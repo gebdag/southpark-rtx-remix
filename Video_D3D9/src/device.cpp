@@ -2,9 +2,16 @@
 #include "log.h"
 
 #include <d3d9.h>
+#include <string.h>
 
 namespace {
 
+// Direct3DCreate9 is resolved at runtime rather than statically imported, so that this
+// plugin can pick *which* d3d9.dll it talks to. See LoadD3D9() below -- this is what makes
+// RTX Remix reachable, and the reason d3d9.lib is not on the link line.
+typedef IDirect3D9* (WINAPI *PFN_Direct3DCreate9)(UINT);
+
+HMODULE g_d3d9Module = 0;
 IDirect3D9* g_d3d = 0;
 IDirect3DDevice9* g_device = 0;
 HWND g_window = 0;
@@ -30,6 +37,44 @@ void FillPresentParams(HWND window, int width, int height) {
     g_params.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
 }
 
+// Load the d3d9.dll that sits next to the game executable, in preference to whatever module
+// named "d3d9.dll" is already in the process.
+//
+// RTX Remix ships exactly that way: a d3d9.dll dropped into the game folder. A static import
+// cannot reach it. By the time the engine loads this plugin, its DirectDraw startup has
+// already pulled C:\Windows\System32\d3d9.dll into the process, and the loader satisfies an
+// import by *module name* from what is already resident -- the application-directory search
+// that would have found Remix never runs, and every call goes to the stock runtime instead.
+//
+// A path-qualified LoadLibrary is keyed on the file rather than the name, so it loads the
+// local copy even with a same-named module already loaded.
+HMODULE LoadD3D9() {
+    char path[MAX_PATH];
+    const DWORD n = GetModuleFileNameA(0, path, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) {
+        char* slash = strrchr(path, '\\');
+        if (slash && (size_t)(slash - path) + sizeof("\\d3d9.dll") < MAX_PATH) {
+            strcpy(slash + 1, "d3d9.dll");
+            HMODULE local = LoadLibraryA(path);
+            if (local) {
+                LogLine("    d3d9 from game folder: %s", path);
+                return local;
+            }
+            LogLine("    no d3d9.dll beside the executable (%s), err=%lu -- falling back to the "
+                    "system runtime; RTX Remix will not see this process",
+                    path, (unsigned long)GetLastError());
+        }
+    }
+    HMODULE sys = LoadLibraryA("d3d9.dll");
+    if (sys) {
+        char actual[MAX_PATH];
+        if (GetModuleFileNameA(sys, actual, MAX_PATH)) {
+            LogLine("    d3d9 fallback: %s", actual);
+        }
+    }
+    return sys;
+}
+
 bool Reset() {
     g_inScene = false;
     HRESULT hr = g_device->Reset(&g_params);
@@ -49,7 +94,21 @@ bool Device::Create(HWND window) {
         return true;
     }
 
-    g_d3d = Direct3DCreate9(D3D_SDK_VERSION);
+    if (!g_d3d9Module) {
+        g_d3d9Module = LoadD3D9();
+    }
+    if (!g_d3d9Module) {
+        LogLine("    FATAL: no d3d9.dll could be loaded");
+        return false;
+    }
+    PFN_Direct3DCreate9 createD3D9 =
+        (PFN_Direct3DCreate9)GetProcAddress(g_d3d9Module, "Direct3DCreate9");
+    if (!createD3D9) {
+        LogLine("    FATAL: d3d9.dll has no Direct3DCreate9");
+        return false;
+    }
+
+    g_d3d = createD3D9(D3D_SDK_VERSION);
     if (!g_d3d) {
         LogLine("    FATAL: Direct3DCreate9 failed");
         return false;
