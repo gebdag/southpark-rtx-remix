@@ -1,4 +1,5 @@
 #include "texture.h"
+#include "config.h"
 #include "log.h"
 
 #include <windows.h>
@@ -28,6 +29,7 @@ struct SetCache {
 };
 SetCache g_cache[kMaxSets];
 bool  g_decodeFailed[kMaxSets];
+bool  g_isSky[kMaxSets];
 int   g_count = 0;
 int   g_paletteLogged = 0;
 
@@ -311,9 +313,44 @@ static const char* SetName(const void* blob) {
     return "";
 }
 
+// The sky list is a comma-separated set of name prefixes, so "Day" covers Day1 and Day2.
+static bool NameIsSky(const char* name) {
+    if (!name || !*name) {
+        return false;
+    }
+    const char* list = Config::SkyTextureNames();
+    while (*list) {
+        while (*list == ',' || *list == ' ') {
+            ++list;
+        }
+        const char* end = list;
+        while (*end && *end != ',') {
+            ++end;
+        }
+        int len = (int)(end - list);
+        while (len > 0 && list[len - 1] == ' ') {
+            --len;
+        }
+        if (len > 0 && _strnicmp(name, list, len) == 0) {
+            return true;
+        }
+        list = end;
+    }
+    return false;
+}
+
 void Texture::FinishEnumeration() {
     int bytes = 0;
     int valid = 0;
+    int skies = 0;
+    for (int i = 0; i < g_count; ++i) {
+        if (g_sets[i] && NameIsSky(SetName(g_sets[i]))) {
+            g_isSky[i] = true;
+            ++skies;
+            LogLine("    sky texture set %d: %s", i, SetName(g_sets[i]));
+        }
+    }
+    LogLine("    %d sky sets matched \"%s\"", skies, Config::SkyTextureNames());
     for (int i = 0; i < g_count; ++i) {
         if (g_sets[i]) {
             ++valid;
@@ -548,6 +585,10 @@ int Texture::Count() {
     return g_count;
 }
 
+bool Texture::IsSkySet(int index) {
+    return index >= 0 && index < g_count && g_isSky[index];
+}
+
 void Texture::ReleaseAll() {
     for (int i = 0; i < g_count; ++i) {
         for (int v = 0; v < g_cache[i].n; ++v) {
@@ -561,6 +602,7 @@ void Texture::ReleaseAll() {
             g_sets[i] = 0;
         }
         g_decodeFailed[i] = false;
+        g_isSky[i] = false;
     }
     g_count = 0;
 }

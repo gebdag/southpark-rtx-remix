@@ -1,4 +1,5 @@
 #include "device.h"
+#include "config.h"
 #include "log.h"
 
 #include <d3d9.h>
@@ -20,9 +21,10 @@ bool g_inScene = false;
 bool g_needsReset = false;
 Device::Pipeline g_pipeline = Device::PipelineNone;
 
-// The stub clears to a distinctive colour so a black frame reads as "nothing ran"
-// rather than "cleared to black", which is the single most useful bring-up signal.
-const D3DCOLOR kClearColour = D3DCOLOR_XRGB(0x20, 0x30, 0x60);
+// Used until the engine sends its own background colour, and whenever the ini says to
+// ignore it. Distinctive on purpose, so a black frame reads as "nothing ran".
+const D3DCOLOR kFallbackClearColour = D3DCOLOR_XRGB(0x20, 0x30, 0x60);
+D3DCOLOR g_clearColour = kFallbackClearColour;
 
 void FillPresentParams(HWND window, int width, int height) {
     ZeroMemory(&g_params, sizeof(g_params));
@@ -202,7 +204,7 @@ bool Device::BeginFrame() {
 
     // A fresh frame inherits nothing: whichever pipeline draws first installs its state.
     g_pipeline = PipelineNone;
-    g_device->Clear(0, 0, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, kClearColour, 1.0f, 0);
+    g_device->Clear(0, 0, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, g_clearColour, 1.0f, 0);
     if (FAILED(g_device->BeginScene())) {
         return false;
     }
@@ -221,6 +223,17 @@ void Device::EndFrame() {
     if (hr == D3DERR_DEVICELOST) {
         g_needsReset = true;
     }
+}
+
+void Device::SetClearColour(unsigned int packedAbgr) {
+    if (!Config::UseEngineBackgroundColour()) {
+        return;
+    }
+    // The original splits the operand into r, g, b, a from the low byte upwards.
+    const unsigned int r = packedAbgr & 0xff;
+    const unsigned int g = (packedAbgr >> 8) & 0xff;
+    const unsigned int b = (packedAbgr >> 16) & 0xff;
+    g_clearColour = D3DCOLOR_XRGB(r, g, b);
 }
 
 void Device::SetVSync(bool enabled) {

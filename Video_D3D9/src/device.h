@@ -49,6 +49,10 @@ void EndFrame();
 
 void SetVSync(bool enabled);
 
+// Background colour for the frame clear, as the engine supplies it through display-list
+// opcode 0xf8. Packed 0xAABBGGRR, matching the byte order the original unpacks.
+void SetClearColour(unsigned int packedAbgr);
+
 int Width();
 int Height();
 

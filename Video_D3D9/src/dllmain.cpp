@@ -1,3 +1,4 @@
+#include "config.h"
 #include "device.h"
 #include "log.h"
 
@@ -34,6 +35,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         char logPath[MAX_PATH];
         BuildLogPath(module, logPath, sizeof(logPath));
         LogOpen(logPath);
+        Config::Load(module);
     } else if (reason == DLL_PROCESS_DETACH) {
         Device::Destroy();
         LogClose();

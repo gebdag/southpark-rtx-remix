@@ -11,6 +11,7 @@ FILE* g_file = 0;
 CRITICAL_SECTION g_lock;
 bool g_lockReady = false;
 
+bool g_callLogging = false;
 unsigned int g_callIndex = 0;
 const char* g_lastName = 0;
 unsigned int g_repeatCount = 0;
@@ -84,8 +85,12 @@ void LogLine(const char* fmt, ...) {
     LeaveCriticalSection(&g_lock);
 }
 
+void LogSetCallLogging(bool enabled) {
+    g_callLogging = enabled;
+}
+
 void LogCall(const char* name, const char* fmt, ...) {
-    if (!g_lockReady) {
+    if (!g_lockReady || !g_callLogging) {
         return;
     }
     EnterCriticalSection(&g_lock);

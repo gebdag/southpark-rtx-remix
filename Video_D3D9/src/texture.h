@@ -33,6 +33,10 @@ void LogSetCensus();
 
 int Count();
 
+// Whether a set is one of the sky textures named in the ini. The sky is ordinary world
+// geometry to the engine, so the only thing distinguishing it is the name in chunk 3.
+bool IsSkySet(int index);
+
 void ReleaseAll();
 
 // Writes a whole set blob to disk for offline analysis.

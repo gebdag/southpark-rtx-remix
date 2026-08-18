@@ -1,4 +1,5 @@
 #include "geometry.h"
+#include "config.h"
 #include "device.h"
 #include "log.h"
 #include "texture.h"
@@ -32,6 +33,9 @@ enum Opcode {
     OP_SKIPMASK_SET = 0xa8,
     OP_MATRIX_POP   = 0xbd,
     OP_SEGMENT    = 0xbc,
+    // The frame's background colour, packed 0xAABBGGRR in word1. The original unpacks it
+    // into the viewport clear; without it the background is whatever this renderer picked.
+    OP_BACKGROUND = 0xf8,
     // Variable-length commands. Every other opcode is exactly 8 bytes; these three consume
     // extra words, and treating them as fixed-length desynchronises the whole walk -- after
     // which operand bytes get decoded as opcodes.
@@ -70,6 +74,7 @@ int g_clampLogged = 0;
 
 int g_texturedFlushes = 0;
 int g_untexturedFlushes = 0;
+int g_skyBatches = 0;
 
 // Operands above 0x00ffffff are segment-relative. The engine installs the bases through
 // opcode 0xbc, sub-command 6, before any list references them.
@@ -443,7 +448,9 @@ void Flush() {
         }
     }
     const int vertexCount = (maxIndex + 1 > g_highWater) ? maxIndex + 1 : g_highWater;
-    LogLine("    flush: %d tris, %d verts", g_indexCount / 3, vertexCount);
+    if (Config::LogEveryCall()) {
+        LogLine("    flush: %d tris, %d verts", g_indexCount / 3, vertexCount);
+    }
 
     // The 2D layer leaves the device set up for screen-space quads, so reclaim it before
     // drawing world geometry -- most importantly the vertex format, which would otherwise
@@ -464,8 +471,16 @@ void Flush() {
 
     // CCW matches the original directly: the engine's negated Y scale cancels out through the
     // projection and viewport, so the winding is not reversed.
-    dev->SetRenderState(D3DRS_CULLMODE,
-                        (g_renderFlags & kFlagBackfaceCull) ? D3DCULL_CCW : D3DCULL_NONE);
+    const bool cull = (g_renderFlags & kFlagBackfaceCull) != 0
+                   && !Config::DisableBackfaceCulling();
+    dev->SetRenderState(D3DRS_CULLMODE, cull ? D3DCULL_CCW : D3DCULL_NONE);
+
+    // A skydome has no business in the depth buffer, and drawing it depth-free is also the
+    // shape Remix's sky auto-detection looks for.
+    const bool sky = Config::DepthlessSky() && Texture::IsSkySet(g_currentTexture);
+    dev->SetRenderState(D3DRS_ZENABLE, sky ? D3DZB_FALSE : D3DZB_TRUE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, sky ? FALSE : TRUE);
+    if (sky) { ++g_skyBatches; }
 
     IDirect3DTexture9* tex = (g_currentTexture >= 0)
                            ? Texture::GetTexture(g_currentTexture, g_currentSubA, g_currentSubB)
@@ -643,7 +658,7 @@ void UploadVertices(const SourceVertex* src, int count, int destSlot) {
 }
 
 void EmitTriangle(int a, int b, int c) {
-    if (g_skipMask) {
+    if (g_skipMask && !Config::DisableTriangleSkipMask()) {
         const int n = g_skipCounter++;
         if (n < kSkipMaskLimit && (g_skipMask[n >> 5] & (1u << (n & 31)))) {
             ++g_skippedTris;
@@ -906,6 +921,10 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
             break;
         }
 
+        case OP_BACKGROUND:
+            Device::SetClearColour(word1);
+            break;
+
         case OP_MATRIX_POP:
             // Without this the hierarchy stack only ever grows, and every later object
             // inherits a wrongly accumulated transform.
@@ -1032,8 +1051,8 @@ void Geometry::LogGeometryAudit() {
 }
 
 void Geometry::LogTextureStats() {
-    LogLine("    texture stats: %d selects, %d textured flushes, %d untextured",
-            g_textureSelects, g_texturedFlushes, g_untexturedFlushes);
+    LogLine("    texture stats: %d selects, %d textured flushes, %d untextured, %d sky",
+            g_textureSelects, g_texturedFlushes, g_untexturedFlushes, g_skyBatches);
 }
 
 void Geometry::LogOpcodeCensus() {

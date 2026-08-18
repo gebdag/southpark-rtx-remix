@@ -1,4 +1,5 @@
 #include "pcx.h"
+#include "config.h"
 #include "device.h"
 #include "log.h"
 
@@ -375,7 +376,8 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
         const float y = positions[i * 3 + 1];
         // The original rejects the whole quad when any corner leaves the screen rather than
         // clipping it, so an off-screen element draws nothing at all.
-        if (x < 0.0f || x > kAuthoredWidth || y < 0.0f || y > kAuthoredHeight) {
+        if (!Config::DisableOffscreenQuadReject() &&
+            (x < 0.0f || x > kAuthoredWidth || y < 0.0f || y > kAuthoredHeight)) {
             ++g_quadsRejected;
             return;
         }
