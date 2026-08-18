@@ -27,6 +27,7 @@ const signed char kOptionStatus[16] = {
 DWORD g_frameStartTicks = 0;
 bool g_vsyncEnabled = false;
 unsigned int g_frameCount = 0;
+int g_frameStatCounter = 0;
 
 } // namespace
 
@@ -71,6 +72,9 @@ GFXAPI void GFXDLL_EndScene(void) {
     Geometry::LogOpcodeCensus();
     Device::EndFrame();
     ++g_frameCount;
+    if ((++g_frameStatCounter % 300) == 0) {
+        Pcx::LogQuadStats();
+    }
 }
 
 // The engine polls this to pace frames. The original skips the sleep when vsync is on,
@@ -140,6 +144,10 @@ GFXAPI int GFXDLL_CanXXX(unsigned int capFlags) {
 // We expose exactly one driver. The buffers are dumped first because the record stride and
 // the purpose of a1 are still unknown -- the executable that allocates them is packed.
 GFXAPI unsigned int GFXDLL_GetDriverInfo(void* a1, char* a2, const char* a3, int maxEntries) {
+    // Driver enumeration is the first export the engine calls, which makes it the earliest
+    // moment the D3D9 runtime can be brought in. RTX Remix needs that head start to detour
+    // input before the engine claims it -- see Device::PreloadD3D9.
+    Device::PreloadD3D9();
     LogCall("GFXDLL_GetDriverInfo", "a1=%p, a2=%p, a3=%p, max=%d", a1, (void*)a2, (const void*)a3, maxEntries);
     LogHex("a1 before", a1, 64);
     LogHex("a2 before", a2, 128);
@@ -211,6 +219,7 @@ GFXAPI void GFXDLL_EnumerateTexture(unsigned int* blob, unsigned int a2, HWND wi
 GFXAPI void GFXDLL_FinishTextureEnumeration(void) {
     LogCall("GFXDLL_FinishTextureEnumeration");
     Texture::FinishEnumeration();
+    Texture::LogSetCensus();
 }
 
 GFXAPI void GFXDLL_FlushTextureCache(void) {
@@ -251,8 +260,10 @@ GFXAPI void GFXDLL_DrawPCX(void) {
     LogCall("GFXDLL_DrawPCX");
 }
 
-GFXAPI void GFXDLL_DrawQuadPCX(void) {
+GFXAPI void GFXDLL_DrawQuadPCX(int handle, const float* positions, const float* colours,
+                               const float* uvs) {
     LogCall("GFXDLL_DrawQuadPCX");
+    Pcx::DrawQuad(handle, positions, colours, uvs);
 }
 
 GFXAPI void GFXDLL_BlitPCXToPCX(void) {
@@ -287,8 +298,9 @@ GFXAPI void GFXDLL_UpdateRGBAPCX(int handle) {
     Pcx::Update(handle);
 }
 
-GFXAPI void GFXDLL_SetBlendModePCX(void) {
+GFXAPI void GFXDLL_SetBlendModePCX(int mode) {
     LogCall("GFXDLL_SetBlendModePCX");
+    Pcx::SetBlendMode(mode);
 }
 
 GFXAPI void GFXDLL_SetAllocatePCXImageFile(Pcx::AllocFn fn) {

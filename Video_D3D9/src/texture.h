@@ -18,9 +18,18 @@ void FinishEnumeration();
 // Returns the stored blob and fills its dimensions. Null for an unknown index.
 void* GetSet(int index, int* outWidth, int* outHeight);
 
-// Decodes the set's palettised image into a D3D9 texture on first use and caches it.
-// Null when the set is unknown or its payload is not decodable.
-IDirect3DTexture9* GetTexture(int index);
+// Decodes one frame of a set into a D3D9 texture on first use and caches it.
+//
+// `subA` and `subB` are the two 16-bit fields of display-list opcode 0xa9's second word.
+// They select which sub-chunk of the image and of the palette to use -- this is how the
+// engine animates a texture (blinking eyes, flowing water) without re-uploading anything.
+// Which field drives the image depends on the format, so both are passed through and the
+// decision is made where the format byte is already in hand. Null when the set is unknown
+// or its payload is not decodable.
+IDirect3DTexture9* GetTexture(int index, int subA, int subB);
+
+// One-shot census of every enumerated set: format, size, sub-chunk counts and name.
+void LogSetCensus();
 
 int Count();
 

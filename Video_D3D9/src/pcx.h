@@ -40,6 +40,17 @@ void Update(int handle);
 
 IDirect3DTexture9* Texture(int handle);
 
+// The engine's entire 2D layer -- HUD, menus, fonts, fades -- is this one call, made once
+// per quad. Positions are 4 x {x, y, z} in the engine's 640x480 bottom-up screen space;
+// colours are 4 x {r, g, b, a} in 0..1; uvs are 4 x {u, v}.
+void DrawQuad(int handle, const float* positions, const float* colours, const float* uvs);
+
+// Blend mode for subsequent quads, as set by GFXDLL_SetBlendModePCX. Only mode 1 modulates
+// by the vertex colour; the rest draw the texture flat, with or without blending.
+void SetBlendMode(int mode);
+
+void LogQuadStats();
+
 // UVs are scaled when a texture had to be padded to power-of-two dimensions.
 float UScale(int handle);
 float VScale(int handle);

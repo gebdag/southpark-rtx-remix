@@ -18,6 +18,7 @@ HWND g_window = 0;
 D3DPRESENT_PARAMETERS g_params;
 bool g_inScene = false;
 bool g_needsReset = false;
+Device::Pipeline g_pipeline = Device::PipelineNone;
 
 // The stub clears to a distinctive colour so a black frame reads as "nothing ran"
 // rather than "cleared to black", which is the single most useful bring-up signal.
@@ -160,6 +161,20 @@ void Device::Destroy() {
     LogLine("    D3D9 device destroyed");
 }
 
+void Device::PreloadD3D9() {
+    if (!g_d3d9Module) {
+        g_d3d9Module = LoadD3D9();
+    }
+}
+
+bool Device::ClaimPipeline(Pipeline pipeline) {
+    if (g_pipeline == pipeline) {
+        return false;
+    }
+    g_pipeline = pipeline;
+    return true;
+}
+
 IDirect3DDevice9* Device::Get() {
     return g_device;
 }
@@ -185,6 +200,8 @@ bool Device::BeginFrame() {
         return false;
     }
 
+    // A fresh frame inherits nothing: whichever pipeline draws first installs its state.
+    g_pipeline = PipelineNone;
     g_device->Clear(0, 0, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, kClearColour, 1.0f, 0);
     if (FAILED(g_device->BeginScene())) {
         return false;

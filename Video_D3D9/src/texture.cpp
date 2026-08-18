@@ -13,7 +13,20 @@ namespace {
 const int kMaxSets = 4096;
 
 void* g_sets[kMaxSets];
-IDirect3DTexture9* g_textures[kMaxSets];
+
+// A set is not one image. Animated sets hold a run of frames in chunk 1 and may hold
+// several palettes in chunk 2, and the display list picks a pair per draw. Each decoded
+// (image, palette) pair is cached separately; almost every set only ever uses one.
+struct Variant {
+    unsigned short pix, pal;
+    IDirect3DTexture9* tex;
+};
+const int kMaxVariants = 16;
+struct SetCache {
+    Variant v[kMaxVariants];
+    int n;
+};
+SetCache g_cache[kMaxSets];
 bool  g_decodeFailed[kMaxSets];
 int   g_count = 0;
 int   g_paletteLogged = 0;
@@ -45,6 +58,19 @@ const unsigned char* SubChunk(const unsigned char* nested, unsigned int index,
     return nested + off;
 }
 
+// How many sub-chunks a nested blob holds. Zero when it is not a nested blob at all --
+// which is a real case: the palette-less formats store a nested blob with a count of 0.
+unsigned int SubChunkCount(const unsigned char* nested, unsigned int nestedBytes) {
+    if (!nested || nestedBytes < 8) {
+        return 0;
+    }
+    const unsigned int count = *(const unsigned int*)nested;
+    if (count > 32 || 4 + (count + 1) * 4 > nestedBytes) {
+        return 0;
+    }
+    return count;
+}
+
 const unsigned char* ChunkAt(const unsigned char* base, unsigned int size, unsigned int index,
                              unsigned int* outSize) {
     const unsigned int count = *(const unsigned int*)base;
@@ -62,12 +88,29 @@ const unsigned char* ChunkAt(const unsigned char* base, unsigned int size, unsig
     return base + off;
 }
 
-// Palette entries are stored byte-swapped; once swapped the layout is RGBA5551, with opacity
-// in the low bit. The original does exactly this -- it byte-swaps each entry and tests the
-// stored 0x0100 bit for transparency. Guessing at ARGB1555 and RGB565 both produced wrong
-// colours; this reading makes snow white and wood brown, checked against decoded samples.
-inline unsigned int ExpandPaletteEntry(unsigned short stored) {
+// Palette entries are always stored byte-swapped, but their layout depends on how much
+// alpha the format carries. The original selects between the two per format, through the
+// gate it stashes at texState+0x9c (FUN_1000cf90): 0x8000 for formats 0 and 1, 0xc000 for
+// format 3.
+//
+//   RGBA5551 -- one bit of alpha. World surfaces: opaque, or cut out along a hard edge.
+//   ARGB4444 -- four bits of alpha. Format 3 only, which is the effect and sky atlas
+//               (clouds, explosions, shockwaves, flares, Dawn/Day/Nite). These need a
+//               graduated edge, and reading them as 5551 turns a soft ring into concentric
+//               dotted noise -- the alpha bit alternating with the low colour bit.
+inline unsigned int ExpandPaletteEntry(unsigned short stored, bool fourBitAlpha) {
     const unsigned short c = (unsigned short)(((stored & 0x00ff) << 8) | (stored >> 8));
+    if (fourBitAlpha) {
+        unsigned int a = (c >> 12) & 0x0f;
+        unsigned int r = (c >> 8) & 0x0f;
+        unsigned int g = (c >> 4) & 0x0f;
+        unsigned int b = c & 0x0f;
+        a = (a << 4) | a;
+        r = (r << 4) | r;
+        g = (g << 4) | g;
+        b = (b << 4) | b;
+        return (a << 24) | (r << 16) | (g << 8) | b;
+    }
     unsigned int r = (c >> 11) & 0x1f;
     unsigned int g = (c >> 6) & 0x1f;
     unsigned int b = (c >> 1) & 0x1f;
@@ -76,6 +119,11 @@ inline unsigned int ExpandPaletteEntry(unsigned short stored) {
     g = (g << 3) | (g >> 2);
     b = (b << 3) | (b >> 2);
     return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+// Format 3 is the only one whose palette carries a full alpha channel.
+inline bool HasFourBitAlpha(int format) {
+    return format == 3;
 }
 
 // Blob layout:
@@ -175,6 +223,8 @@ void Texture::Enumerate(void* blob) {
     CompleteHeader(copy);
     g_sets[g_count++] = copy;
 }
+
+static const char* SetName(const void* blob);
 
 // Chunks 1 and 2 are themselves blobs with the same count+offsets layout. Their sizes against
 // the set's dimensions give the bits per pixel.
@@ -300,19 +350,35 @@ void* Texture::GetSet(int index, int* outWidth, int* outHeight) {
     return blob;
 }
 
-IDirect3DTexture9* Texture::GetTexture(int index) {
-    if (index < 0 || index >= g_count || !g_sets[index] || g_decodeFailed[index]) {
+namespace {
+
+// Which sub-chunk of the image, and of the palette, a draw selects.
+//
+// Opcode 0xa9 carries two 16-bit fields. The original (FUN_1000cf90) stores both, then uses
+// the larger of the two as the image sub-chunk -- except for format 3, the animated format,
+// where the first field alone drives it. The second field always selects the palette.
+void ResolveSubChunks(int fmt, int subA, int subB, int* outPix, int* outPal) {
+    const unsigned int a = (unsigned int)subA;
+    const unsigned int b = (unsigned int)subB;
+    *outPix = (int)((fmt == 3) ? a : (a > b ? a : b));
+    *outPal = (int)b;
+}
+
+int ClampIndex(int wanted, unsigned int available) {
+    if (available == 0) {
         return 0;
     }
-    if (g_textures[index]) {
-        return g_textures[index];
+    if (wanted < 0 || (unsigned int)wanted >= available) {
+        return 0;
     }
+    return wanted;
+}
 
+IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
     IDirect3DDevice9* dev = Device::Get();
     const unsigned char* base = (const unsigned char*)g_sets[index];
     const unsigned int size = BlobSize(base);
     if (!dev || size == 0) {
-        g_decodeFailed[index] = true;
         return 0;
     }
 
@@ -320,8 +386,7 @@ IDirect3DTexture9* Texture::GetTexture(int index) {
     const unsigned char* hdr = ChunkAt(base, size, 0, &hdrSize);
     const unsigned char* pixChunk = ChunkAt(base, size, 1, &pixChunkSize);
     const unsigned char* palChunk = ChunkAt(base, size, 2, &palChunkSize);
-    if (!hdr || hdrSize < 4 || !pixChunk || !palChunk) {
-        g_decodeFailed[index] = true;
+    if (!hdr || hdrSize < 4 || !pixChunk) {
         return 0;
     }
 
@@ -329,15 +394,19 @@ IDirect3DTexture9* Texture::GetTexture(int index) {
     const int h = hdr[3] ? hdr[3] : 256;
 
     unsigned int pixSize = 0, palSize = 0;
-    const unsigned char* pixelData = SubChunk(pixChunk, 0, pixChunkSize, &pixSize);
-    const unsigned char* palette = SubChunk(palChunk, 0, palChunkSize, &palSize);
-    if (!pixelData || !palette) {
-        g_decodeFailed[index] = true;
+    const unsigned char* pixelData =
+        SubChunk(pixChunk, (unsigned int)pixSub, pixChunkSize, &pixSize);
+    if (!pixelData) {
         return 0;
     }
+    // Formats 2, 4, 5 and 6 carry no palette at all -- their chunk 2 is a nested blob with a
+    // count of zero. The original reflects this: FUN_1000cf90 only fetches a palette when its
+    // per-format gate (texState+0x9c) is non-zero, which holds for formats 0, 1 and 3 alone.
+    const unsigned char* palette = 0;
+    if (palChunk && SubChunkCount(palChunk, palChunkSize) > 0) {
+        palette = SubChunk(palChunk, (unsigned int)palSub, palChunkSize, &palSize);
+    }
 
-    // Bit depth is derived from the payload rather than the format byte: formats 1 and 3 are
-    // both 4bpp, and deriving it covers any format the enumeration turns up.
     const unsigned int pixels = (unsigned int)(w * h);
     int bpp;
     if (pixSize >= pixels) {
@@ -346,31 +415,23 @@ IDirect3DTexture9* Texture::GetTexture(int index) {
         bpp = 4;
     } else {
         LogLine("    texture %d: payload too small (%u for %ux%u)", index, pixSize, w, h);
-        g_decodeFailed[index] = true;
         return 0;
     }
-    if (palSize < 2) {
-        g_decodeFailed[index] = true;
-        return 0;
-    }
-
-
 
     IDirect3DTexture9* tex = 0;
     if (FAILED(dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, 0))) {
-        g_decodeFailed[index] = true;
         return 0;
     }
 
     D3DLOCKED_RECT lr;
     if (FAILED(tex->LockRect(0, &lr, 0, 0))) {
         tex->Release();
-        g_decodeFailed[index] = true;
         return 0;
     }
 
     const unsigned short* pal = (const unsigned short*)palette;
-    const unsigned int palEntries = palSize / 2;
+    const unsigned int palEntries = palette ? palSize / 2 : 0;
+    const bool fourBitAlpha = HasFourBitAlpha(hdr[0]);
     for (int y = 0; y < h; ++y) {
         unsigned int* dst = (unsigned int*)((unsigned char*)lr.pBits + (size_t)y * lr.Pitch);
         for (int x = 0; x < w; ++x) {
@@ -383,13 +444,104 @@ IDirect3DTexture9* Texture::GetTexture(int index) {
             } else {
                 idx = pixelData[(size_t)y * w + x];
             }
-            dst[x] = (idx < palEntries) ? ExpandPaletteEntry(pal[idx]) : 0u;
+            if (palEntries) {
+                dst[x] = (idx < palEntries) ? ExpandPaletteEntry(pal[idx], fourBitAlpha) : 0u;
+            } else {
+                // Palette-less sets are single-channel coverage: white modulated by the
+                // vertex colour, with the sample as opacity.
+                dst[x] = (idx << 24) | 0x00ffffffu;
+            }
         }
     }
     tex->UnlockRect(0);
-
-    g_textures[index] = tex;
     return tex;
+}
+
+} // namespace
+
+IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
+    if (index < 0 || index >= g_count || !g_sets[index] || g_decodeFailed[index]) {
+        return 0;
+    }
+
+    const unsigned char* base = (const unsigned char*)g_sets[index];
+    const unsigned int size = BlobSize(base);
+    unsigned int hdrSize = 0, pixChunkSize = 0, palChunkSize = 0;
+    const unsigned char* hdr = ChunkAt(base, size, 0, &hdrSize);
+    const unsigned char* pixChunk = ChunkAt(base, size, 1, &pixChunkSize);
+    const unsigned char* palChunk = ChunkAt(base, size, 2, &palChunkSize);
+    if (!hdr || hdrSize < 1 || !pixChunk) {
+        g_decodeFailed[index] = true;
+        return 0;
+    }
+
+    int pixSub = 0, palSub = 0;
+    ResolveSubChunks(hdr[0], subA, subB, &pixSub, &palSub);
+    pixSub = ClampIndex(pixSub, SubChunkCount(pixChunk, pixChunkSize));
+    palSub = ClampIndex(palSub, SubChunkCount(palChunk, palChunkSize));
+
+    SetCache& cache = g_cache[index];
+    for (int i = 0; i < cache.n; ++i) {
+        if (cache.v[i].pix == (unsigned short)pixSub && cache.v[i].pal == (unsigned short)palSub) {
+            return cache.v[i].tex;
+        }
+    }
+
+    IDirect3DTexture9* tex = Decode(index, pixSub, palSub);
+    if (!tex && cache.n == 0) {
+        // Frame 0 failing means the set as a whole is undecodable; a single missing frame is
+        // not grounds for giving up on the rest.
+        g_decodeFailed[index] = true;
+        return 0;
+    }
+    if (cache.n < kMaxVariants) {
+        cache.v[cache.n].pix = (unsigned short)pixSub;
+        cache.v[cache.n].pal = (unsigned short)palSub;
+        cache.v[cache.n].tex = tex;
+        ++cache.n;
+    }
+    return tex;
+}
+
+// One line per set, so the formats that carry no name and never appear in a reference
+// screenshot can still be identified by their shape.
+void Texture::LogSetCensus() {
+    int byFormat[8];
+    memset(byFormat, 0, sizeof(byFormat));
+    LogLine("    TEXTURE CENSUS: %d sets", g_count);
+    for (int i = 0; i < g_count; ++i) {
+        if (!g_sets[i]) {
+            continue;
+        }
+        const unsigned char* base = (const unsigned char*)g_sets[i];
+        const unsigned int size = BlobSize(base);
+        unsigned int hdrSize = 0, pixChunkSize = 0, palChunkSize = 0;
+        const unsigned char* hdr = ChunkAt(base, size, 0, &hdrSize);
+        const unsigned char* pixChunk = ChunkAt(base, size, 1, &pixChunkSize);
+        const unsigned char* palChunk = ChunkAt(base, size, 2, &palChunkSize);
+        if (!hdr || hdrSize < 4) {
+            continue;
+        }
+        const int fmt = hdr[0];
+        if (fmt >= 0 && fmt < 8) {
+            ++byFormat[fmt];
+        }
+        const int w = hdr[2] ? hdr[2] : 256;
+        const int h = hdr[3] ? hdr[3] : 256;
+        const unsigned int frames = SubChunkCount(pixChunk, pixChunkSize);
+        const unsigned int pals = SubChunkCount(palChunk, palChunkSize);
+        unsigned int frame0 = 0, pal0 = 0;
+        SubChunk(pixChunk, 0, pixChunkSize, &frame0);
+        SubChunk(palChunk, 0, palChunkSize, &pal0);
+        const unsigned int px = (unsigned int)(w * h);
+        LogLine("      set %4d fmt=%d %3dx%-3d frames=%-2u pal=%-2u frame0=%-6u (%.2f bpp) "
+                "pal0=%-4u  %s",
+                i, fmt, w, h, frames, pals, frame0,
+                px ? (double)frame0 * 8.0 / (double)px : 0.0, pal0, SetName(g_sets[i]));
+    }
+    LogLine("    format totals: 0=%d 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d",
+            byFormat[0], byFormat[1], byFormat[2], byFormat[3],
+            byFormat[4], byFormat[5], byFormat[6], byFormat[7]);
 }
 
 int Texture::Count() {
@@ -398,10 +550,12 @@ int Texture::Count() {
 
 void Texture::ReleaseAll() {
     for (int i = 0; i < g_count; ++i) {
-        if (g_textures[i]) {
-            g_textures[i]->Release();
-            g_textures[i] = 0;
+        for (int v = 0; v < g_cache[i].n; ++v) {
+            if (g_cache[i].v[v].tex) {
+                g_cache[i].v[v].tex->Release();
+            }
         }
+        g_cache[i].n = 0;
         if (g_sets[i]) {
             free(g_sets[i]);
             g_sets[i] = 0;

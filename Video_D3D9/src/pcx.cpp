@@ -56,6 +56,25 @@ bool Valid(int h) {
     return h >= 0 && h < kMaxImages && g_entries[h].refcount > 0 && g_entries[h].image != 0;
 }
 
+// Screen-space vertex handed straight to the rasteriser, bypassing every transform.
+struct ScreenVertex {
+    float x, y, z, rhw;
+    D3DCOLOR diffuse;
+    D3DCOLOR specular;
+    float u, v;
+};
+const DWORD kScreenFVF = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1;
+
+// The engine's 2D coordinates are always 640x480; the original hardcodes the 479.0 flip.
+// The backbuffer is the window, which is larger, so quads are scaled on the way out.
+const float kAuthoredWidth  = 640.0f;
+const float kAuthoredHeight = 480.0f;
+
+int g_blendMode = 0;
+int g_quadsDrawn = 0;
+int g_quadsRejected = 0;
+int g_quadLogged = 0;
+
 int NextPow2(int v) {
     int p = 1;
     while (p < v) {
@@ -327,6 +346,110 @@ float Pcx::VScale(int handle) {
         return 1.0f;
     }
     return (float)g_entries[handle].image->height / (float)g_entries[handle].texHeight;
+}
+
+void Pcx::SetBlendMode(int mode) {
+    g_blendMode = mode;
+}
+
+void Pcx::DrawQuad(int handle, const float* positions, const float* colours, const float* uvs) {
+    IDirect3DDevice9* dev = Device::Get();
+    if (!dev || !positions || !uvs || !Valid(handle)) {
+        return;
+    }
+    Entry& e = g_entries[handle];
+    if (!e.texture && !CreateTexture(e)) {
+        return;
+    }
+
+    const float halfTexelU = (e.image->width  > 0) ? 0.5f / (float)e.image->width  : 0.0f;
+    const float halfTexelV = (e.image->height > 0) ? 0.5f / (float)e.image->height : 0.0f;
+    const float uScale = Pcx::UScale(handle);
+    const float vScale = Pcx::VScale(handle);
+    const float sx = (float)Device::Width()  / kAuthoredWidth;
+    const float sy = (float)Device::Height() / kAuthoredHeight;
+
+    ScreenVertex v[4];
+    for (int i = 0; i < 4; ++i) {
+        const float x = positions[i * 3 + 0];
+        const float y = positions[i * 3 + 1];
+        // The original rejects the whole quad when any corner leaves the screen rather than
+        // clipping it, so an off-screen element draws nothing at all.
+        if (x < 0.0f || x > kAuthoredWidth || y < 0.0f || y > kAuthoredHeight) {
+            ++g_quadsRejected;
+            return;
+        }
+        v[i].x = x * sx;
+        v[i].y = (kAuthoredHeight - 1.0f - y) * sy;
+        v[i].z = positions[i * 3 + 2];
+        v[i].rhw = 1.0f;
+
+        // Half a texel inwards, away from whichever edge the coordinate sits nearer.
+        const float u = uvs[i * 2 + 0];
+        const float uv = uvs[i * 2 + 1];
+        v[i].u = ((u  >= 0.5f) ? (u  - halfTexelU) : (u  + halfTexelU)) * uScale;
+        v[i].v = ((uv >= 0.5f) ? (uv - halfTexelV) : (uv + halfTexelV)) * vScale;
+
+        if (g_blendMode == 1 && colours) {
+            const float* c = colours + i * 4;
+            const unsigned int a = (unsigned int)(c[3] * 255.0f) & 0xff;
+            const unsigned int r = (unsigned int)(c[0] * 255.0f) & 0xff;
+            const unsigned int g = (unsigned int)(c[1] * 255.0f) & 0xff;
+            const unsigned int b = (unsigned int)(c[2] * 255.0f) & 0xff;
+            v[i].diffuse = (a << 24) | (r << 16) | (g << 8) | b;
+        } else {
+            v[i].diffuse = 0xffffffffu;
+        }
+        v[i].specular = 0;
+    }
+
+    if (g_quadLogged < 40) {
+        ++g_quadLogged;
+        LogLine("    2D quad h=%-3d mode=%d img=%dx%d tex=%dx%d scale=%.2f,%.2f "
+                "authored(%.0f,%.0f)-(%.0f,%.0f) -> screen(%.0f,%.0f)-(%.0f,%.0f)",
+                handle, g_blendMode, e.image->width, e.image->height, e.texWidth, e.texHeight,
+                sx, sy,
+                positions[0], positions[1], positions[6], positions[7],
+                v[0].x, v[0].y, v[2].x, v[2].y);
+    }
+
+    // 2D sits on top of the scene unconditionally: no depth test, no depth write, no fog,
+    // no culling.
+    if (Device::ClaimPipeline(Device::Pipeline2D)) {
+        dev->SetFVF(kScreenFVF);
+        dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+        dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    }
+
+    // Mode 1 is the only one that modulates the texture by the vertex colour; mode 0 and 2
+    // draw it opaque, the rest blend it.
+    dev->SetTexture(0, e.texture);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE,
+                        (g_blendMode == 0 || g_blendMode == 2) ? FALSE : TRUE);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP,
+                              (g_blendMode == 1) ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP,
+                              (g_blendMode == 1) ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
+
+    if (SUCCEEDED(dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, v, sizeof(ScreenVertex)))) {
+        ++g_quadsDrawn;
+    }
+}
+
+void Pcx::LogQuadStats() {
+    LogLine("    2D quads: %d drawn, %d rejected off-screen, device %dx%d",
+            g_quadsDrawn, g_quadsRejected, Device::Width(), Device::Height());
 }
 
 void Pcx::ReleaseAll() {

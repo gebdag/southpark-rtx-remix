@@ -50,8 +50,13 @@ const unsigned int kFlagLighting = 0x00020000;
 const unsigned int kFlagBackfaceCull = 0x00002000;
 unsigned int g_renderFlags = 0;
 
-// Texture set selected by opcode 0xa6. -1 means untextured.
+// Texture set selected by opcode 0xa9. -1 means untextured.
 int g_currentTexture = -1;
+// The two 16-bit fields of that opcode's second word. They choose which frame of an animated
+// set and which of its palettes to draw with, so a change to either has to break the batch
+// exactly as a change of set does.
+int g_currentSubA = 0;
+int g_currentSubB = 0;
 
 // Per-triangle skip bitmask. Opcode 0xa8 installs it and resets the counter, 0xa7 clears it.
 // Each emitted triangle consumes one counter step; a set bit means the engine wants that
@@ -421,6 +426,7 @@ void LogMatrix(const char* label, const D3DMATRIX& m) {
 
 void BuildProjection();
 void Flush();
+void ApplyRenderStates();
 
 void Flush() {
     IDirect3DDevice9* dev = Device::Get();
@@ -439,6 +445,13 @@ void Flush() {
     const int vertexCount = (maxIndex + 1 > g_highWater) ? maxIndex + 1 : g_highWater;
     LogLine("    flush: %d tris, %d verts", g_indexCount / 3, vertexCount);
 
+    // The 2D layer leaves the device set up for screen-space quads, so reclaim it before
+    // drawing world geometry -- most importantly the vertex format, which would otherwise
+    // reinterpret these vertices as the 2D layout.
+    if (Device::ClaimPipeline(Device::PipelineWorld)) {
+        ApplyRenderStates();
+    }
+
     // Positions are already world space because the model matrix is baked at upload time,
     // so WORLD is identity and VIEW carries the camera alone.
     D3DMATRIX identity;
@@ -454,7 +467,9 @@ void Flush() {
     dev->SetRenderState(D3DRS_CULLMODE,
                         (g_renderFlags & kFlagBackfaceCull) ? D3DCULL_CCW : D3DCULL_NONE);
 
-    IDirect3DTexture9* tex = (g_currentTexture >= 0) ? Texture::GetTexture(g_currentTexture) : 0;
+    IDirect3DTexture9* tex = (g_currentTexture >= 0)
+                           ? Texture::GetTexture(g_currentTexture, g_currentSubA, g_currentSubB)
+                           : 0;
     if (tex) { ++g_texturedFlushes; } else { ++g_untexturedFlushes; }
     if (g_renderFlags & kFlagBackfaceCull) { ++g_audit.culledBatches; }
     else { ++g_audit.unculledBatches; }
@@ -701,22 +716,28 @@ void ApplyRenderStates() {
     }
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
     dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
     // Cull mode is per-batch state, applied at draw time in Flush().
     dev->SetRenderState(D3DRS_LIGHTING, FALSE);
-    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-    // The palette's low bit is genuine per-texel opacity, so alpha testing gives the game
-    // its cut-out foliage and signage.
+    // World surfaces carry either one bit of alpha or four, depending on the palette their
+    // format uses, and both go down this path. Blending covers both: with a 1-bit palette
+    // every texel is 0 or 255, so the blend is a no-op on the opaque ones and the alpha test
+    // discards the rest before they can write depth. With format 3's 4-bit palette the same
+    // states give clouds and explosions their graduated edge.
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
     dev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
-    dev->SetRenderState(D3DRS_ALPHAREF, 0x80);
+    dev->SetRenderState(D3DRS_ALPHAREF, 1);
     dev->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
     dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
     dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
     dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
     dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
     dev->SetFVF(kWorldFVF);
-    // Untextured: colour comes from the vertex diffuse channel.
     dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
 }
 
 } // namespace
@@ -737,6 +758,8 @@ void Geometry::BeginFrame() {
     g_stackDepth = 0;
     g_renderFlags = 0;
     g_currentTexture = -1;
+    g_currentSubA = 0;
+    g_currentSubB = 0;
     g_skipMask = 0;
     g_skipCounter = 0;
     Identity(g_modelStack[0]);
@@ -870,9 +893,15 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
                 path[sizeof(path) - 1] = 0;
                 Texture::DumpSet(tex, path);
             }
-            if (tex != g_currentTexture) {
+            // word1 holds the two sub-chunk selectors: the low half sign-extended, the
+            // high half as-is. Texture::GetTexture turns them into a frame and a palette.
+            const int subA = (int)(short)(word1 & 0xffff);
+            const int subB = (int)(word1 >> 16);
+            if (tex != g_currentTexture || subA != g_currentSubA || subB != g_currentSubB) {
                 Flush();
                 g_currentTexture = tex;
+                g_currentSubA = subA;
+                g_currentSubB = subB;
             }
             break;
         }

@@ -11,6 +11,31 @@ namespace Device {
 
 bool Create(HWND window);
 
+// Bring the D3D9 runtime into the process without creating a device yet.
+//
+// This exists for RTX Remix. The Remix bridge installs its DirectInput and window-procedure
+// detours when its d3d9.dll loads, and can only drive its own menu with input it detoured
+// *before* the engine took it. Loading at device-creation time is far too late: the engine
+// has already registered its window class and taken the mouse, so the bridge logs
+// "No winproc detected" and its menu never gets a usable cursor. Calling this from the very
+// first export the engine invokes is the earliest point the plugin controls.
+//
+// Safe to call repeatedly; only the first call loads anything. Deliberately not called from
+// DllMain -- LoadLibrary under the loader lock risks deadlock.
+void PreloadD3D9();
+
+// World geometry and the 2D layer want incompatible device state -- different vertex
+// formats, depth behaviour and texture stages -- and the engine interleaves them freely
+// within a frame. Each claims the device before drawing; a true return means the other
+// pipeline had it and the caller must install its own state again. This keeps each path
+// owning its state instead of depending on what frame setup happened to leave behind.
+enum Pipeline {
+    PipelineNone,
+    PipelineWorld,
+    Pipeline2D,
+};
+bool ClaimPipeline(Pipeline pipeline);
+
 // Null until Create succeeds. Subsystems that own D3D resources must tolerate this.
 IDirect3DDevice9* Get();
 void Destroy();
