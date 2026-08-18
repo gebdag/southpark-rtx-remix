@@ -1,0 +1,18 @@
+# Build output
+Video_D3D9/build/
+
+# Ghidra project -- large, machine-local, regenerable from the binary
+ghidra/
+
+# Original game binaries: not ours to redistribute
+original/
+*.exe
+risc.dat.master
+
+# Timestamped working-state snapshots
+backups/
+
+# Runtime capture
+*.log
+*.bin
+*.png

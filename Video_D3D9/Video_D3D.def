@@ -1,0 +1,51 @@
+LIBRARY Video_D3D
+EXPORTS
+; Ordinals match the original Video_D3D.dll exactly, in case the engine binds by
+; ordinal rather than by name. MSVC matches these undecorated names against the
+; leading-underscore __cdecl symbols it emits for a 32-bit build.
+    GFXDLL_BeginScene @1
+    GFXDLL_BlitPCXToPCX @2
+    GFXDLL_CanXXX @3
+    GFXDLL_CheckBloodColor @4
+    GFXDLL_CreatePCX @5
+    GFXDLL_DirtyPCX @6
+    GFXDLL_DoSettingsDialog @7
+    GFXDLL_DrawPCX @8
+    GFXDLL_DrawQuadPCX @9
+    GFXDLL_DumpScreen @10
+    GFXDLL_EndScene @11
+    GFXDLL_EnumerateTexture @12
+    GFXDLL_FinishTextureEnumeration @13
+    GFXDLL_FlushTextureCache @14
+    GFXDLL_GetDriverInfo @15
+    GFXDLL_GetHeightPCX @16
+    GFXDLL_GetIndexedPCX @17
+    GFXDLL_GetOptionStatus @18
+    GFXDLL_GetRGBAPCX @19
+    GFXDLL_GetScreen @20
+    GFXDLL_GetTextureSetPtr @21
+    GFXDLL_GetWidthPCX @22
+    GFXDLL_InitializeDriver @23
+    GFXDLL_LoadPCX @24
+    GFXDLL_LockFrameBufferPCX @25
+    GFXDLL_ProcessDisplayList @26
+    GFXDLL_SetAllocatePCXImageFile @27
+    GFXDLL_SetBlendModePCX @28
+    GFXDLL_SetCapsBits @29
+    GFXDLL_SetColormask @30
+    GFXDLL_SetDLLVariables @31
+    GFXDLL_SetDeallocatePCXImageFile @32
+    GFXDLL_SetTextureFileName @33
+    GFXDLL_SetVSync @34
+    GFXDLL_SetZPlanes @35
+    GFXDLL_SetsaveDataAsPCX @36
+    GFXDLL_ShowWindowsDisplay @37
+    GFXDLL_ShutdownDriver @38
+    GFXDLL_StartFrameTiming @39
+    GFXDLL_StartTextureEnumeration @40
+    GFXDLL_ToggleOption @41
+    GFXDLL_UnloadPCX @42
+    GFXDLL_UnlockFrameBufferPCX @43
+    GFXDLL_UpdateRGBAPCX @44
+    GFXDLL_WaitAndGetFrameMSTime @45
+    GFXDLL_changeViewportSize @46
