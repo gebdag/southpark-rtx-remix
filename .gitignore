@@ -16,3 +16,7 @@ backups/
 *.log
 *.bin
 *.png
+
+# Engine images dumped from memory: derived artefacts, and game code
+SouthPark_unpacked.exe
+SouthPark_code.exe
