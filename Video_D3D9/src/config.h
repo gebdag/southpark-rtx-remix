@@ -73,6 +73,15 @@ float DrawDistance();
 float FarPlane();
 
 
+// ------------------------------------------------------------------------ textures
+
+// Decode format-3 palettes as intensity + alpha rather than as packed colour. Format 3 is the
+// effect atlas -- blood, smoke, explosions, splats, sky -- and its entries carry no colour of
+// their own: the shape is greyscale and the colour comes from the combiner constant. Reading
+// them as 4444 scatters the two bytes across the wrong channels, which is what turned brown
+// splats blue and left the blood spray with an alpha it could not be seen through.
+bool IntensityAlphaEffects();
+
 // ---------------------------------------------------------------------------- colour
 
 // Multiply world geometry by the display list's constant colour, as opcodes 0xfa (primitive)

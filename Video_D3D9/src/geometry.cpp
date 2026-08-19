@@ -169,6 +169,10 @@ const unsigned int* g_skipMask = 0;
 int g_skipCounter = 0;
 const int kSkipMaskLimit = 0x80;
 int g_textureSelects = 0;
+// Selects of a mouth set (MTH*). Character mouths animate by sub-chunk, and only the raw
+// operand separates "the engine stopped asking for new frames" from "the renderer stopped
+// honouring the request", so every mouth select is recorded (RecordMouthOperand).
+unsigned int g_mouthSelects = 0;
 int g_clampLogged = 0;
 
 
@@ -1405,6 +1409,16 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
             // high half as-is. Texture::GetTexture turns them into a frame and a palette.
             const int subA = (int)(short)(word1 & 0xffff);
             const int subB = (int)(word1 >> 16);
+            {
+                const char* setName = Texture::Name(tex);
+                if (setName[0] == 'M' && setName[1] == 'T' && setName[2] == 'H') {
+                    ++g_mouthSelects;
+                    if (g_mouthSelects <= 40 || (g_mouthSelects % 250) == 0) {
+                        LogLine("    mouth select #%u: set %d word1=0x%08x subA=%d subB=%d  %s",
+                                g_mouthSelects, tex, word1, subA, subB, setName);
+                    }
+                }
+            }
             if (tex != g_currentTexture || subA != g_currentSubA || subB != g_currentSubB) {
                 Flush();
                 g_currentTexture = tex;

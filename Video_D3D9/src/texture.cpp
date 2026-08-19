@@ -100,28 +100,38 @@ const unsigned char* ChunkAt(const unsigned char* base, unsigned int size, unsig
     return base + off;
 }
 
-// Palette entries are always stored byte-swapped, but their layout depends on how much
-// alpha the format carries. The original selects between the two per format, through the
-// gate it stashes at texState+0x9c (FUN_1000cf90): 0x8000 for formats 0 and 1, 0xc000 for
-// format 3.
+// Palette entries are always stored byte-swapped, and after the swap two different layouts
+// are in use. The original tells them apart by the gate it stashes at texState+0x9c
+// (FUN_1000cf90): 0x8000 for formats 0 and 1, 0xc000 for format 3. That gate is carried into
+// the texture builder, which at 0x1000609b raises a flag when the tile is colour-indexed and
+// the gate is 0xc000 -- format 3 and nothing else.
 //
 //   RGBA5551 -- one bit of alpha. World surfaces: opaque, or cut out along a hard edge.
-//   ARGB4444 -- four bits of alpha. Format 3 only, which is the effect and sky atlas
-//               (clouds, explosions, shockwaves, flares, Dawn/Day/Nite). These need a
-//               graduated edge, and reading them as 5551 turns a soft ring into concentric
-//               dotted noise -- the alpha bit alternating with the low colour bit.
-inline unsigned int ExpandPaletteEntry(unsigned short stored, bool fourBitAlpha) {
+//               R = bits 15..11, G = 10..6, B = 5..1, A = bit 0.
+//
+//   IA16     -- intensity in the high byte, alpha in the low byte. Format 3 only, which is
+//               the effect atlas: BSPURT01, BSPLSH01, EXPLOD01, SMOKE01, PUFF01, the poo
+//               splats, the sky. These carry no colour of their own at all -- they are a
+//               greyscale shape and a soft edge, and the colour arrives from the combiner's
+//               constant colour, which is why one 16-entry palette serves blood, smoke and
+//               snow alike.
+//
+// Read as 4444 instead, the two bytes fall across the wrong channels and produce colour out
+// of nothing -- blue where brown belongs. The ramps below decompose into two clean linear runs
+// of step 0x11, one per byte, and 4444 shreds them --
+//
+//   Ringo01  high byte 0x11,0x22,0x33 ... 0xff exactly, an intensity ramp
+//            as ARGB4444: 0x660c -> r102 g0 b204, a blue-purple that is in no palette
+//   SNOWPF01 both bytes ramp by 0x11, offset from each other: a puff fading out
+//
+// The alpha goes wrong the same way: the blood spray turns invisible and the pool vanishes
+// once it spreads.
+inline unsigned int ExpandPaletteEntry(unsigned short stored, bool intensityAlpha) {
     const unsigned short c = (unsigned short)(((stored & 0x00ff) << 8) | (stored >> 8));
-    if (fourBitAlpha) {
-        unsigned int a = (c >> 12) & 0x0f;
-        unsigned int r = (c >> 8) & 0x0f;
-        unsigned int g = (c >> 4) & 0x0f;
-        unsigned int b = c & 0x0f;
-        a = (a << 4) | a;
-        r = (r << 4) | r;
-        g = (g << 4) | g;
-        b = (b << 4) | b;
-        return (a << 24) | (r << 16) | (g << 8) | b;
+    if (intensityAlpha) {
+        const unsigned int i = (c >> 8) & 0xff;
+        const unsigned int a = c & 0xff;
+        return (a << 24) | (i << 16) | (i << 8) | i;
     }
     unsigned int r = (c >> 11) & 0x1f;
     unsigned int g = (c >> 6) & 0x1f;
@@ -134,8 +144,10 @@ inline unsigned int ExpandPaletteEntry(unsigned short stored, bool fourBitAlpha)
 }
 
 // Format 3 is the only one whose palette carries a full alpha channel.
-inline bool HasFourBitAlpha(int format) {
-    return format == 3;
+// Format 3 is the effect atlas, and the only one whose palette is intensity + alpha rather
+// than colour. Kept as a predicate because the format byte is checked in several places.
+inline bool IsIntensityAlpha(int format) {
+    return format == 3 && Config::IntensityAlphaEffects();
 }
 
 // Blob layout:
@@ -479,7 +491,7 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
 
     const unsigned short* pal = (const unsigned short*)palette;
     const unsigned int palEntries = palette ? palSize / 2 : 0;
-    const bool fourBitAlpha = HasFourBitAlpha(hdr[0]);
+    const bool intensityAlpha = IsIntensityAlpha(hdr[0]);
     for (int y = 0; y < h; ++y) {
         unsigned int* dst = (unsigned int*)((unsigned char*)lr.pBits + (size_t)y * lr.Pitch);
         for (int x = 0; x < w; ++x) {
@@ -493,7 +505,7 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
                 idx = pixelData[(size_t)y * w + x];
             }
             if (palEntries) {
-                dst[x] = (idx < palEntries) ? ExpandPaletteEntry(pal[idx], fourBitAlpha) : 0u;
+                dst[x] = (idx < palEntries) ? ExpandPaletteEntry(pal[idx], intensityAlpha) : 0u;
                 if ((dst[x] >> 24) == 0) {
                     ++clearTexels;
                 }
