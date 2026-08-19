@@ -444,6 +444,34 @@ void ResolveSubChunks(int fmt, int subA, int subB, int* outPix, int* outPal) {
     *outPal = (int)b;
 }
 
+// Which image sub-chunk to actually decode, once the set's real frame count is known.
+//
+// The rule above reproduces SP_SelectTextureSet exactly, unsigned max and all, but the
+// original never clamps -- and this renderer has to, or it indexes past the blob. The engine
+// can ask a set for an image sub-chunk beyond its frame count together with a palette that is
+// in range -- the 15-frame mouth sets are asked for palettes 12, 13 and 14 that way -- and the
+// unsigned max then picks the out-of-range half. A set's variants otherwise pair frame N with
+// palette N, so when the two disagree it is the in-range one that is meaningful.
+//
+// So prefer a candidate that actually exists: the resolved value when it fits, then the
+// palette index, then the other half. Frame 0 is the last resort, not the first answer:
+// falling back to it leaves a mouth wearing a palette from a frame it is not showing.
+int ResolveImageSubChunk(int resolved, int subA, int subB, unsigned int frames) {
+    if (frames == 0) {
+        return 0;
+    }
+    if (resolved >= 0 && (unsigned int)resolved < frames) {
+        return resolved;
+    }
+    if (subB >= 0 && (unsigned int)subB < frames) {
+        return subB;
+    }
+    if (subA >= 0 && (unsigned int)subA < frames) {
+        return subA;
+    }
+    return 0;
+}
+
 int ClampIndex(int wanted, unsigned int available) {
     if (available == 0) {
         return 0;
@@ -575,7 +603,7 @@ IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
 
     int pixSub = 0, palSub = 0;
     ResolveSubChunks(hdr[0], subA, subB, &pixSub, &palSub);
-    pixSub = ClampIndex(pixSub, SubChunkCount(pixChunk, pixChunkSize));
+    pixSub = ResolveImageSubChunk(pixSub, subA, subB, SubChunkCount(pixChunk, pixChunkSize));
     palSub = ClampIndex(palSub, SubChunkCount(palChunk, palChunkSize));
 
     SetCache& cache = g_cache[index];
@@ -751,7 +779,7 @@ void Texture::Describe(int index, int subA, int subB, char* out, int capacity) {
     }
     int pixSub = 0, palSub = 0;
     ResolveSubChunks(hdr[0], subA, subB, &pixSub, &palSub);
-    pixSub = ClampIndex(pixSub, SubChunkCount(pixChunk, pixChunkSize));
+    pixSub = ResolveImageSubChunk(pixSub, subA, subB, SubChunkCount(pixChunk, pixChunkSize));
     palSub = ClampIndex(palSub, SubChunkCount(palChunk, palChunkSize));
 
     int transparent = -1;
