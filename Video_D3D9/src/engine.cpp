@@ -273,6 +273,108 @@ void __cdecl OnCameraListsBuilt(unsigned char* camera) {
     }
 }
 
+// ------------------------------------------- raising the camera's drawn-object list
+//
+// The list at camera+0xc88 is the one FUN_0043d690 actually draws, and it is a fixed 128
+// entries: FUN_0043ce30 compares the count at camera+0xe88 against 0x80 and, when it is
+// full, simply does not record the object. Nothing is logged and nothing is drawn -- which is
+// why raising DrawDistance made particular objects vanish rather than making the map deeper.
+//
+// The list cannot grow where it is. It runs 0xc88..0xe88 and its own count sits immediately
+// after it, with the next list starting at 0xe8c, so every extra entry would overwrite the
+// count and then the list behind it. It has to move.
+//
+// Moving it is practical because every instruction that reaches it is enumerable, and each
+// one has an equal-length replacement:
+//
+//   0043cea2  cmp eax, 0x80                    the cap          -- imm32, rewritten in place
+//   0043cea9  mov [esi+eax*4+0xc88], edi        the only store   -- 7 bytes, becomes
+//                                                                   mov [eax*4+abs32], edi
+//   0043d6d2  lea edi, [esi+0xc88]  \           the five readers -- 6 bytes each, become
+//   00441f67  lea ecx, [eax+0xc88]   |                             mov reg, imm32 + nop
+//   00442001  lea edi, [eax+0xc88]   | each paired with a read of the count at +0xe88,
+//   00442064  lea ecx, [eax+0xc88]   | which stays where it is and needs no patch
+//   004422d6  lea ecx, [edx+0xc88]  /
+//
+// An exhaustive scan of .text found no other reference to +0xc88, and the count at +0xe88 is
+// left alone, so the engine's own bookkeeping is untouched.
+//
+// THE ONE CAVEAT: the relocated list is a single buffer, where the original was a field
+// inside each camera. With one viewport that is exactly equivalent. With split screen two
+// cameras would share it and the second would overwrite the first, so this is off unless
+// asked for, and should stay off for multiplayer.
+struct ListPatch {
+    unsigned int address;
+    unsigned char expected[8];
+    unsigned int length;
+    unsigned char movOpcode;   // mov r32, imm32 for the readers; 0 for the store
+};
+
+const unsigned int kDrawnListCapSite = 0x0043CEA2;   // cmp eax, 0x80  (imm32 at +1)
+const unsigned char kDrawnListCapCode[5] = { 0x3D, 0x80, 0x00, 0x00, 0x00 };
+const unsigned int kDrawnListStore = 0x0043CEA9;
+const unsigned char kDrawnListStoreCode[7] = { 0x89, 0xBC, 0x86, 0x88, 0x0C, 0x00, 0x00 };
+
+const ListPatch kDrawnListReaders[] = {
+    { 0x0043D6D2, { 0x8D, 0xBE, 0x88, 0x0C, 0x00, 0x00 }, 6, 0xBF },   // lea edi, [esi+0xc88]
+    { 0x00441F67, { 0x8D, 0x88, 0x88, 0x0C, 0x00, 0x00 }, 6, 0xB9 },   // lea ecx, [eax+0xc88]
+    { 0x00442001, { 0x8D, 0xB8, 0x88, 0x0C, 0x00, 0x00 }, 6, 0xBF },   // lea edi, [eax+0xc88]
+    { 0x00442064, { 0x8D, 0x88, 0x88, 0x0C, 0x00, 0x00 }, 6, 0xB9 },   // lea ecx, [eax+0xc88]
+    { 0x004422D6, { 0x8D, 0x8A, 0x88, 0x0C, 0x00, 0x00 }, 6, 0xB9 },   // lea ecx, [edx+0xc88]
+};
+
+unsigned int g_drawnListCap = 0x80;
+
+// Verifies every site before writing any of them: a half-relocated list draws from one
+// address and records into another, which is a crash rather than a glitch.
+bool RaiseDrawnList(unsigned int factor) {
+    const unsigned int newCap = 0x80 * factor;
+    const int readers = (int)(sizeof(kDrawnListReaders) / sizeof(kDrawnListReaders[0]));
+
+    if (!Verify(kDrawnListCapSite, kDrawnListCapCode, sizeof(kDrawnListCapCode)) ||
+        !Verify(kDrawnListStore, kDrawnListStoreCode, sizeof(kDrawnListStoreCode))) {
+        LogLine("    engine: camera drawn-list code is not what was expected -- left alone");
+        return false;
+    }
+    for (int i = 0; i < readers; ++i) {
+        if (!Verify(kDrawnListReaders[i].address, kDrawnListReaders[i].expected,
+                    kDrawnListReaders[i].length)) {
+            LogLine("    engine: camera drawn-list reader at 0x%08X is not what was expected "
+                    "-- list left alone", kDrawnListReaders[i].address);
+            return false;
+        }
+    }
+
+    void* buffer = VirtualAlloc(0, newCap * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buffer) {
+        LogLine("    engine: could not allocate %u bytes for the camera drawn list",
+                newCap * 4);
+        return false;
+    }
+    const unsigned int base = (unsigned int)buffer;
+
+    unsigned char store[7];
+    store[0] = 0x89; store[1] = 0x3C; store[2] = 0x85;    // mov [eax*4 + abs32], edi
+    memcpy(store + 3, &base, 4);
+    if (!Overwrite(kDrawnListStore, store, sizeof(store))) {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        return false;
+    }
+    for (int i = 0; i < readers; ++i) {
+        unsigned char code[6];
+        code[0] = kDrawnListReaders[i].movOpcode;          // mov reg, imm32
+        memcpy(code + 1, &base, 4);
+        code[5] = 0x90;                                    // one byte shorter than the lea
+        Overwrite(kDrawnListReaders[i].address, code, sizeof(code));
+    }
+    PatchOperand(kDrawnListCapSite + 1, 0x80, newCap);
+
+    g_drawnListCap = newCap;
+    LogLine("    engine: camera drawn-object list %u -> %u entries, relocated to 0x%08X "
+            "(single viewport only)", 0x80u, newCap, base);
+    return true;
+}
+
 // ------------------------------------------------------------------- draw arrays
 //
 // The engine records each frame's draw work into three fixed arrays and stops recording, with
@@ -520,6 +622,16 @@ void Engine::Install() {
     const float distance = Config::DrawDistance();
     if (distance > 1024.0f) {
         InstallDrawDistanceFloor(distance);
+    }
+
+    // Raised before the peak counters are installed, so the reported cap is the live one.
+    const unsigned int listScale = Config::CameraDrawListScale();
+    if (listScale > 1 && RaiseDrawnList(listScale)) {
+        for (int i = 0; i < (int)(sizeof(g_cameraLists) / sizeof(g_cameraLists[0])); ++i) {
+            if (g_cameraLists[i].countOffset == 0xE88) {
+                g_cameraLists[i].cap = (int)g_drawnListCap;
+            }
+        }
     }
 
     // Measuring the peaks needs the detour whether or not anything else is patched.

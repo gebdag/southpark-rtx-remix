@@ -67,6 +67,16 @@ unsigned int BatchLimitScale();
 // 0 keeps the engine's own value.
 float DrawDistance();
 
+// Multiplier on the camera's drawn-object list, the fixed 128-entry array the engine
+// records each frame's visible objects into and overruns silently -- an object past it is
+// simply not drawn. This is what bounds DrawDistance: at 8192 units the list peaks around
+// 93 of 128, so a busier scene crosses it and geometry starts going missing.
+//
+// Raising it relocates the list, which makes it a single shared buffer rather than a field
+// inside each camera. That is equivalent for one viewport and WRONG for split screen, so
+// leave it at 1 for multiplayer.
+unsigned int CameraDrawListScale();
+
 // Far plane the renderer builds its projection with, in world units. The engine's own is a
 // little over a thousand units, which clips away most of what the wider volume submits.
 // Zero keeps the engine's value.

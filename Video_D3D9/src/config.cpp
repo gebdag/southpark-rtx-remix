@@ -27,6 +27,7 @@ bool g_uncullEntities = true;
 int g_uncullBudget = 512;
 unsigned int g_batchLimitScale = 8;
 float g_drawDistance = 8192.0f;
+unsigned int g_cameraDrawListScale = 4;
 int g_effectPaletteMode = 1;
 float g_farPlane = 100000.0f;
 bool g_applyConstantColour = true;
@@ -112,6 +113,15 @@ const char* kDefaultIni =
     "; field when the fog option is set, so scaling it in place would compound every\r\n"
     "; frame. 0 keeps the engine's own 1024.\r\n"
     "DrawDistance=8192\r\n"
+    "\r\n"
+    "; The engine records each frame's visible objects into a fixed 128-entry list and stops\r\n"
+    "; recording when it fills -- an object past it is simply not drawn, with no diagnostic.\r\n"
+    "; That is what bounds DrawDistance: at 8192 units the list peaks around 93 of 128, so a\r\n"
+    "; busier scene crosses it and geometry goes missing. This multiplies it and relocates it.\r\n"
+    ";\r\n"
+    "; CAUTION: relocating makes it one shared buffer instead of a field inside each camera.\r\n"
+    "; Equivalent for a single viewport, WRONG for split screen -- set to 1 for multiplayer.\r\n"
+    "CameraDrawListScale=4\r\n"
     "\r\n"
     "; Far plane for the renderer's projection, in world units. The engine builds its own\r\n"
     "; at a little over a thousand units, which would clip away most of what the wider\r\n"
@@ -269,6 +279,10 @@ void Config::Load(void* self) {
                                                             g_iniPath);
     if (g_batchLimitScale < 1)  g_batchLimitScale = 1;
     if (g_batchLimitScale > 64) g_batchLimitScale = 64;
+    g_cameraDrawListScale = (unsigned int)GetPrivateProfileIntA(
+        "FullMap", "CameraDrawListScale", 4, g_iniPath);
+    if (g_cameraDrawListScale < 1)  g_cameraDrawListScale = 1;
+    if (g_cameraDrawListScale > 16) g_cameraDrawListScale = 16;
     g_drawDistance = (float)GetPrivateProfileIntA("FullMap", "DrawDistance", 8192, g_iniPath);
     if (g_drawDistance < 0.0f)     g_drawDistance = 0.0f;
     // These boxes also feed spatial lookups and a near-infinite extent crashes the game.
@@ -311,7 +325,8 @@ void Config::Load(void* self) {
             "UncullBudget=%d BatchLimitScale=%u FarPlane=%.0f",
             g_loadEntireMap, g_disableFrustumTest, g_uncullRooms, g_uncullEntities,
             g_uncullBudget, g_batchLimitScale, g_farPlane);
-    LogLine("    DrawDistance=%.0f", g_drawDistance);
+    LogLine("    DrawDistance=%.0f CameraDrawListScale=%u",
+            g_drawDistance, g_cameraDrawListScale);
     LogLine("    EffectPaletteMode=%d", g_effectPaletteMode);
     LogLine("    ApplyConstantColour=%d", g_applyConstantColour);
     LogLine("    SynthesiseSkybox=%d SkyboxSize=%.0f SkyboxColour=%d "
@@ -337,6 +352,7 @@ bool Config::UncullRooms()                { return g_uncullRooms; }
 bool Config::UncullEntities()             { return g_uncullEntities; }
 int Config::UncullBudget()                { return g_uncullBudget; }
 unsigned int Config::BatchLimitScale()    { return g_batchLimitScale; }
+unsigned int Config::CameraDrawListScale() { return g_cameraDrawListScale; }
 float Config::DrawDistance()              { return g_drawDistance; }
 float Config::FarPlane()                  { return g_farPlane; }
 int Config::EffectPaletteMode()           { return g_effectPaletteMode; }
