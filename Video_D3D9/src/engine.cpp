@@ -131,6 +131,50 @@ int g_extraVisible = 0;         // overrides granted this frame
 int g_extraVisiblePeak = 0;
 int g_extraVisibleDenied = 0;   // rejections the budget could not cover
 
+// The resource cache the visible side of the entity path registers through. It is a hash
+// table whose slots are only ever released by the NOT-visible side, so every object the
+// budget forces visible is an entry that is never given back. A few dozen overrides a frame
+// fill its few thousand slots within seconds -- which is why geometry stops appearing a little
+// way into a scene rather than immediately, and why it is objects that arrive LATE, after a
+// cut, that go missing: by then there is no slot left to register them.
+const unsigned int kResourceCacheMask  = 0x00599050;
+const unsigned int kResourceCacheTable = 0x00599054;
+unsigned int g_cachePeak = 0;
+unsigned int g_cacheSlots = 0;
+
+// Counts occupied slots. Walked at intervals rather than per frame: the table is thousands of
+// entries and this is a diagnostic, not a hot path.
+void SampleResourceCache() {
+    if (IsBadReadPtr((const void*)kResourceCacheMask, 4) ||
+        IsBadReadPtr((const void*)kResourceCacheTable, 4)) {
+        return;
+    }
+    const unsigned int mask = *(const unsigned int*)kResourceCacheMask;
+    void** table = *(void***)kResourceCacheTable;
+    if (!table || mask == 0 || mask > 0xFFFF) {
+        return;
+    }
+    const unsigned int slots = mask + 1;
+    if (IsBadReadPtr(table, slots * sizeof(void*))) {
+        return;
+    }
+    unsigned int used = 0;
+    for (unsigned int i = 0; i < slots; ++i) {
+        if (table[i]) {
+            ++used;
+        }
+    }
+    g_cacheSlots = slots;
+    if (used > g_cachePeak) {
+        g_cachePeak = used;
+    }
+    if (used * 10 >= slots * 9) {
+        LogLine("    engine: entity resource cache %u/%u slots used -- it is nearly full, and "
+                "objects that arrive after it fills cannot register, so they are never drawn. "
+                "Lower UncullBudget or set UncullEntities=0.", used, slots);
+    }
+}
+
 typedef int (__cdecl *FrustumTestFn)(const void*, const void*);
 
 int __cdecl BudgetedFrustumTest(const void* planes, const void* box) {
@@ -415,11 +459,16 @@ DrawArray g_arrays[] = {
       { 0x0042B126, 0 },          0x0050BF58, 0x20, 0, 0, 0 },
 };
 
+unsigned int g_frameTick = 0;
+
 void __cdecl OnDrawListsReady() {
     if (g_extraVisible > g_extraVisiblePeak) {
         g_extraVisiblePeak = g_extraVisible;
     }
     g_extraVisible = 0;
+    if ((++g_frameTick % 120) == 0) {
+        SampleResourceCache();
+    }
     for (int i = 0; i < (int)(sizeof(g_arrays) / sizeof(g_arrays[0])); ++i) {
         DrawArray& a = g_arrays[i];
         const int value = *a.counter;
@@ -707,6 +756,14 @@ void Engine::LogState() {
             g_frustumSitesPatched, g_entitySitePatched ? "widened" : "untouched",
             g_extraVisiblePeak, g_extraVisibleDenied);
     LogLine("    engine: room visibility widened at %d sites", g_roomTestsWidened);
+    SampleResourceCache();
+    if (g_cacheSlots) {
+        LogLine("    engine: entity resource cache peak %u / %u slots%s",
+                g_cachePeak, g_cacheSlots,
+                (g_cachePeak * 10 >= g_cacheSlots * 9)
+                    ? "   <-- saturated; late-arriving objects could not register"
+                    : "");
+    }
     if (g_drawDistancePatched) {
         LogLine("    engine: camera draw distance floor %.0f -> %.0f units in the last "
                 "frame (engine default 1024)", g_drawDistanceFloor, g_drawDistanceApplied);

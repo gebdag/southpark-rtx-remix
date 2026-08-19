@@ -23,7 +23,7 @@ bool g_logEveryCall = false;
 bool g_loadEntireMap = true;
 bool g_disableFrustumTest = true;
 bool g_uncullRooms = true;
-bool g_uncullEntities = true;
+bool g_uncullEntities = false;
 int g_uncullBudget = 512;
 unsigned int g_batchLimitScale = 8;
 float g_drawDistance = 8192.0f;
@@ -272,7 +272,7 @@ void Config::Load(void* self) {
     g_loadEntireMap              = ReadBool("FullMap", "LoadEntireMap", true);
     g_disableFrustumTest         = ReadBool("FullMap", "DisableFrustumTest", true);
     g_uncullRooms                = ReadBool("FullMap", "UncullRooms", true);
-    g_uncullEntities             = ReadBool("FullMap", "UncullEntities", true);
+    g_uncullEntities             = ReadBool("FullMap", "UncullEntities", false);
     g_uncullBudget = GetPrivateProfileIntA("FullMap", "UncullBudget", 512, g_iniPath);
     if (g_uncullBudget < 0) g_uncullBudget = 0;
     g_batchLimitScale = (unsigned int)GetPrivateProfileIntA("FullMap", "BatchLimitScale", 8,
