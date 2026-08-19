@@ -354,22 +354,27 @@ unsigned char* BuildPreCallDetour(unsigned int original, void* callback) {
     return cave;
 }
 
-// Runs the original and then hands its first argument to a callback. Both callees leave the
-// argument in place, so `add esp, 8` balances the shim and the caller still cleans its own
-// push.
-unsigned char* BuildForwardingDetour(unsigned int original, void* callback) {
+// Hands the first argument to a callback and then tail-jumps to the original with the
+// caller's frame completely untouched.
+//
+// The tail jump is the point. A shim that instead calls the original after pushing a copy of
+// argument one leaves that copy, and its own return address, sitting between the original and
+// the arguments beyond the first -- so a two-argument function reads the shim's return address
+// as its second argument. FUN_0043d690 is `push esi; push ebx; call`, and a corrupt second
+// argument stops every object it draws from appearing. Jumping keeps the stack exactly as the
+// caller built it, whatever the arity.
+unsigned char* BuildArgumentTapDetour(unsigned int original, void* callback) {
     unsigned char* cave = (unsigned char*)VirtualAlloc(0, 64, MEM_COMMIT | MEM_RESERVE,
                                                        PAGE_EXECUTE_READWRITE);
     if (!cave) {
         return 0;
     }
     g_write = cave;
-    Emit(0xFF); Emit(0x74); Emit(0x24); Emit(0x04);   // push dword ptr [esp+4]
-    EmitCall(original);
-    Emit(0xFF); Emit(0x74); Emit(0x24); Emit(0x08);   // push dword ptr [esp+8]
+    Emit(0xFF); Emit(0x74); Emit(0x24); Emit(0x04);   // push dword ptr [esp+4]  (argument 1)
     EmitCall((unsigned int)callback);
-    Emit(0x83); Emit(0xC4); Emit(0x08);               // add esp, 8
-    Emit(0xC3);
+    Emit(0x83); Emit(0xC4); Emit(0x04);               // add esp, 4
+    Emit(0xE9);                                       // jmp original
+    EmitDword(original - ((unsigned int)g_write + 4));
     return cave;
 }
 
@@ -406,8 +411,8 @@ void Engine::Install() {
     }
 
     // Measuring the peaks needs the detour whether or not anything else is patched.
-    unsigned char* listDetour = BuildForwardingDetour(kVisibleListConsumer,
-                                                     (void*)&OnCameraListsBuilt);
+    unsigned char* listDetour = BuildArgumentTapDetour(kVisibleListConsumer,
+                                                      (void*)&OnCameraListsBuilt);
     if (listDetour) {
         RedirectCallSites(&kVisibleListConsumerCallSite, 1, kVisibleListConsumer, listDetour);
     }
