@@ -54,6 +54,18 @@ int UncullBudget();
 // its bound, which is what a whole map needs once the frustum test is off.
 unsigned int BatchLimitScale();
 
+// Multiplier on the camera's own draw distance (camera+0x4e4, 1024 units by default, and
+// the field the "Fog Distance" video option moves). That distance sizes the frustum corner
+// points, the side planes, the frustum AABB the engine's 2D X/Z test compares against, and
+// the cull box it publishes -- so it, not the frustum test, is what still removes the town
+// once the room and frustum tests are widened. 1 keeps the engine's own value.
+unsigned int DrawDistanceScale();
+
+// Ceiling on the scaled draw distance, in world units. The camera's boxes also feed spatial
+// lookups and a near-infinite extent crashes the game, so the multiplier is clamped rather
+// than trusted.
+float DrawDistanceMax();
+
 // Far plane the renderer builds its projection with, in world units. The engine's own is a
 // little over a thousand units, which clips away most of what the wider volume submits.
 // Zero keeps the engine's value.

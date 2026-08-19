@@ -26,6 +26,8 @@ bool g_uncullRooms = true;
 bool g_uncullEntities = true;
 int g_uncullBudget = 512;
 unsigned int g_batchLimitScale = 8;
+unsigned int g_drawDistanceScale = 8;
+float g_drawDistanceMax = 32768.0f;
 float g_farPlane = 100000.0f;
 bool g_applyConstantColour = true;
 bool g_synthesiseSkybox = true;
@@ -97,6 +99,21 @@ const char* kDefaultIni =
     "; up. This multiplies all three and relocates them, and it applies whether or not\r\n"
     "; LoadEntireMap is on. 1 keeps the engine's own sizes. The log says when one fills.\r\n"
     "BatchLimitScale=8\r\n"
+    "\r\n"
+    "; What still culls the town after the tests above are widened is the camera's own\r\n"
+    "; draw distance -- 1024 units, the field the game's 'Fog Distance' video option\r\n"
+    "; moves. The engine sizes its frustum corners, side planes, frustum box and cull\r\n"
+    "; box from it, and the 2D X/Z box test that runs between the room and frustum\r\n"
+    "; tests rejects everything outside that box before the frustum override is ever\r\n"
+    "; reached. This multiplies it and lets the engine rebuild all of them itself, so\r\n"
+    "; nothing is hand-forged and gameplay keeps reading a camera merely set to see\r\n"
+    "; further. 1 keeps the engine's own value.\r\n"
+    "DrawDistanceScale=8\r\n"
+    "\r\n"
+    "; Ceiling on that distance in world units. The camera boxes also feed spatial\r\n"
+    "; lookups and a near-infinite extent crashes the game, so the multiplier is\r\n"
+    "; clamped.\r\n"
+    "DrawDistanceMax=32768\r\n"
     "\r\n"
     "; Far plane for the renderer's projection, in world units. The engine builds its own\r\n"
     "; at a little over a thousand units, which would clip away most of what the wider\r\n"
@@ -239,6 +256,13 @@ void Config::Load(void* self) {
                                                             g_iniPath);
     if (g_batchLimitScale < 1)  g_batchLimitScale = 1;
     if (g_batchLimitScale > 64) g_batchLimitScale = 64;
+    g_drawDistanceScale = (unsigned int)GetPrivateProfileIntA("FullMap", "DrawDistanceScale",
+                                                              8, g_iniPath);
+    if (g_drawDistanceScale < 1)  g_drawDistanceScale = 1;
+    if (g_drawDistanceScale > 64) g_drawDistanceScale = 64;
+    g_drawDistanceMax = (float)GetPrivateProfileIntA("FullMap", "DrawDistanceMax", 32768,
+                                                     g_iniPath);
+    if (g_drawDistanceMax < 1024.0f) g_drawDistanceMax = 1024.0f;
     g_farPlane = (float)GetPrivateProfileIntA("FullMap", "FarPlane", 100000, g_iniPath);
     g_applyConstantColour        = ReadBool("Colour", "ApplyConstantColour", true);
     g_synthesiseSkybox           = ReadBool("Sky", "SynthesiseSkybox", true);
@@ -275,6 +299,8 @@ void Config::Load(void* self) {
             "UncullBudget=%d BatchLimitScale=%u FarPlane=%.0f",
             g_loadEntireMap, g_disableFrustumTest, g_uncullRooms, g_uncullEntities,
             g_uncullBudget, g_batchLimitScale, g_farPlane);
+    LogLine("    DrawDistanceScale=%u DrawDistanceMax=%.0f",
+            g_drawDistanceScale, g_drawDistanceMax);
     LogLine("    ApplyConstantColour=%d", g_applyConstantColour);
     LogLine("    SynthesiseSkybox=%d SkyboxSize=%.0f SkyboxColour=%d "
             "SkyboxBlueShift=%d SkyboxBlueTarget=0x%06X",
@@ -299,6 +325,8 @@ bool Config::UncullRooms()                { return g_uncullRooms; }
 bool Config::UncullEntities()             { return g_uncullEntities; }
 int Config::UncullBudget()                { return g_uncullBudget; }
 unsigned int Config::BatchLimitScale()    { return g_batchLimitScale; }
+unsigned int Config::DrawDistanceScale()  { return g_drawDistanceScale; }
+float Config::DrawDistanceMax()           { return g_drawDistanceMax; }
 float Config::FarPlane()                  { return g_farPlane; }
 bool Config::ApplyConstantColour()        { return g_applyConstantColour; }
 bool Config::SynthesiseSkybox()           { return g_synthesiseSkybox; }
