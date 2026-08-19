@@ -27,7 +27,7 @@ bool g_uncullEntities = true;
 int g_uncullBudget = 512;
 unsigned int g_batchLimitScale = 8;
 float g_drawDistance = 8192.0f;
-unsigned int g_cameraDrawListScale = 4;
+unsigned int g_cameraDrawListScale = 1;
 int g_effectPaletteMode = 1;
 float g_farPlane = 100000.0f;
 bool g_applyConstantColour = true;
@@ -121,7 +121,7 @@ const char* kDefaultIni =
     ";\r\n"
     "; CAUTION: relocating makes it one shared buffer instead of a field inside each camera.\r\n"
     "; Equivalent for a single viewport, WRONG for split screen -- set to 1 for multiplayer.\r\n"
-    "CameraDrawListScale=4\r\n"
+    "CameraDrawListScale=1\r\n"
     "\r\n"
     "; Far plane for the renderer's projection, in world units. The engine builds its own\r\n"
     "; at a little over a thousand units, which would clip away most of what the wider\r\n"
@@ -280,7 +280,7 @@ void Config::Load(void* self) {
     if (g_batchLimitScale < 1)  g_batchLimitScale = 1;
     if (g_batchLimitScale > 64) g_batchLimitScale = 64;
     g_cameraDrawListScale = (unsigned int)GetPrivateProfileIntA(
-        "FullMap", "CameraDrawListScale", 4, g_iniPath);
+        "FullMap", "CameraDrawListScale", 1, g_iniPath);
     if (g_cameraDrawListScale < 1)  g_cameraDrawListScale = 1;
     if (g_cameraDrawListScale > 16) g_cameraDrawListScale = 16;
     g_drawDistance = (float)GetPrivateProfileIntA("FullMap", "DrawDistance", 8192, g_iniPath);

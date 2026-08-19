@@ -290,14 +290,19 @@ void __cdecl OnCameraListsBuilt(unsigned char* camera) {
 //   0043cea2  cmp eax, 0x80                    the cap          -- imm32, rewritten in place
 //   0043cea9  mov [esi+eax*4+0xc88], edi        the only store   -- 7 bytes, becomes
 //                                                                   mov [eax*4+abs32], edi
-//   0043d6d2  lea edi, [esi+0xc88]  \           the five readers -- 6 bytes each, become
-//   00441f67  lea ecx, [eax+0xc88]   |                             mov reg, imm32 + nop
+//   0043d6d2  lea edi, [esi+0xc88]  \           the readers -- 6 bytes each, become
+//   00441f67  lea ecx, [eax+0xc88]   |                        mov reg, imm32 plus a nop
 //   00442001  lea edi, [eax+0xc88]   | each paired with a read of the count at +0xe88,
 //   00442064  lea ecx, [eax+0xc88]   | which stays where it is and needs no patch
 //   004422d6  lea ecx, [edx+0xc88]  /
+//   0043d7af  add eax, 0xc88                    the sixth reader -- 5 bytes, becomes
+//                                                                   mov eax, imm32
 //
-// An exhaustive scan of .text found no other reference to +0xc88, and the count at +0xe88 is
-// left alone, so the engine's own bookkeeping is untouched.
+// That last one forms the address with an add rather than a displacement, so a search for
+// `[reg + 0xc88]` misses it; left unpatched, it reads whatever remains at camera+0xc88 and
+// dereferences it as an object pointer. The list above covers every instruction in .text that
+// mentions the constant in any operand form. The count at +0xe88 is left alone, so the
+// engine's own bookkeeping is untouched.
 //
 // THE ONE CAVEAT: the relocated list is a single buffer, where the original was a field
 // inside each camera. With one viewport that is exactly equivalent. With split screen two
@@ -321,6 +326,7 @@ const ListPatch kDrawnListReaders[] = {
     { 0x00442001, { 0x8D, 0xB8, 0x88, 0x0C, 0x00, 0x00 }, 6, 0xBF },   // lea edi, [eax+0xc88]
     { 0x00442064, { 0x8D, 0x88, 0x88, 0x0C, 0x00, 0x00 }, 6, 0xB9 },   // lea ecx, [eax+0xc88]
     { 0x004422D6, { 0x8D, 0x8A, 0x88, 0x0C, 0x00, 0x00 }, 6, 0xB9 },   // lea ecx, [edx+0xc88]
+    { 0x0043D7AF, { 0x05, 0x88, 0x0C, 0x00, 0x00, 0x00 }, 5, 0xB8 },   // add eax, 0xc88
 };
 
 unsigned int g_drawnListCap = 0x80;
@@ -364,8 +370,8 @@ bool RaiseDrawnList(unsigned int factor) {
         unsigned char code[6];
         code[0] = kDrawnListReaders[i].movOpcode;          // mov reg, imm32
         memcpy(code + 1, &base, 4);
-        code[5] = 0x90;                                    // one byte shorter than the lea
-        Overwrite(kDrawnListReaders[i].address, code, sizeof(code));
+        code[5] = 0x90;                                    // padding, only the 6-byte forms
+        Overwrite(kDrawnListReaders[i].address, code, kDrawnListReaders[i].length);
     }
     PatchOperand(kDrawnListCapSite + 1, 0x80, newCap);
 
