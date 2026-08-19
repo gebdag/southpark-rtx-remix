@@ -189,6 +189,10 @@ struct SetDraws {
     unsigned int flushes;
     unsigned int tris;
     unsigned int flushesWithoutTexture;
+    // The tint the batch carried, kept so the census can separate a texture that decoded to
+    // the wrong colour from one that decoded correctly and was then tinted wrongly.
+    unsigned int lastConstant;
+    int lastMode;
 };
 SetDraws g_setDraws[kCensusSets];
 unsigned int g_noSelectFlushes = 0;   // batches drawn before any 0xa9 named a set
@@ -849,6 +853,8 @@ void Flush() {
     if (tex) { ++g_texturedFlushes; } else { ++g_untexturedFlushes; }
     if (g_currentTexture >= 0 && g_currentTexture < kCensusSets) {
         SetDraws& d = g_setDraws[g_currentTexture];
+        d.lastConstant = Config::ApplyConstantColour() ? ConstantColourForBatch() : 0xffffffffu;
+        d.lastMode = g_combinerMode;
         ++d.flushes;
         d.tris += (unsigned int)(g_indexCount / 3);
         if (!tex) {
@@ -1637,10 +1643,26 @@ void Geometry::LogTextureStats() {
             break;
         }
         const SetDraws& d = g_setDraws[best];
-        LogLine("      set %4d  %9u tris  %7u flushes%s%s  %s", best, d.tris, d.flushes,
+        // Texture colour as decoded, and the tint that was applied to it. If the decoded
+        // mean is brown and the tint is blue, the palette is fine and the combiner constant
+        // is not; if the decoded mean is itself blue, the palette reading is wrong.
+        const int mean = Texture::MeanColour(best);
+        const unsigned int k = d.lastConstant;
+        char colour[96];
+        if (mean >= 0) {
+            _snprintf(colour, sizeof(colour),
+                      "  texRGB=%02X%02X%02X tint=%02X%02X%02X mode=%02X",
+                      (mean >> 16) & 0xff, (mean >> 8) & 0xff, mean & 0xff,
+                      k & 0xff, (k >> 8) & 0xff, (k >> 16) & 0xff, d.lastMode & 0xff);
+        } else {
+            _snprintf(colour, sizeof(colour), "  (never decoded)");
+        }
+        colour[sizeof(colour) - 1] = 0;
+        LogLine("      set %4d  %9u tris  %7u flushes%s%s%s  %s  fmt=%d",
+                best, d.tris, d.flushes,
                 d.flushesWithoutTexture ? "   NO TEXTURE BOUND" : "",
                 Texture::DecodeFailed(best) ? " (decode failed)" : "",
-                Texture::Name(best));
+                colour, Texture::Name(best), Texture::Format(best));
         g_setDraws[best].tris = 0;
     }
 }

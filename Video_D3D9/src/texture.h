@@ -33,6 +33,12 @@ void LogSetCensus();
 
 int Count();
 
+// Mean colour of the decoded texels of a set's first cached frame, as 0x00RRGGBB, and -1 when
+// nothing of it has been decoded. This is the texture as the renderer actually built it,
+// before any tint -- the only way to tell "the palette decoded wrong" from "the right texture
+// was tinted the wrong colour".
+int MeanColour(int index);
+
 // The ASCII name stored in chunk 3, or "" when the set has none. Empty for an unknown index.
 const char* Name(int index);
 

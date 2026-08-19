@@ -21,6 +21,7 @@ void* g_sets[kMaxSets];
 struct Variant {
     unsigned short pix, pal;
     unsigned short transparentPercent;   // texels the alpha test would discard
+    unsigned int meanColour;             // mean of the opaque texels, 0x00RRGGBB
     IDirect3DTexture9* tex;
 };
 // Deep enough for the widest sets (SMOKE01 has 30 frames, BOOM05 27 palettes). A
@@ -38,6 +39,7 @@ bool  g_decodeFailed[kMaxSets];
 int   g_decodeFailuresLogged = 0;
 // Filled by the decoder and consumed by the caller that cached the variant.
 unsigned short g_lastDecodeTransparentPercent = 0;
+unsigned int g_lastDecodeMeanColour = 0;
 int   g_decodeFailures = 0;
 bool  g_isSky[kMaxSets];
 int   g_count = 0;
@@ -507,6 +509,7 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
         return 0;
     }
     unsigned int clearTexels = 0;
+    unsigned int sumR = 0, sumG = 0, sumB = 0, opaqueTexels = 0;
 
     const unsigned short* pal = (const unsigned short*)palette;
     const unsigned int palEntries = palette ? palSize / 2 : 0;
@@ -527,6 +530,14 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
                 dst[x] = (idx < palEntries) ? ExpandPaletteEntry(pal[idx], effectMode) : 0u;
                 if ((dst[x] >> 24) == 0) {
                     ++clearTexels;
+                } else {
+                    // Mean over the visible texels only: averaging in the transparent ones
+                    // drags every cut-out texture towards whatever the clear colour is and
+                    // hides the very difference this is here to show.
+                    sumR += (dst[x] >> 16) & 0xff;
+                    sumG += (dst[x] >> 8) & 0xff;
+                    sumB += dst[x] & 0xff;
+                    ++opaqueTexels;
                 }
             } else {
                 // Palette-less sets are single-channel coverage: white modulated by the
@@ -538,6 +549,9 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
     tex->UnlockRect(0);
     g_lastDecodeTransparentPercent =
         pixels ? (unsigned short)((clearTexels * 100) / pixels) : 0;
+    g_lastDecodeMeanColour = opaqueTexels
+        ? (((sumR / opaqueTexels) << 16) | ((sumG / opaqueTexels) << 8) | (sumB / opaqueTexels))
+        : 0u;
     return tex;
 }
 
@@ -590,6 +604,7 @@ IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
         cache.v[cache.n].pix = (unsigned short)pixSub;
         cache.v[cache.n].pal = (unsigned short)palSub;
         cache.v[cache.n].transparentPercent = g_lastDecodeTransparentPercent;
+        cache.v[cache.n].meanColour = g_lastDecodeMeanColour;
         cache.v[cache.n].tex = tex;
         ++cache.n;
     } else {
@@ -604,6 +619,7 @@ IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
         victim.pix = (unsigned short)pixSub;
         victim.pal = (unsigned short)palSub;
         victim.transparentPercent = g_lastDecodeTransparentPercent;
+        victim.meanColour = g_lastDecodeMeanColour;
         victim.tex = tex;
     }
     return tex;
@@ -676,6 +692,13 @@ void Texture::LogSetCensus() {
 
 int Texture::Count() {
     return g_count;
+}
+
+int Texture::MeanColour(int index) {
+    if (index < 0 || index >= g_count || g_cache[index].n == 0) {
+        return -1;
+    }
+    return (int)g_cache[index].v[0].meanColour;
 }
 
 const char* Texture::Name(int index) {
