@@ -285,6 +285,11 @@ const int kMaxIndices  = 8192;
 
 WorldVertex g_vertices[kMaxVertices];
 unsigned short g_indices[kMaxIndices];
+// Scratch for compacting a batch down to the vertices it actually indexes, so the range handed
+// to D3D -- and therefore the range Remix hashes -- is exactly the geometry being drawn.
+WorldVertex    g_compactVertices[kMaxVertices];
+unsigned short g_compactIndices[kMaxIndices];
+int            g_compactMap[kMaxVertices];
 int g_indexCount = 0;
 int g_highWater  = 0;   // highest slot written this frame; the window outlives a flush
 
@@ -954,10 +959,34 @@ void Flush() {
         DumpBatch(vertexCount, tex != 0, cull, sky);
     }
 
-    HRESULT hr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vertexCount,
+    // Hand over ONLY the vertices this batch actually indexes.
+    //
+    // Passing the whole slot array up to the highest index used is correct for D3D -- the
+    // unreferenced vertices are ignored -- but RTX Remix hashes the vertex range it is given,
+    // not the subset the indices reach. A four-vertex house wall submitted inside a range of
+    // forty therefore gets a hash covering thirty-six vertices belonging to other geometry,
+    // and as the camera moves and the batch composition changes, so does the hash. Remix then
+    // sees the same static wall as a brand new mesh over and over.
+    //
+    // Compacting makes the hashed data exactly the drawn geometry, so a wall that does not
+    // change keeps its identity from frame to frame.
+    int compactCount = 0;
+    for (int i = 0; i < vertexCount; ++i) {
+        g_compactMap[i] = -1;
+    }
+    for (int i = 0; i < g_indexCount; ++i) {
+        const unsigned short src = g_indices[i];
+        if (src < vertexCount && g_compactMap[src] < 0) {
+            g_compactMap[src] = compactCount;
+            g_compactVertices[compactCount++] = g_vertices[src];
+        }
+        g_compactIndices[i] = (unsigned short)(src < vertexCount ? g_compactMap[src] : 0);
+    }
+
+    HRESULT hr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, compactCount,
                                              g_indexCount / 3,
-                                             g_indices, D3DFMT_INDEX16,
-                                             g_vertices, sizeof(WorldVertex));
+                                             g_compactIndices, D3DFMT_INDEX16,
+                                             g_compactVertices, sizeof(WorldVertex));
     if (FAILED(hr)) {
         LogLine("    DrawIndexedPrimitiveUP failed hr=0x%08lx", (unsigned long)hr);
     }
