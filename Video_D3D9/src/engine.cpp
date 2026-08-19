@@ -156,13 +156,19 @@ int __cdecl BudgetedFrustumTest(const void* planes, const void* box) {
 // beyond it never reaches the frustum test at all, so almost nothing gets as far as the
 // budgeted override.
 //
-// So the distance is scaled at its source and the engine rebuilds everything spatial from it,
+// So the distance is raised at its source and the engine rebuilds everything spatial from it,
 // rather than the boxes being rewritten after the fact. That matters twice over: the derived
 // volumes stay consistent with each other, and -- because camera+0x4e4 is the field the
 // game's own "Fog Distance" video option moves -- a larger value is a state the engine is
 // built to run in. Gameplay keeps making its decisions from a camera that is merely set to
 // see further, which is why this does not repeat the entity starvation that forcing the room
 // mask caused.
+//
+// It raises the field to a floor rather than scaling it, because the engine does not rewrite
+// it every frame: on two of the three paths below the field simply keeps what it already
+// holds, so a multiply would compound frame over frame until it saturated whatever ceiling it
+// was given. A floor lands on the same value however many times it runs, and steps aside if
+// the fog option ever asks for more.
 //
 // SP_UpdateCamera reaches the value by three paths and they converge at 0x00421807:
 //
@@ -184,8 +190,7 @@ const unsigned char kCameraDistanceCode[10] = {
 };
 
 // Read by the patched code itself, so they are globals rather than captured values.
-float g_drawDistanceScale   = 1.0f;
-float g_drawDistanceCeiling = 32768.0f;
+float g_drawDistanceFloor   = 0.0f;
 float g_drawDistanceApplied = 0.0f;
 bool  g_drawDistancePatched = false;
 
@@ -421,7 +426,7 @@ unsigned char* BuildArgumentTapDetour(unsigned int original, void* callback) {
     return cave;
 }
 
-bool InstallDrawDistanceScale(unsigned int factor, float ceiling) {
+bool InstallDrawDistanceFloor(float distance) {
     if (!Verify(kCameraDistanceSite, kCameraDistanceCode, sizeof(kCameraDistanceCode))) {
         LogLine("    engine: 0x%08X is not the camera draw-distance code -- not patching",
                 kCameraDistanceSite);
@@ -432,17 +437,14 @@ bool InstallDrawDistanceScale(unsigned int factor, float ceiling) {
     if (!cave) {
         return false;
     }
-    g_drawDistanceScale   = (float)factor;
-    g_drawDistanceCeiling = ceiling;
+    g_drawDistanceFloor = distance;
 
     g_write = cave;
     Emit(0x8D); Emit(0x64); Emit(0x24); Emit(0xF0);            // lea    esp, [esp-16]
     Emit(0x0F); Emit(0x11); Emit(0x04); Emit(0x24);            // movups [esp], xmm0
     Emit(0xF3); Emit(0x0F); Emit(0x10); Emit(0x86); EmitDword(0x4E4);   // movss xmm0,[esi+4e4]
-    Emit(0xF3); Emit(0x0F); Emit(0x59); Emit(0x05);
-    EmitDword((unsigned int)&g_drawDistanceScale);                      // mulss xmm0,[scale]
-    Emit(0xF3); Emit(0x0F); Emit(0x5D); Emit(0x05);
-    EmitDword((unsigned int)&g_drawDistanceCeiling);                    // minss xmm0,[ceiling]
+    Emit(0xF3); Emit(0x0F); Emit(0x5F); Emit(0x05);
+    EmitDword((unsigned int)&g_drawDistanceFloor);                      // maxss xmm0,[floor]
     Emit(0xF3); Emit(0x0F); Emit(0x11); Emit(0x86); EmitDword(0x4E4);   // movss [esi+4e4],xmm0
     Emit(0xF3); Emit(0x0F); Emit(0x11); Emit(0x05);
     EmitDword((unsigned int)&g_drawDistanceApplied);                    // movss [applied],xmm0
@@ -463,8 +465,8 @@ bool InstallDrawDistanceScale(unsigned int factor, float ceiling) {
         return false;
     }
     g_drawDistancePatched = true;
-    LogLine("    engine: camera draw distance x%u, capped at %.0f units (engine default 1024)",
-            factor, ceiling);
+    LogLine("    engine: camera draw distance raised to at least %.0f units "
+            "(engine default 1024)", distance);
     return true;
 }
 
@@ -501,10 +503,10 @@ void Engine::Install() {
     }
 
     // The draw distance is the engine's own "Fog Distance" field, so it is raised on its
-    // own switch rather than behind LoadEntireMap: 1 leaves the engine's 1024 units alone.
-    const unsigned int distance = Config::DrawDistanceScale();
-    if (distance > 1) {
-        InstallDrawDistanceScale(distance, Config::DrawDistanceMax());
+    // own switch rather than behind LoadEntireMap: 0 leaves the engine's 1024 units alone.
+    const float distance = Config::DrawDistance();
+    if (distance > 1024.0f) {
+        InstallDrawDistanceFloor(distance);
     }
 
     // Measuring the peaks needs the detour whether or not anything else is patched.
@@ -575,8 +577,8 @@ void Engine::LogState() {
             g_extraVisiblePeak, g_extraVisibleDenied);
     LogLine("    engine: room visibility widened at %d sites", g_roomTestsWidened);
     if (g_drawDistancePatched) {
-        LogLine("    engine: camera draw distance x%.0f -> %.0f units in the last frame "
-                "(engine default 1024)", g_drawDistanceScale, g_drawDistanceApplied);
+        LogLine("    engine: camera draw distance floor %.0f -> %.0f units in the last "
+                "frame (engine default 1024)", g_drawDistanceFloor, g_drawDistanceApplied);
     } else {
         LogLine("    engine: camera draw distance left at the engine's own value");
     }
