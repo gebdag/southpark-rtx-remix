@@ -126,12 +126,31 @@ const unsigned char* ChunkAt(const unsigned char* base, unsigned int size, unsig
 //
 // The alpha goes wrong the same way: the blood spray turns invisible and the pool vanishes
 // once it spreads.
-inline unsigned int ExpandPaletteEntry(unsigned short stored, bool intensityAlpha) {
+inline unsigned int ExpandPaletteEntry(unsigned short stored, int effectMode) {
     const unsigned short c = (unsigned short)(((stored & 0x00ff) << 8) | (stored >> 8));
-    if (intensityAlpha) {
-        const unsigned int i = (c >> 8) & 0xff;
-        const unsigned int a = c & 0xff;
+    if (effectMode == 1 || effectMode == 2) {
+        // Which byte is which is the one thing the data does not settle on its own. Most
+        // format-3 sets put a clean 0x11-step 0..255 ramp in the low byte, which reads as a
+        // textbook alpha ramp; Ringo01 and the soft puffs put their clean ramp in the HIGH
+        // byte instead. Mode 1 is intensity-high/alpha-low, which is what the N64 IA16 TLUT
+        // format specifies; mode 2 is the other way round, kept switchable because a wrong
+        // guess here does not look wrong so much as absent.
+        const unsigned int hi = (c >> 8) & 0xff;
+        const unsigned int lo = c & 0xff;
+        const unsigned int i = (effectMode == 1) ? hi : lo;
+        const unsigned int a = (effectMode == 1) ? lo : hi;
         return (a << 24) | (i << 16) | (i << 8) | i;
+    }
+    if (effectMode == 3) {
+        unsigned int a = (c >> 12) & 0x0f;
+        unsigned int r = (c >> 8) & 0x0f;
+        unsigned int g = (c >> 4) & 0x0f;
+        unsigned int b = c & 0x0f;
+        a = (a << 4) | a;
+        r = (r << 4) | r;
+        g = (g << 4) | g;
+        b = (b << 4) | b;
+        return (a << 24) | (r << 16) | (g << 8) | b;
     }
     unsigned int r = (c >> 11) & 0x1f;
     unsigned int g = (c >> 6) & 0x1f;
@@ -144,10 +163,10 @@ inline unsigned int ExpandPaletteEntry(unsigned short stored, bool intensityAlph
 }
 
 // Format 3 is the only one whose palette carries a full alpha channel.
-// Format 3 is the effect atlas, and the only one whose palette is intensity + alpha rather
-// than colour. Kept as a predicate because the format byte is checked in several places.
-inline bool IsIntensityAlpha(int format) {
-    return format == 3 && Config::IntensityAlphaEffects();
+// Format 3 is the effect atlas and the only format whose palette is not packed colour.
+// Returns the mode ExpandPaletteEntry should use: 0 leaves RGBA5551 for everything else.
+inline int EffectPaletteMode(int format) {
+    return (format == 3) ? Config::EffectPaletteMode() : 0;
 }
 
 // Blob layout:
@@ -491,7 +510,7 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
 
     const unsigned short* pal = (const unsigned short*)palette;
     const unsigned int palEntries = palette ? palSize / 2 : 0;
-    const bool intensityAlpha = IsIntensityAlpha(hdr[0]);
+    const int effectMode = EffectPaletteMode(hdr[0]);
     for (int y = 0; y < h; ++y) {
         unsigned int* dst = (unsigned int*)((unsigned char*)lr.pBits + (size_t)y * lr.Pitch);
         for (int x = 0; x < w; ++x) {
@@ -505,7 +524,7 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
                 idx = pixelData[(size_t)y * w + x];
             }
             if (palEntries) {
-                dst[x] = (idx < palEntries) ? ExpandPaletteEntry(pal[idx], intensityAlpha) : 0u;
+                dst[x] = (idx < palEntries) ? ExpandPaletteEntry(pal[idx], effectMode) : 0u;
                 if ((dst[x] >> 24) == 0) {
                     ++clearTexels;
                 }
@@ -615,6 +634,25 @@ void Texture::LogSetCensus() {
         }
         const int w = hdr[2] ? hdr[2] : 256;
         const int h = hdr[3] ? hdr[3] : 256;
+        // Alpha actually decoded for palette 0, which is the number that says whether an
+        // effect can be seen at all: a set whose alpha is zero everywhere draws nothing.
+        unsigned int aMin = 255, aMax = 0, aSum = 0, aN = 0;
+        {
+            unsigned int palSize0 = 0;
+            const unsigned char* p0 =
+                (palChunk && SubChunkCount(palChunk, palChunkSize) > 0)
+                    ? SubChunk(palChunk, 0, palChunkSize, &palSize0) : 0;
+            const int ia = EffectPaletteMode(hdr[0]);
+            for (unsigned int e = 0; p0 && e + 1 < palSize0; e += 2) {
+                const unsigned short stored =
+                    (unsigned short)(p0[e] | ((unsigned short)p0[e + 1] << 8));
+                const unsigned int a = (ExpandPaletteEntry(stored, ia) >> 24) & 0xff;
+                if (a < aMin) aMin = a;
+                if (a > aMax) aMax = a;
+                aSum += a;
+                ++aN;
+            }
+        }
         const unsigned int frames = SubChunkCount(pixChunk, pixChunkSize);
         const unsigned int pals = SubChunkCount(palChunk, palChunkSize);
         unsigned int frame0 = 0, pal0 = 0;
@@ -625,6 +663,10 @@ void Texture::LogSetCensus() {
                 "pal0=%-4u  %s",
                 i, fmt, w, h, frames, pals, frame0,
                 px ? (double)frame0 * 8.0 / (double)px : 0.0, pal0, SetName(g_sets[i]));
+        if (aN && fmt == 3) {
+            LogLine("            palette alpha min=%u max=%u mean=%u over %u entries%s",
+                    aMin, aMax, aSum / aN, aN, (aMax < 16) ? "   <-- effectively invisible" : "");
+        }
     }
     LogLine("    decode failures so far: %d", g_decodeFailures);
     LogLine("    format totals: 0=%d 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d",

@@ -27,7 +27,7 @@ bool g_uncullEntities = true;
 int g_uncullBudget = 512;
 unsigned int g_batchLimitScale = 8;
 float g_drawDistance = 8192.0f;
-bool g_intensityAlphaEffects = true;
+int g_effectPaletteMode = 1;
 float g_farPlane = 100000.0f;
 bool g_applyConstantColour = true;
 bool g_synthesiseSkybox = true;
@@ -143,14 +143,19 @@ const char* kDefaultIni =
     "KeepCursorVisible=1\r\n"
     "\r\n"
     "[Textures]\r\n"
-    "; Format 3 is the effect atlas -- blood, smoke, explosions, splats, the sky -- and its\r\n"
-    "; palette entries are intensity in one byte and alpha in the other, not packed colour.\r\n"
-    "; The shape is greyscale and the colour arrives from the combiner constant, which is\r\n"
-    "; how one 16-entry palette serves blood, smoke and snow alike. Reading those two bytes\r\n"
-    "; as 4444 colour scatters them across the wrong channels: that is what put blue splats\r\n"
-    "; where brown belonged and left the blood spray with an alpha it could not be seen\r\n"
-    "; through.\r\n"
-    "IntensityAlphaEffects=1\r\n"
+    "; How to read a format-3 palette entry. Format 3 is the effect atlas -- blood, smoke,\r\n"
+    "; explosions, splats, the sky -- and its entries are not packed colour: the shape is\r\n"
+    "; greyscale and the colour arrives from the combiner constant, which is how one 16-entry\r\n"
+    "; palette serves blood, smoke and snow alike.\r\n"
+    ";\r\n"
+    ";   1  intensity in the high byte, alpha in the low byte (the N64 IA16 TLUT layout)\r\n"
+    ";   2  the two swapped\r\n"
+    ";   3  ARGB4444, for comparison only: it turns brown splats blue and gives the blood\r\n"
+    ";      spray the wrong alpha\r\n"
+    ";\r\n"
+    "; Which byte carries alpha is the one thing the palette data does not settle on its own,\r\n"
+    "; so if an effect is absent rather than merely miscoloured, try 2 before going back to 3.\r\n"
+    "EffectPaletteMode=1\r\n"
     "\r\n"
     "[Colour]\r\n"
     "; Multiply world geometry by the display list's constant colour, as opcodes 0xfa\r\n"
@@ -269,7 +274,8 @@ void Config::Load(void* self) {
     // These boxes also feed spatial lookups and a near-infinite extent crashes the game.
     if (g_drawDistance > 65536.0f) g_drawDistance = 65536.0f;
     g_farPlane = (float)GetPrivateProfileIntA("FullMap", "FarPlane", 100000, g_iniPath);
-    g_intensityAlphaEffects      = ReadBool("Textures", "IntensityAlphaEffects", true);
+    g_effectPaletteMode = GetPrivateProfileIntA("Textures", "EffectPaletteMode", 1, g_iniPath);
+    if (g_effectPaletteMode < 1 || g_effectPaletteMode > 3) g_effectPaletteMode = 1;
     g_applyConstantColour        = ReadBool("Colour", "ApplyConstantColour", true);
     g_synthesiseSkybox           = ReadBool("Sky", "SynthesiseSkybox", true);
     g_skyboxSize = (float)GetPrivateProfileIntA("Sky", "SkyboxSize", 0, g_iniPath);
@@ -306,7 +312,7 @@ void Config::Load(void* self) {
             g_loadEntireMap, g_disableFrustumTest, g_uncullRooms, g_uncullEntities,
             g_uncullBudget, g_batchLimitScale, g_farPlane);
     LogLine("    DrawDistance=%.0f", g_drawDistance);
-    LogLine("    IntensityAlphaEffects=%d", g_intensityAlphaEffects);
+    LogLine("    EffectPaletteMode=%d", g_effectPaletteMode);
     LogLine("    ApplyConstantColour=%d", g_applyConstantColour);
     LogLine("    SynthesiseSkybox=%d SkyboxSize=%.0f SkyboxColour=%d "
             "SkyboxBlueShift=%d SkyboxBlueTarget=0x%06X",
@@ -333,7 +339,7 @@ int Config::UncullBudget()                { return g_uncullBudget; }
 unsigned int Config::BatchLimitScale()    { return g_batchLimitScale; }
 float Config::DrawDistance()              { return g_drawDistance; }
 float Config::FarPlane()                  { return g_farPlane; }
-bool Config::IntensityAlphaEffects()      { return g_intensityAlphaEffects; }
+int Config::EffectPaletteMode()           { return g_effectPaletteMode; }
 bool Config::ApplyConstantColour()        { return g_applyConstantColour; }
 bool Config::SynthesiseSkybox()           { return g_synthesiseSkybox; }
 float Config::SkyboxSize()                { return g_skyboxSize; }

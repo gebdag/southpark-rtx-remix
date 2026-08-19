@@ -75,12 +75,19 @@ float FarPlane();
 
 // ------------------------------------------------------------------------ textures
 
-// Decode format-3 palettes as intensity + alpha rather than as packed colour. Format 3 is the
-// effect atlas -- blood, smoke, explosions, splats, sky -- and its entries carry no colour of
-// their own: the shape is greyscale and the colour comes from the combiner constant. Reading
-// them as 4444 scatters the two bytes across the wrong channels, which is what turned brown
-// splats blue and left the blood spray with an alpha it could not be seen through.
-bool IntensityAlphaEffects();
+// How to read a format-3 palette entry. Format 3 is the effect atlas -- blood, smoke,
+// explosions, splats, sky -- and its entries are not packed colour: the shape is greyscale
+// and the colour arrives from the combiner constant. Reading them as 4444 scatters the two
+// bytes across the wrong channels: brown splats come out blue and the blood spray's alpha is
+// wrong.
+//
+//   1  intensity in the high byte, alpha in the low byte  (the N64 IA16 TLUT layout)
+//   2  the two swapped
+//   3  the original ARGB4444 reading, for comparison
+//
+// Switchable because which byte carries alpha is the one thing the data does not settle: most
+// sets put a clean 0..255 ramp in the low byte, a few put it in the high byte instead.
+int EffectPaletteMode();
 
 // ---------------------------------------------------------------------------- colour
 
