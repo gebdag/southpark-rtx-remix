@@ -73,20 +73,6 @@ float DrawDistance();
 float FarPlane();
 
 
-// ------------------------------------------------------------------------ textures
-
-// Decode from the texture blobs the engine owns rather than from a private copy of each.
-// The engine animates some sets by rewriting the pixels of a set it has already handed over
-// -- which is what GFXDLL_FlushTextureCache exists to announce -- and a copy taken at
-// enumeration never sees that happen. 0 restores the copy.
-bool LiveTextureBlobs();
-
-// Re-check the source bytes behind a cached frame before reusing it, and decode again when
-// they have changed. The flush is the engine's own signal that this is needed, but it is a
-// signal a caller can simply not send; this notices either way, and costs a few dozen byte
-// reads per draw.
-bool DetectTextureRewrites();
-
 // ---------------------------------------------------------------------------- colour
 
 // Multiply world geometry by the display list's constant colour, as opcodes 0xfa (primitive)

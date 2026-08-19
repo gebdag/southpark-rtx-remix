@@ -28,8 +28,6 @@ int g_uncullBudget = 512;
 unsigned int g_batchLimitScale = 8;
 float g_drawDistance = 8192.0f;
 float g_farPlane = 100000.0f;
-bool g_liveTextureBlobs = true;
-bool g_detectTextureRewrites = true;
 bool g_applyConstantColour = true;
 bool g_synthesiseSkybox = true;
 float g_skyboxSize = 0.0f;
@@ -142,20 +140,6 @@ const char* kDefaultIni =
     "; an arrow, and drop its ClipCursor and its recentring mouse_event calls while it is not\r\n"
     "; entitled to the pointer.\r\n"
     "KeepCursorVisible=1\r\n"
-    "\r\n"
-    "[Textures]\r\n"
-    "; Decode from the texture blobs the engine owns instead of from a private copy taken\r\n"
-    "; when it enumerated them. The engine animates some sets -- character mouths among\r\n"
-    "; them -- by rewriting the pixels of a set it has already handed over, and a copy\r\n"
-    "; never sees that: the animation freezes on whichever frame was decoded first. 0\r\n"
-    "; restores the copy.\r\n"
-    "LiveTextureBlobs=1\r\n"
-    "\r\n"
-    "; Re-check the source bytes behind a cached frame before reusing it, and decode again\r\n"
-    "; when they have changed. GFXDLL_FlushTextureCache is the engine's own signal that a\r\n"
-    "; source was rewritten, but it is a signal it need not send; this notices either way,\r\n"
-    "; for a few dozen byte reads per draw.\r\n"
-    "DetectTextureRewrites=1\r\n"
     "\r\n"
     "[Colour]\r\n"
     "; Multiply world geometry by the display list's constant colour, as opcodes 0xfa\r\n"
@@ -274,8 +258,6 @@ void Config::Load(void* self) {
     // These boxes also feed spatial lookups and a near-infinite extent crashes the game.
     if (g_drawDistance > 65536.0f) g_drawDistance = 65536.0f;
     g_farPlane = (float)GetPrivateProfileIntA("FullMap", "FarPlane", 100000, g_iniPath);
-    g_liveTextureBlobs           = ReadBool("Textures", "LiveTextureBlobs", true);
-    g_detectTextureRewrites      = ReadBool("Textures", "DetectTextureRewrites", true);
     g_applyConstantColour        = ReadBool("Colour", "ApplyConstantColour", true);
     g_synthesiseSkybox           = ReadBool("Sky", "SynthesiseSkybox", true);
     g_skyboxSize = (float)GetPrivateProfileIntA("Sky", "SkyboxSize", 0, g_iniPath);
@@ -312,8 +294,6 @@ void Config::Load(void* self) {
             g_loadEntireMap, g_disableFrustumTest, g_uncullRooms, g_uncullEntities,
             g_uncullBudget, g_batchLimitScale, g_farPlane);
     LogLine("    DrawDistance=%.0f", g_drawDistance);
-    LogLine("    LiveTextureBlobs=%d DetectTextureRewrites=%d",
-            g_liveTextureBlobs, g_detectTextureRewrites);
     LogLine("    ApplyConstantColour=%d", g_applyConstantColour);
     LogLine("    SynthesiseSkybox=%d SkyboxSize=%.0f SkyboxColour=%d "
             "SkyboxBlueShift=%d SkyboxBlueTarget=0x%06X",
@@ -340,8 +320,6 @@ int Config::UncullBudget()                { return g_uncullBudget; }
 unsigned int Config::BatchLimitScale()    { return g_batchLimitScale; }
 float Config::DrawDistance()              { return g_drawDistance; }
 float Config::FarPlane()                  { return g_farPlane; }
-bool Config::LiveTextureBlobs()           { return g_liveTextureBlobs; }
-bool Config::DetectTextureRewrites()      { return g_detectTextureRewrites; }
 bool Config::ApplyConstantColour()        { return g_applyConstantColour; }
 bool Config::SynthesiseSkybox()           { return g_synthesiseSkybox; }
 float Config::SkyboxSize()                { return g_skyboxSize; }
