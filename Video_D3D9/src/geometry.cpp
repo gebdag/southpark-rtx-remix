@@ -173,6 +173,31 @@ int g_textureSelects = 0;
 // operand separates "the engine stopped asking for new frames" from "the renderer stopped
 // honouring the request", so every mouth select is recorded (RecordMouthOperand).
 unsigned int g_mouthSelects = 0;
+
+// Every distinct (set, word1) a mouth set is selected with, counted in full: a sample can
+// alias straight past an animation, a full count cannot.
+struct MouthOperand {
+    int set;
+    unsigned int word1;
+    unsigned int count;
+};
+const int kMaxMouthOperands = 96;
+MouthOperand g_mouthOperands[kMaxMouthOperands];
+int g_mouthOperandCount = 0;
+
+void RecordMouthOperand(int set, unsigned int word1) {
+    for (int i = 0; i < g_mouthOperandCount; ++i) {
+        if (g_mouthOperands[i].set == set && g_mouthOperands[i].word1 == word1) {
+            ++g_mouthOperands[i].count;
+            return;
+        }
+    }
+    if (g_mouthOperandCount >= kMaxMouthOperands) {
+        return;
+    }
+    MouthOperand& m = g_mouthOperands[g_mouthOperandCount++];
+    m.set = set; m.word1 = word1; m.count = 1;
+}
 int g_clampLogged = 0;
 
 
@@ -1513,10 +1538,7 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
                 const char* setName = Texture::Name(tex);
                 if (setName[0] == 'M' && setName[1] == 'T' && setName[2] == 'H') {
                     ++g_mouthSelects;
-                    if (g_mouthSelects <= 40 || (g_mouthSelects % 250) == 0) {
-                        LogLine("    mouth select #%u: set %d word1=0x%08x subA=%d subB=%d  %s",
-                                g_mouthSelects, tex, word1, subA, subB, setName);
-                    }
+                    RecordMouthOperand(tex, word1);
                 }
             }
             if (tex != g_currentTexture || subA != g_currentSubA || subB != g_currentSubB) {
@@ -1724,6 +1746,13 @@ void Geometry::LogTextureStats() {
             g_textureSelects, g_texturedFlushes, g_untexturedFlushes, g_skyBatches);
     LogLine("    lit tris %u / unlit tris %u", g_litTris, g_unlitTris);
     LogLine("    flushes opaque %u / blended %u", g_opaqueFlushes, g_blendedFlushes);
+    LogLine("    MOUTH selector operands, every one counted (%u selects):", g_mouthSelects);
+    for (int i = 0; i < g_mouthOperandCount; ++i) {
+        const MouthOperand& m = g_mouthOperands[i];
+        LogLine("      set %4d  word1=0x%08x  subA=%-5d subB=%-5d  %8u selects  %s",
+                m.set, m.word1, (int)(short)(m.word1 & 0xffff), (int)(m.word1 >> 16),
+                m.count, Texture::Name(m.set));
+    }
     LogLine("    UNTEXTURED batches by (mode, constant, blend) -- this is where the houses are:");
     for (int i = 0; i < g_untexturedKindCount; ++i) {
         const UntexturedKind& k = g_untexturedKinds[i];
