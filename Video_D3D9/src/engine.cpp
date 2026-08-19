@@ -227,13 +227,14 @@ struct CameraList {
     int cap;
     int peak;
     unsigned int framesFull;
+    unsigned int framesNearFull;
 };
 
 CameraList g_cameraLists[] = {
-    { "classified", 0x97C, 0x200, 0, 0 },
-    { "secondary",  0xB80, 0x080, 0, 0 },
-    { "drawn",      0xE88, 0x080, 0, 0 },
-    { "tertiary",   0xF0C, 0x020, 0, 0 },
+    { "classified", 0x97C, 0x200, 0, 0, 0 },
+    { "secondary",  0xB80, 0x080, 0, 0, 0 },
+    { "drawn",      0xE88, 0x080, 0, 0, 0 },
+    { "tertiary",   0xF0C, 0x020, 0, 0, 0 },
 };
 
 void __cdecl OnCameraListsBuilt(unsigned char* camera) {
@@ -253,8 +254,20 @@ void __cdecl OnCameraListsBuilt(unsigned char* camera) {
             ++l.framesFull;
             if (l.framesFull == 1 || (l.framesFull % 600) == 0) {
                 LogLine("    engine: camera %s list FULL at %d entries -- objects are being "
-                        "dropped before any visibility test (%u frames so far)",
-                        l.name, l.cap, l.framesFull);
+                        "dropped before any visibility test (%u frames so far). Lower "
+                        "DrawDistance.", l.name, l.cap, l.framesFull);
+            }
+        } else if (count * 4 >= l.cap * 3) {
+            // These caps are the one thing DrawDistance can overrun, and the engine gives no
+            // sign when it does -- an object past the cap is simply not drawn. Saying so at
+            // three quarters gives a chance to lower the distance before geometry starts
+            // going missing, rather than after.
+            ++l.framesNearFull;
+            if (l.framesNearFull == 1 || (l.framesNearFull % 600) == 0) {
+                LogLine("    engine: camera %s list at %d/%d -- close to the cap, and past it "
+                        "objects are dropped silently. Lower DrawDistance if geometry starts "
+                        "vanishing (%u frames so far)",
+                        l.name, count, l.cap, l.framesNearFull);
             }
         }
     }
@@ -585,8 +598,11 @@ void Engine::LogState() {
     LogLine("    engine camera visible-object lists (the cap that ends the culling):");
     for (int i = 0; i < (int)(sizeof(g_cameraLists) / sizeof(g_cameraLists[0])); ++i) {
         const CameraList& l = g_cameraLists[i];
-        LogLine("      %-12s peak %4d / %4d   full on %u frames%s", l.name, l.peak, l.cap,
-                l.framesFull, l.framesFull ? "   <-- objects dropped here" : "");
+        LogLine("      %-12s peak %4d / %4d   full on %u frames, over three quarters on %u%s",
+                l.name, l.peak, l.cap, l.framesFull, l.framesNearFull,
+                l.framesFull ? "   <-- objects dropped here"
+                             : (l.peak * 4 >= l.cap * 3 ? "   <-- close; lower DrawDistance"
+                                                        : ""));
     }
     LogLine("    engine draw arrays:");
     for (int i = 0; i < (int)(sizeof(g_arrays) / sizeof(g_arrays[0])); ++i) {
