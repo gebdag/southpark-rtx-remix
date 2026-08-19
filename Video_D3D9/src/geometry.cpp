@@ -195,6 +195,39 @@ struct SetDraws {
     int lastMode;
 };
 SetDraws g_setDraws[kCensusSets];
+// House walls carry no texture and white vertices, so they never appear in the per-set
+// census -- every one of them lands in the untextured bucket below. To see what actually
+// decides their colour, each distinct (combiner mode, constant colour, blend) triple an
+// untextured batch is drawn with is counted here. A wall that changes colour as the camera
+// turns has to be drawn under more than one of these.
+struct UntexturedKind {
+    int mode;
+    unsigned int constant;
+    unsigned char blend;      // 0 opaque, 1 additive ONE/ONE, 2 SRCALPHA
+    unsigned int flushes;
+    unsigned int tris;
+};
+const int kMaxUntexturedKinds = 64;
+UntexturedKind g_untexturedKinds[kMaxUntexturedKinds];
+int g_untexturedKindCount = 0;
+
+void RecordUntexturedBatch(int mode, unsigned int constant, unsigned char blend,
+                           unsigned int tris) {
+    for (int i = 0; i < g_untexturedKindCount; ++i) {
+        UntexturedKind& k = g_untexturedKinds[i];
+        if (k.mode == mode && k.constant == constant && k.blend == blend) {
+            ++k.flushes;
+            k.tris += tris;
+            return;
+        }
+    }
+    if (g_untexturedKindCount >= kMaxUntexturedKinds) {
+        return;
+    }
+    UntexturedKind& k = g_untexturedKinds[g_untexturedKindCount++];
+    k.mode = mode; k.constant = constant; k.blend = blend; k.flushes = 1; k.tris = tris;
+}
+
 unsigned int g_noSelectFlushes = 0;   // batches drawn before any 0xa9 named a set
 unsigned int g_noSelectTris = 0;
 unsigned int g_litTris = 0;
@@ -849,6 +882,13 @@ void Flush() {
         dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     }
     if (additive || graduated) { ++g_blendedFlushes; } else { ++g_opaqueFlushes; }
+    if (g_currentTexture < 0) {
+        RecordUntexturedBatch(g_combinerMode,
+                              Config::ApplyConstantColour() ? ConstantColourForBatch()
+                                                            : 0xffffffffu,
+                              additive ? 1 : (graduated ? 2 : 0),
+                              (unsigned int)(g_indexCount / 3));
+    }
 
     // A skydome has no business in the depth buffer, and drawing it depth-free is also the
     // shape Remix's sky auto-detection looks for.
@@ -1655,6 +1695,16 @@ void Geometry::LogTextureStats() {
             g_textureSelects, g_texturedFlushes, g_untexturedFlushes, g_skyBatches);
     LogLine("    lit tris %u / unlit tris %u", g_litTris, g_unlitTris);
     LogLine("    flushes opaque %u / blended %u", g_opaqueFlushes, g_blendedFlushes);
+    LogLine("    UNTEXTURED batches by (mode, constant, blend) -- this is where the houses are:");
+    for (int i = 0; i < g_untexturedKindCount; ++i) {
+        const UntexturedKind& k = g_untexturedKinds[i];
+        LogLine("      mode=%02X  constant R=%02X G=%02X B=%02X A=%02X  %-8s  %7u flushes  "
+                "%9u tris", k.mode & 0xff,
+                k.constant & 0xff, (k.constant >> 8) & 0xff, (k.constant >> 16) & 0xff,
+                (k.constant >> 24) & 0xff,
+                k.blend == 1 ? "ADDITIVE" : (k.blend == 2 ? "SRCALPHA" : "opaque"),
+                k.flushes, k.tris);
+    }
     LogLine("    constant-colour changes (opcodes 0xfa/0xfb): %u   uploads tinted %u / plain %u",
             g_constantColourChanges, g_tintedUploads, g_untintedUploads);
     LogLine("    combiner modes selected (opcode 0xaf), mode: times selected / constant colour:");

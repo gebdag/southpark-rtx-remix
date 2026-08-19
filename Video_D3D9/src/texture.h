@@ -31,6 +31,9 @@ IDirect3DTexture9* GetTexture(int index, int subA, int subB);
 // One-shot census of every enumerated set: format, size, sub-chunk counts and name.
 void LogSetCensus();
 
+// Every decoded frame/palette pair of the MTH-* sets, with how transparent each one is.
+void LogMouthVariants();
+
 int Count();
 
 // Mean colour of the decoded texels of a set's first cached frame, as 0x00RRGGBB, and -1 when

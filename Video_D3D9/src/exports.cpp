@@ -70,6 +70,7 @@ GFXAPI unsigned int GFXDLL_InitializeDriver(HWND window, unsigned int a2, unsign
 GFXAPI void GFXDLL_ShutdownDriver(void) {
     LogCall("GFXDLL_ShutdownDriver");
     Geometry::LogTextureStats();
+    Texture::LogMouthVariants();
     Engine::LogState();
     Geometry::ReleaseResources();
     Pcx::ReleaseAll();

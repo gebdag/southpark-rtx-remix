@@ -625,8 +625,28 @@ IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
     return tex;
 }
 
-// One line per set, so the formats that carry no name and never appear in a reference
-// screenshot can still be identified by their shape.
+// Every frame/palette pair actually decoded for the mouth sets, with how much of each is
+// transparent: a pair that decodes to nothing draws no mouth at all, which looks like a mouth
+// that stopped animating.
+void Texture::LogMouthVariants() {
+    LogLine("    MOUTH/EYE variants actually decoded:");
+    for (int i = 0; i < g_count; ++i) {
+        if (!g_sets[i] || g_cache[i].n == 0) {
+            continue;
+        }
+        const char* n = SetName(g_sets[i]);
+        if (!(n[0] == 'M' && n[1] == 'T' && n[2] == 'H')) {
+            continue;
+        }
+        for (int v = 0; v < g_cache[i].n; ++v) {
+            const Variant& var = g_cache[i].v[v];
+            LogLine("      set %4d %-14s frame %2u palette %2u   clear=%u%%%s",
+                    i, n, var.pix, var.pal, var.transparentPercent,
+                    var.transparentPercent >= 99 ? "   <-- decodes to nothing" : "");
+        }
+    }
+}
+
 void Texture::LogSetCensus() {
     int byFormat[8];
     memset(byFormat, 0, sizeof(byFormat));
