@@ -305,6 +305,16 @@ unsigned char g_slotWritten[kMaxVertices];   // per display list, not per frame
 // that was baked under different transforms.
 short g_slotSrc[kMaxVertices][3];   // source object-space coords, for blame reporting
 unsigned char g_slotRaw[kMaxVertices][20];  // the whole source vertex, to judge if it is real
+// The vertex colour as authored, before the combiner constant is folded in.
+//
+// The constant cannot be applied when a vertex block is loaded: the engine loads a block of
+// vertices once and then emits triangles from it,
+// and it is free to change the primitive or environment colour in between -- on the N64 the
+// constant is a combiner input applied as each triangle is rasterised, not something baked
+// into a vertex. Folding it at load time gives every triangle the colour that happened to be
+// current when the block arrived, which for the first draw of a newly spawned object is
+// whatever the previous object left behind.
+unsigned int g_slotUntinted[kMaxVertices];
 unsigned short g_slotBatch[kMaxVertices];
 unsigned short g_slotMatrix[kMaxVertices];
 unsigned short g_batchSerial = 0;
@@ -881,6 +891,25 @@ void Flush() {
     dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
     dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, tex ? D3DTA_TEXTURE : D3DTA_DIFFUSE);
 
+    // The combiner constant, applied here rather than when the vertices were loaded, so a
+    // colour the engine sets after loading a block still reaches the triangles drawn from it.
+    // Kept in the vertex colour rather than a texture-stage factor deliberately: a vertex
+    // colour survives Remix's material conversion, where a fixed-function stage factor need
+    // not, and it is the vertex colour Remix writes out as primvars:displayColor.
+    {
+        const unsigned int k = Config::ApplyConstantColour() ? ConstantColourForBatch()
+                                                            : 0xffffffffu;
+        const unsigned int kr = k & 0xff, kg = (k >> 8) & 0xff, kb = (k >> 16) & 0xff;
+        if (k == 0xffffffffu) { ++g_untintedUploads; } else { ++g_tintedUploads; }
+        for (int i = 0; i < vertexCount; ++i) {
+            const unsigned int u = g_slotUntinted[i];
+            const unsigned int r = (((u >> 16) & 0xffu) * kr) / 255u;
+            const unsigned int g = (((u >> 8) & 0xffu) * kg) / 255u;
+            const unsigned int b = ((u & 0xffu) * kb) / 255u;
+            g_vertices[i].diffuse = (D3DCOLOR)(0xff000000u | (r << 16) | (g << 8) | b);
+        }
+    }
+
     if (g_dumpingFrame) {
         DumpBatch(vertexCount, tex != 0, cull, sky);
     }
@@ -1013,12 +1042,6 @@ void UploadVertices(const SourceVertex* src, int count, int destSlot) {
     // The original tints in its upload handler, in the same pass as the transform; here the
     // slot keeps its untinted colour and the constant is applied when the batch is drawn
     // (Flush), since the engine may change it between upload and draw.
-    const unsigned int constant =
-        Config::ApplyConstantColour() ? ConstantColourForBatch() : 0xffffffffu;
-    const unsigned int constR = constant & 0xff;
-    const unsigned int constG = (constant >> 8) & 0xff;
-    const unsigned int constB = (constant >> 16) & 0xff;
-    if (constant == 0xffffffffu) { ++g_untintedUploads; } else { ++g_tintedUploads; }
 
     for (int i = 0; i < count; ++i) {
         WorldVertex& d = g_vertices[destSlot + i];
@@ -1044,7 +1067,9 @@ void UploadVertices(const SourceVertex* src, int count, int destSlot) {
                 d.ny *= inv;
                 d.nz *= inv;
             }
-            d.diffuse = (D3DCOLOR)(0xff000000u | (constR << 16) | (constG << 8) | constB);
+            // Lit vertices take their colour from the constant alone, so white is what is
+            // left once the constant is factored back out.
+            g_slotUntinted[destSlot + i] = 0xffffffffu;
         } else {
             d.nx = 0.0f;
             d.ny = 1.0f;
@@ -1054,11 +1079,11 @@ void UploadVertices(const SourceVertex* src, int count, int destSlot) {
             // blue swap on the way in; taking the dword as-is tinted the whole world
             // backwards.
             const unsigned int c = s.bgra;
-            const unsigned int r = ((c & 0x000000ffu) * constR) / 255u;
-            const unsigned int g = (((c >> 8) & 0xffu) * constG) / 255u;
-            const unsigned int b = (((c >> 16) & 0xffu) * constB) / 255u;
-            d.diffuse = (D3DCOLOR)(0xff000000u | (r << 16) | (g << 8) | b);
+            g_slotUntinted[destSlot + i] = 0xff000000u | ((c & 0x000000ffu) << 16) |
+                                           (((c >> 8) & 0xffu) << 8) | ((c >> 16) & 0xffu);
         }
+        // Filled properly at draw time, when the constant that actually applies is known.
+        d.diffuse = g_slotUntinted[destSlot + i];
         d.u = s.u;
         d.v = s.v;
     }
