@@ -1466,6 +1466,14 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
         case OP_COMBINER_MODE:
             // FUN_1000c951 stores word1 and marks the state dirty; FUN_10005850 then
             // resolves it through the mode table the next time it runs.
+            //
+            // Break the batch first. The mode decides both which constant colour applies --
+            // primitive, environment or none -- and whether the batch blends, and both of
+            // those are read when the batch is drawn. Triangles already queued were queued
+            // under the old mode and have to be drawn under it.
+            if ((int)word1 != g_combinerMode) {
+                Flush();
+            }
             g_combinerMode = (int)word1;
             if (g_combinerMode >= 0 && g_combinerMode < kCombinerModeCount) {
                 ++g_modeSelects[g_combinerMode];
@@ -1474,11 +1482,28 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
 
         case OP_PRIM_COLOUR:
         case OP_ENV_COLOUR: {
-            // No flush: the colour is folded into vertices as they are uploaded, so
-            // geometry already queued was tinted when it arrived and is unaffected. The
-            // original's handlers do not flush either.
+            // This has to break the batch.
+            //
+            // The constant is applied when the triangles are drawn -- as the hardware does it,
+            // so a newly spawned object never inherits the previous object's colour -- so
+            // anything still queued would be drawn with the NEW colour instead of the one it
+            // was emitted under. A batch that spans a change would come out one flat colour,
+            // and which geometry shares a batch shifts with the camera: house walls would
+            // change colour as you turn.
+            //
+            // Only when the change is one the batch would actually see: a write to the
+            // environment register while the mode is taking the primitive colour changes
+            // nothing on screen and does not deserve a draw call.
             unsigned int& slot = (op == OP_PRIM_COLOUR) ? g_primColour : g_envColour;
             if (slot != word1) {
+                const unsigned int effectiveBefore = ConstantColourForBatch();
+                const unsigned int previous = slot;
+                slot = word1;
+                const unsigned int effectiveAfter = ConstantColourForBatch();
+                slot = previous;
+                if (effectiveAfter != effectiveBefore) {
+                    Flush();
+                }
                 slot = word1;
                 ++g_constantColourChanges;
             }
