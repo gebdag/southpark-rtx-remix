@@ -14,6 +14,9 @@ namespace {
 const int kMaxSets = 4096;
 
 void* g_sets[kMaxSets];
+// Whether the pointer above is ours to free. With LiveTextureBlobs the set belongs to the
+// engine and is only borrowed, so freeing it would hand the engine back a dangling pointer.
+bool  g_setOwned[kMaxSets];
 
 // A set is not one image. Animated sets hold a run of frames in chunk 1 and may hold
 // several palettes in chunk 2, and the display list picks a pair per draw. Each decoded
@@ -21,6 +24,7 @@ void* g_sets[kMaxSets];
 struct Variant {
     unsigned short pix, pal;
     unsigned short transparentPercent;   // texels the alpha test would discard
+    unsigned int fingerprint;            // of the source bytes this was decoded from
     IDirect3DTexture9* tex;
 };
 // Deep enough for the widest sets (SMOKE01 has 30 frames, BOOM05 27 palettes). A
@@ -225,6 +229,22 @@ void Texture::Enumerate(void* blob) {
         g_sets[g_count++] = 0;
         return;
     }
+    // Borrow the engine's own storage. Two reasons, and the second is the one that shows on
+    // screen. GFXDLL_GetTextureSetPtr has to hand back the very pointer the engine gave us,
+    // which a copy cannot do; and the engine animates some sets by rewriting the pixels of a
+    // set it has already enumerated, which is what GFXDLL_FlushTextureCache announces. A copy
+    // taken here never sees that write, so such an animation freezes on its first frame no
+    // matter how faithfully the frame is selected.
+    //
+    // CompleteHeader fills chunk0 +6/+7 when they are zero, and is applied to the engine's
+    // blob deliberately: those two bytes are what the engine's own texture-dimension divide
+    // at 0x00428ce2 reads, and it faulted while they were left zeroed.
+    if (Config::LiveTextureBlobs()) {
+        CompleteHeader(blob);
+        g_setOwned[g_count] = false;
+        g_sets[g_count++] = blob;
+        return;
+    }
     void* copy = malloc(size);
     if (!copy) {
         LogLine("    out of memory copying texture set %d (%u bytes)", g_count, size);
@@ -233,6 +253,7 @@ void Texture::Enumerate(void* blob) {
     }
     memcpy(copy, blob, size);
     CompleteHeader(copy);
+    g_setOwned[g_count] = true;
     g_sets[g_count++] = copy;
 }
 
@@ -399,6 +420,44 @@ void* Texture::GetSet(int index, int* outWidth, int* outHeight) {
 
 namespace {
 
+unsigned int g_rewritesSeen = 0;
+
+// A cheap digest of the bytes a decode actually read: the image sub-chunk and the palette
+// sub-chunk. Sampled rather than summed whole, because this runs on every textured draw and
+// a full pass over a 64x64 frame would not.
+unsigned int MixBytes(unsigned int h, const unsigned char* data, unsigned int size) {
+    if (!data || size == 0) {
+        return h * 16777619u;
+    }
+    h = (h ^ size) * 16777619u;
+    const unsigned int step = (size > 64) ? (size / 64) : 1;
+    for (unsigned int i = 0; i < size; i += step) {
+        h = (h ^ data[i]) * 16777619u;
+    }
+    return h;
+}
+
+unsigned int SourceFingerprint(int index, int pixSub, int palSub) {
+    const unsigned char* base = (const unsigned char*)g_sets[index];
+    const unsigned int size = BlobSize(base);
+    if (size == 0) {
+        return 0;
+    }
+    unsigned int pixChunkSize = 0, palChunkSize = 0;
+    const unsigned char* pixChunk = ChunkAt(base, size, 1, &pixChunkSize);
+    const unsigned char* palChunk = ChunkAt(base, size, 2, &palChunkSize);
+    unsigned int h = 2166136261u;
+    unsigned int n = 0;
+    const unsigned char* d =
+        pixChunk ? SubChunk(pixChunk, (unsigned int)pixSub, pixChunkSize, &n) : 0;
+    h = MixBytes(h, d, n);
+    n = 0;
+    d = (palChunk && SubChunkCount(palChunk, palChunkSize) > 0)
+            ? SubChunk(palChunk, (unsigned int)palSub, palChunkSize, &n)
+            : 0;
+    return MixBytes(h, d, n);
+}
+
 // Which sub-chunk of the image, and of the palette, a draw selects.
 //
 // Opcode 0xa9 carries two 16-bit fields. The original (FUN_1000cf90) stores both, then uses
@@ -533,9 +592,31 @@ IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
     pixSub = ClampIndex(pixSub, SubChunkCount(pixChunk, pixChunkSize));
     palSub = ClampIndex(palSub, SubChunkCount(palChunk, palChunkSize));
 
+    // Only worth computing when the source can actually change under a cached frame, which
+    // is to say when the blob belongs to the engine rather than to us.
+    const bool watchSource = Config::LiveTextureBlobs() && Config::DetectTextureRewrites();
+    const unsigned int fingerprint = watchSource ? SourceFingerprint(index, pixSub, palSub) : 0;
+
     SetCache& cache = g_cache[index];
     for (int i = 0; i < cache.n; ++i) {
         if (cache.v[i].pix == (unsigned short)pixSub && cache.v[i].pal == (unsigned short)palSub) {
+            if (!watchSource || cache.v[i].fingerprint == fingerprint) {
+                return cache.v[i].tex;
+            }
+            // Same frame of the same set, different pixels: the engine rewrote the source and
+            // the decoded copy is now a still of an animation that has moved on.
+            ++g_rewritesSeen;
+            if (g_rewritesSeen == 1 || (g_rewritesSeen % 2000) == 0) {
+                LogLine("    texture source rewritten under a cached frame: set %d frame %d "
+                        "palette %d \"%s\" (%u so far)",
+                        index, pixSub, palSub, Name(index), g_rewritesSeen);
+            }
+            if (cache.v[i].tex) {
+                cache.v[i].tex->Release();
+            }
+            cache.v[i].tex = Decode(index, pixSub, palSub);
+            cache.v[i].fingerprint = fingerprint;
+            cache.v[i].transparentPercent = g_lastDecodeTransparentPercent;
             return cache.v[i].tex;
         }
     }
@@ -559,6 +640,7 @@ IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
         cache.v[cache.n].pix = (unsigned short)pixSub;
         cache.v[cache.n].pal = (unsigned short)palSub;
         cache.v[cache.n].transparentPercent = g_lastDecodeTransparentPercent;
+        cache.v[cache.n].fingerprint = fingerprint;
         cache.v[cache.n].tex = tex;
         ++cache.n;
     } else {
@@ -573,6 +655,7 @@ IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
         victim.pix = (unsigned short)pixSub;
         victim.pal = (unsigned short)palSub;
         victim.transparentPercent = g_lastDecodeTransparentPercent;
+        victim.fingerprint = fingerprint;
         victim.tex = tex;
     }
     return tex;
@@ -713,7 +796,8 @@ void Texture::FlushDecoded() {
         g_cache[i].next = 0;
         g_decodeFailed[i] = false;
     }
-    LogLine("    texture cache flushed: %d decoded frames released", released);
+    LogLine("    texture cache flushed: %d decoded frames released (%u source rewrites "
+            "caught so far)", released, g_rewritesSeen);
 }
 
 void Texture::ReleaseAll() {
@@ -725,10 +809,11 @@ void Texture::ReleaseAll() {
         }
         g_cache[i].n = 0;
         g_cache[i].next = 0;
-        if (g_sets[i]) {
+        if (g_sets[i] && g_setOwned[i]) {
             free(g_sets[i]);
-            g_sets[i] = 0;
         }
+        g_sets[i] = 0;
+        g_setOwned[i] = false;
         g_decodeFailed[i] = false;
         g_isSky[i] = false;
     }
