@@ -1,0 +1,12 @@
+LIBRARY dinput
+EXPORTS
+; The executable imports DirectInputCreateA by name; the rest exist so that anything else
+; in the process that expects a real dinput.dll -- including the RTX Remix bridge -- finds
+; what it is looking for rather than a module missing half its exports.
+    DirectInputCreateA
+    DirectInputCreateW
+    DirectInputCreateEx
+    DllCanUnloadNow
+    DllGetClassObject
+    DllRegisterServer
+    DllUnregisterServer

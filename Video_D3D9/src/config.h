@@ -21,6 +21,53 @@ bool DisableTriangleSkipMask();
 // Draw 2D quads even when a corner leaves the screen. The original drops the whole quad.
 bool DisableOffscreenQuadReject();
 
+// ------------------------------------------------------------------------ full map
+
+// Patch the executable so it stops culling the world against its own view volume, and stop
+// the renderer clipping what that then submits. The engine's culler is a 2D box test in X
+// and Z: geometry outside the box is never written into the display list at all, which is
+// why this cannot be answered on the renderer side alone.
+bool LoadEntireMap();
+
+// Bypass the engine's six-plane frustum test at its drawing call sites, the last of its
+// visibility tests (after the room test and the 2D X/Z box test).
+bool DisableFrustumTest();
+
+// Widen the engine's room-visibility test, which runs BEFORE the frustum test and is what
+// actually brings level geometry in: every object carries a room bitmask and is dropped
+// outright when it shares no bit with the camera's. Widening the frustum without this does
+// nothing, because rejected objects never reach the frustum test at all.
+bool UncullRooms();
+
+// Also bypass it at the seventh call site, the one inside the engine's entity path. The town
+// is built out of entities, so without this it stays culled -- but that path also registers
+// each entity through a resource cache, and reporting the whole level visible every frame
+// stops enemies spawning and breaks the player's weapon.
+bool UncullEntities();
+
+// How many objects the engine's own test rejects may be shown anyway, per frame. 0 is
+// unlimited, with the problems above. The renderer logs the peak actually used.
+int UncullBudget();
+
+// Multiplier on the engine's three fixed draw arrays, which it overruns silently. 1 keeps the
+// engine's own sizes. Anything above 1 relocates each array to a larger buffer and rewrites
+// its bound, which is what a whole map needs once the frustum test is off.
+unsigned int BatchLimitScale();
+
+// Far plane the renderer builds its projection with, in world units. The engine's own is a
+// little over a thousand units, which clips away most of what the wider volume submits.
+// Zero keeps the engine's value.
+float FarPlane();
+
+
+// ---------------------------------------------------------------------------- colour
+
+// Multiply world geometry by the display list's constant colour, as opcodes 0xfa (primitive)
+// and 0xfb (environment) deliver it. The original folds that colour into every vertex before
+// transforming; South Park's house walls carry no texture and white vertex colours, so it is
+// the only thing that gives them their colour.
+bool ApplyConstantColour();
+
 // ------------------------------------------------------------------------------- sky
 
 // Clear to the colour the engine supplies through display-list opcode 0xf8 rather than to
@@ -33,6 +80,40 @@ bool DepthlessSky();
 
 // Comma-separated texture-set names treated as sky, matched against the name in chunk 3.
 const char* SkyTextureNames();
+
+// Draw a large box around the camera in the background colour, before any world geometry
+// and with depth off. The game has no skydome -- it leaves the cleared frame showing --
+// and a path tracer needs an actual surface there: something to bound the scene, to catch
+// rays that miss the world, and to light it.
+bool SynthesiseSkybox();
+
+// Half-extent of that box in world units, or 0 to derive it from the projection's far
+// plane. Only worth setting if the box is being clipped or is landing inside the world.
+float SkyboxSize();
+
+// Colour of the box as 0xRRGGBB, or -1 to follow the background colour the engine sends
+// through display-list opcode 0xf8.
+int SkyboxColour();
+
+// How far to pull that colour towards sky blue, 0-100. The engine's own backdrop is a pale
+// wash chosen to sit behind a rasterised scene; as a real surface lighting a path-traced one
+// it wants to read as sky. 0 leaves the colour exactly as chosen.
+int SkyboxBlueShift();
+
+// The colour SkyboxBlueShift pulls towards, as 0xRRGGBB.
+int SkyboxBlueTarget();
+
+// ----------------------------------------------------------------------------- debug
+
+// Frame number at which to start writing screenshots automatically, or 0 for none, and how
+// many frames apart to repeat (0 for a single shot). F11 always takes one on demand; these
+// take them without a key press.
+int ScreenshotFrame();
+int ScreenshotInterval();
+
+// Directory the DLL lives in, with a trailing backslash. The engine changes the working
+// directory during startup, so anything written relative to it lands somewhere unhelpful.
+const char* BaseDir();
 
 // ------------------------------------------------------------------------------- log
 

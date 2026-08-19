@@ -1,0 +1,22 @@
+#pragma once
+
+// Runtime patches applied to SouthPark.exe from inside the video plugin.
+//
+// Everything the plugin can do about culling is downstream of a decision the executable has
+// already made: geometry it culls is never written into the display list, so no renderer
+// option can bring it back. The one lever that reaches upstream is patching the engine's own
+// code, which the plugin can do because it is loaded into that process.
+namespace Engine {
+
+// Applies whatever the ini asks for. Safe to call once the executable has unpacked itself,
+// which is true by the time any GFXDLL_ export runs. Every patch verifies the bytes it is
+// about to overwrite and refuses if they do not match, so a different build of the game
+// leaves the process untouched rather than corrupted.
+void Install();
+
+// What the engine asked to see, and how full its fixed-size draw arrays got. Both are needed
+// to tell "the whole map is drawn" from "the patch is not running" and from "the map does not
+// fit the arrays".
+void LogState();
+
+} // namespace Engine

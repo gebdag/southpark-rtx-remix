@@ -36,6 +36,13 @@ enum Pipeline {
 };
 bool ClaimPipeline(Pipeline pipeline);
 
+// The synthesised skybox is drawn with depth off, so it is only safe while the frame is
+// still empty; the 2D layer is depth-free too and can legitimately go down first. Ask with
+// FrameHasDrawn, and claim only once something has actually been drawn -- a claim spent on
+// an attempt that then fails costs the frame its backdrop.
+bool FrameHasDrawn();
+void ClaimFirstDraw();
+
 // Null until Create succeeds. Subsystems that own D3D resources must tolerate this.
 IDirect3DDevice9* Get();
 void Destroy();
@@ -53,7 +60,18 @@ void SetVSync(bool enabled);
 // opcode 0xf8. Packed 0xAABBGGRR, matching the byte order the original unpacks.
 void SetClearColour(unsigned int packedAbgr);
 
+// The colour the frame is being cleared to, as a D3DCOLOR. The synthesised skybox paints
+// itself with this so the backdrop is one colour whether it is reached as cleared pixels or
+// as geometry.
+unsigned int ClearColour();
+
 int Width();
 int Height();
+
+// Copies the back buffer to a 24-bit BMP. PrintWindow returns black for a D3D9 swapchain, so
+// the renderer takes its own screenshots.
+// The capture happens inside EndFrame, after EndScene and before Present, which is the only
+// window where the finished frame is both complete and still on the render target.
+void RequestScreenshot(const char* path);
 
 } // namespace Device

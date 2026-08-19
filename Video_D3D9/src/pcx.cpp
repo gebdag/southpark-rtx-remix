@@ -417,6 +417,9 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
 
     // 2D sits on top of the scene unconditionally: no depth test, no depth write, no fog,
     // no culling.
+    // Counts against the frame's first draw, so the depth-free skybox knows not to paint
+    // over a 2D backdrop that went down before any world geometry.
+    Device::ClaimFirstDraw();
     if (Device::ClaimPipeline(Device::Pipeline2D)) {
         dev->SetFVF(kScreenFVF);
         dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);

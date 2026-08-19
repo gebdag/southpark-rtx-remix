@@ -20,15 +20,25 @@ void* g_sets[kMaxSets];
 // (image, palette) pair is cached separately; almost every set only ever uses one.
 struct Variant {
     unsigned short pix, pal;
+    unsigned short transparentPercent;   // texels the alpha test would discard
     IDirect3DTexture9* tex;
 };
-const int kMaxVariants = 16;
+// Deep enough for the widest sets (SMOKE01 has 30 frames, BOOM05 27 palettes). A
+// set that still overflows recycles its oldest entry rather than decoding afresh every draw
+// -- at 20,000 flushes a second, a decode that is not cached is also a texture that is
+// never released.
+const int kMaxVariants = 64;
 struct SetCache {
     Variant v[kMaxVariants];
     int n;
+    int next;   // round-robin victim once the cache is full
 };
 SetCache g_cache[kMaxSets];
 bool  g_decodeFailed[kMaxSets];
+int   g_decodeFailuresLogged = 0;
+// Filled by the decoder and consumed by the caller that cached the variant.
+unsigned short g_lastDecodeTransparentPercent = 0;
+int   g_decodeFailures = 0;
 bool  g_isSky[kMaxSets];
 int   g_count = 0;
 int   g_paletteLogged = 0;
@@ -465,6 +475,7 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
         tex->Release();
         return 0;
     }
+    unsigned int clearTexels = 0;
 
     const unsigned short* pal = (const unsigned short*)palette;
     const unsigned int palEntries = palette ? palSize / 2 : 0;
@@ -483,6 +494,9 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
             }
             if (palEntries) {
                 dst[x] = (idx < palEntries) ? ExpandPaletteEntry(pal[idx], fourBitAlpha) : 0u;
+                if ((dst[x] >> 24) == 0) {
+                    ++clearTexels;
+                }
             } else {
                 // Palette-less sets are single-channel coverage: white modulated by the
                 // vertex colour, with the sample as opacity.
@@ -491,6 +505,8 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
         }
     }
     tex->UnlockRect(0);
+    g_lastDecodeTransparentPercent =
+        pixels ? (unsigned short)((clearTexels * 100) / pixels) : 0;
     return tex;
 }
 
@@ -525,17 +541,39 @@ IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
     }
 
     IDirect3DTexture9* tex = Decode(index, pixSub, palSub);
-    if (!tex && cache.n == 0) {
-        // Frame 0 failing means the set as a whole is undecodable; a single missing frame is
-        // not grounds for giving up on the rest.
-        g_decodeFailed[index] = true;
+    if (!tex) {
+        ++g_decodeFailures;
+        if (g_decodeFailuresLogged < 40) {
+            ++g_decodeFailuresLogged;
+            LogLine("    texture decode FAILED: set %d frame %d palette %d  \"%s\"",
+                    index, pixSub, palSub, Name(index));
+        }
+        if (cache.n == 0) {
+            // Frame 0 failing means the set as a whole is undecodable; a single missing
+            // frame is not grounds for giving up on the rest.
+            g_decodeFailed[index] = true;
+        }
         return 0;
     }
     if (cache.n < kMaxVariants) {
         cache.v[cache.n].pix = (unsigned short)pixSub;
         cache.v[cache.n].pal = (unsigned short)palSub;
+        cache.v[cache.n].transparentPercent = g_lastDecodeTransparentPercent;
         cache.v[cache.n].tex = tex;
         ++cache.n;
+    } else {
+        // Full: recycle a slot. Dropping the texture on the floor instead leaks one per
+        // draw call, which is how a long run runs the device out of memory and starts
+        // failing every later decode.
+        Variant& victim = cache.v[cache.next];
+        cache.next = (cache.next + 1) % kMaxVariants;
+        if (victim.tex) {
+            victim.tex->Release();
+        }
+        victim.pix = (unsigned short)pixSub;
+        victim.pal = (unsigned short)palSub;
+        victim.transparentPercent = g_lastDecodeTransparentPercent;
+        victim.tex = tex;
     }
     return tex;
 }
@@ -576,6 +614,7 @@ void Texture::LogSetCensus() {
                 i, fmt, w, h, frames, pals, frame0,
                 px ? (double)frame0 * 8.0 / (double)px : 0.0, pal0, SetName(g_sets[i]));
     }
+    LogLine("    decode failures so far: %d", g_decodeFailures);
     LogLine("    format totals: 0=%d 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d",
             byFormat[0], byFormat[1], byFormat[2], byFormat[3],
             byFormat[4], byFormat[5], byFormat[6], byFormat[7]);
@@ -585,8 +624,96 @@ int Texture::Count() {
     return g_count;
 }
 
+const char* Texture::Name(int index) {
+    if (index < 0 || index >= g_count || !g_sets[index]) {
+        return "";
+    }
+    return SetName(g_sets[index]);
+}
+
+void Texture::Describe(int index, int subA, int subB, char* out, int capacity) {
+    if (!out || capacity <= 0) {
+        return;
+    }
+    out[0] = 0;
+    if (index < 0 || index >= g_count || !g_sets[index]) {
+        _snprintf(out, capacity, "no texture (index %d)", index);
+        out[capacity - 1] = 0;
+        return;
+    }
+    const unsigned char* base = (const unsigned char*)g_sets[index];
+    const unsigned int size = BlobSize(base);
+    unsigned int hdrSize = 0, pixChunkSize = 0, palChunkSize = 0;
+    const unsigned char* hdr = ChunkAt(base, size, 0, &hdrSize);
+    const unsigned char* pixChunk = ChunkAt(base, size, 1, &pixChunkSize);
+    const unsigned char* palChunk = ChunkAt(base, size, 2, &palChunkSize);
+    if (!hdr || hdrSize < 4) {
+        _snprintf(out, capacity, "set %d unreadable", index);
+        out[capacity - 1] = 0;
+        return;
+    }
+    int pixSub = 0, palSub = 0;
+    ResolveSubChunks(hdr[0], subA, subB, &pixSub, &palSub);
+    pixSub = ClampIndex(pixSub, SubChunkCount(pixChunk, pixChunkSize));
+    palSub = ClampIndex(palSub, SubChunkCount(palChunk, palChunkSize));
+
+    int transparent = -1;
+    const SetCache& cache = g_cache[index];
+    for (int i = 0; i < cache.n; ++i) {
+        if (cache.v[i].pix == (unsigned short)pixSub && cache.v[i].pal == (unsigned short)palSub) {
+            transparent = (int)cache.v[i].transparentPercent;
+            break;
+        }
+    }
+    // Both the resolved sub-chunks and the raw operands the display list asked for. An
+    // animation that has stopped moving looks identical to one the engine stopped driving,
+    // and only the raw values tell the two apart: a frame that reads "asked 7 -> 0" was
+    // clamped here, one that reads "asked 0" was never requested.
+    int rawPix = 0, rawPal = 0;
+    ResolveSubChunks(hdr[0], subA, subB, &rawPix, &rawPal);
+    _snprintf(out, capacity,
+              "set %4d fmt=%d %3dx%-3d frame %d/%u pal %d/%u (asked %d,%d -> %d,%d) "
+              "clear=%d%% %s%s",
+              index, hdr[0], hdr[2] ? hdr[2] : 256, hdr[3] ? hdr[3] : 256,
+              pixSub, SubChunkCount(pixChunk, pixChunkSize),
+              palSub, SubChunkCount(palChunk, palChunkSize),
+              subA, subB, rawPix, rawPal, transparent,
+              SetName(g_sets[index]), g_decodeFailed[index] ? "  DECODE FAILED" : "");
+    out[capacity - 1] = 0;
+}
+
+int Texture::Format(int index) {
+    if (index < 0 || index >= g_count || !g_sets[index]) {
+        return -1;
+    }
+    const unsigned char* base = (const unsigned char*)g_sets[index];
+    unsigned int hdrSize = 0;
+    const unsigned char* hdr = ChunkAt(base, BlobSize(base), 0, &hdrSize);
+    return (hdr && hdrSize >= 1) ? (int)hdr[0] : -1;
+}
+
+bool Texture::DecodeFailed(int index) {
+    return index >= 0 && index < kMaxSets && g_decodeFailed[index];
+}
+
 bool Texture::IsSkySet(int index) {
     return index >= 0 && index < g_count && g_isSky[index];
+}
+
+void Texture::FlushDecoded() {
+    int released = 0;
+    for (int i = 0; i < g_count; ++i) {
+        for (int v = 0; v < g_cache[i].n; ++v) {
+            if (g_cache[i].v[v].tex) {
+                g_cache[i].v[v].tex->Release();
+                ++released;
+            }
+        }
+        g_cache[i].n = 0;
+        g_cache[i].next = 0;
+        g_decodeFailed[i] = false;
+    }
+    LogLine("    texture cache flushed: %d decoded frames released", released);
 }
 
 void Texture::ReleaseAll() {
@@ -597,6 +724,7 @@ void Texture::ReleaseAll() {
             }
         }
         g_cache[i].n = 0;
+        g_cache[i].next = 0;
         if (g_sets[i]) {
             free(g_sets[i]);
             g_sets[i] = 0;

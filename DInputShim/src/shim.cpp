@@ -1,0 +1,718 @@
+// dinput.dll shim for South Park (1999) -- makes the game share input with the desktop.
+//
+// The game takes the mouse and keyboard through DirectInput in EXCLUSIVE mode. That has
+// three consequences the RTX Remix port cannot live with:
+//
+//   * the OS cursor is suppressed for the whole process, so the Alt+X Remix overlay has
+//     nothing to point with -- and it is genuinely suppressed, not merely hidden:
+//     SetCursorPos still reports success while synthetic mouse_event(MOUSEEVENTF_MOVE)
+//     calls leave the pointer where it is;
+//   * an exclusively acquired keyboard swallows Alt+Tab;
+//   * the game keeps reading its devices while another window has focus, so clicking away
+//     leaves it turning and firing in the background.
+//
+// None of this is fixable from the video plugin. The engine calls DirectInputCreateA during
+// startup, long before it loads a renderer, so every call the plugin could redirect has
+// already happened by the time it exists.
+//
+// A DLL the executable imports statically, on the other hand, is initialised before the
+// process runs a single instruction of its own. The executable imports DINPUT.dll, and
+// dinput.dll is not a KnownDLL, so a copy in the application directory wins the loader's
+// search. This is that copy: it forwards every export to the real dinput.dll in system32 and
+// patches a handful of methods on the interfaces the game gets back.
+//
+// Patching the COM vtables rather than wrapping the objects means no method we do not care
+// about has to be reimplemented -- which matters, because dinput hands out several interface
+// versions with different vtable lengths. Each patched vtable is remembered with its
+// original method pointers, since the mouse and the keyboard are different classes inside
+// dinput and do not share one.
+
+#include <windows.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+namespace {
+
+// --------------------------------------------------------------------------- logging
+
+char g_logPath[MAX_PATH];
+CRITICAL_SECTION g_logLock;
+bool g_logReady = false;
+
+void Log(const char* fmt, ...) {
+    if (!g_logReady) {
+        return;
+    }
+    EnterCriticalSection(&g_logLock);
+    FILE* f = fopen(g_logPath, "a");
+    if (f) {
+        va_list args;
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        va_end(args);
+        fputc('\n', f);
+        fclose(f);
+    }
+    LeaveCriticalSection(&g_logLock);
+}
+
+// ---------------------------------------------------------------------------- config
+//
+// Read from the renderer's Video_D3D9.ini so the port has one settings file rather than two.
+
+char g_iniPath[MAX_PATH];
+bool g_forceNonExclusive = true;
+bool g_suspendWhenUnfocused = true;
+bool g_menuHotkeySuspends = true;
+bool g_keepCursorVisible = true;
+
+bool ReadBool(const char* section, const char* key, bool fallback) {
+    return GetPrivateProfileIntA(section, key, fallback ? 1 : 0, g_iniPath) != 0;
+}
+
+// --------------------------------------------------------------------------- forwarding
+
+HMODULE g_real = 0;
+
+typedef HRESULT (WINAPI *DirectInputCreateAFn)(HINSTANCE, DWORD, void**, void*);
+typedef HRESULT (WINAPI *DirectInputCreateWFn)(HINSTANCE, DWORD, void**, void*);
+typedef HRESULT (WINAPI *DirectInputCreateExFn)(HINSTANCE, DWORD, const IID&, void**, void*);
+typedef HRESULT (WINAPI *DllGetClassObjectFn)(const CLSID&, const IID&, void**);
+typedef HRESULT (WINAPI *NoArgHrFn)(void);
+
+DirectInputCreateAFn  g_realCreateA = 0;
+DirectInputCreateWFn  g_realCreateW = 0;
+DirectInputCreateExFn g_realCreateEx = 0;
+
+// Loads the genuine dinput.dll by absolute path. A plain LoadLibraryA("dinput.dll") would
+// find this file again -- it is the one sitting in the application directory.
+bool LoadReal() {
+    if (g_real) {
+        return true;
+    }
+    char path[MAX_PATH];
+    const UINT n = GetSystemDirectoryA(path, MAX_PATH);
+    if (n == 0 || n + sizeof("\\dinput.dll") >= MAX_PATH) {
+        return false;
+    }
+    lstrcatA(path, "\\dinput.dll");
+    g_real = LoadLibraryA(path);
+    if (!g_real) {
+        Log("FATAL: could not load %s (err %lu)", path, (unsigned long)GetLastError());
+        return false;
+    }
+    Log("real dinput: %s", path);
+    return true;
+}
+
+FARPROC Real(const char* name) {
+    return LoadReal() ? GetProcAddress(g_real, name) : 0;
+}
+
+// ------------------------------------------------------------------------ focus state
+
+// Alt+X toggles the Remix overlay. The overlay lives in the bridge's 64-bit process and the
+// shim cannot ask whether it is open, so the toggle is mirrored here: while the overlay is
+// up the game stops reading its devices, which is what makes the pointer usable over it.
+// The mirror can drift if the overlay is closed some other way; pressing Alt+X resyncs it.
+bool g_inputSuspendedByMenu = false;
+bool g_menuChordHeld = false;
+
+// The cursor belongs to whoever is entitled to the mouse. While the game is reading its
+// devices that is the game, which hides the pointer -- an arrow parked in the middle of
+// gameplay is exactly what the game's exclusive grab prevents. It is put back only while
+// input is suspended: overlay open, or another window in the foreground.
+int g_cursorShown = 0;
+// Starts released so the first UpdateCursor(false) genuinely runs: the window class may
+// already carry a cursor, and the resting state has to be installed rather than assumed.
+bool g_cursorReleased = true;       // the pointer currently belongs to the desktop
+HCURSOR g_gameCursor = 0;           // the last cursor the game asked for
+HWND g_inputWindow = 0;             // the window the game gave to SetCooperativeLevel
+int g_devicesPatched = 0;
+int g_coopCallsRewritten = 0;
+long g_statesBlocked = 0;
+long g_reacquires = 0;
+
+bool GameHasFocus() {
+    const HWND fg = GetForegroundWindow();
+    if (!fg) {
+        return false;
+    }
+    DWORD pid = 0;
+    GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId();
+}
+
+void PollMenuHotkey() {
+    if (!g_menuHotkeySuspends) {
+        return;
+    }
+    const bool held = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 &&
+                      (GetAsyncKeyState('X') & 0x8000) != 0;
+    if (held && !g_menuChordHeld) {
+        g_inputSuspendedByMenu = !g_inputSuspendedByMenu;
+        Log("Alt+X: game input %s", g_inputSuspendedByMenu ? "suspended (overlay)" : "resumed");
+    }
+    g_menuChordHeld = held;
+}
+
+// ShowCursor keeps an internal counter, so the show and the hide have to be balanced rather
+// than repeated -- calling it every frame either climbs forever or never takes effect. The
+// window class cursor moves with it: a class with no cursor shows nothing over its client
+// area whatever anyone else wants, and a class with one shows it whether or not it is
+// wanted, so it is installed and removed alongside.
+void UpdateCursor(bool release) {
+    if (!g_keepCursorVisible || release == g_cursorReleased) {
+        return;
+    }
+    g_cursorReleased = release;
+    if (release) {
+        if (g_inputWindow) {
+            SetClassLongPtrA(g_inputWindow, GCLP_HCURSOR, (LONG_PTR)LoadCursorA(0, IDC_ARROW));
+        }
+        SetCursor(LoadCursorA(0, IDC_ARROW));
+        if (g_cursorShown < 1) {
+            ShowCursor(TRUE);
+            ++g_cursorShown;
+        }
+    } else {
+        if (g_inputWindow) {
+            SetClassLongPtrA(g_inputWindow, GCLP_HCURSOR, 0);
+        }
+        // Hand the game back whatever it last asked for, which is usually nothing at all.
+        SetCursor(g_gameCursor);
+        while (g_cursorShown > 0) {
+            ShowCursor(FALSE);
+            --g_cursorShown;
+        }
+    }
+}
+
+// True when the game must not see any input on this call.
+bool InputBlocked() {
+    PollMenuHotkey();
+    const bool focused = GameHasFocus();
+    const bool blocked = (g_suspendWhenUnfocused && !focused) || g_inputSuspendedByMenu;
+    UpdateCursor(blocked || !focused);
+    return blocked;
+}
+
+// ------------------------------------------------------------------- vtable patching
+
+typedef HRESULT (STDMETHODCALLTYPE *QueryInterfaceFn)(void*, const IID&, void**);
+typedef HRESULT (STDMETHODCALLTYPE *CreateDeviceFn)(void*, const GUID*, void**, void*);
+typedef HRESULT (STDMETHODCALLTYPE *AcquireFn)(void*);
+typedef HRESULT (STDMETHODCALLTYPE *SetCooperativeLevelFn)(void*, HWND, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *GetDeviceStateFn)(void*, DWORD, void*);
+typedef HRESULT (STDMETHODCALLTYPE *GetDeviceDataFn)(void*, DWORD, void*, DWORD*, DWORD);
+
+// Vtable slots, counting the three IUnknown methods first.
+const int kSlotQueryInterface      = 0;
+const int kSlotCreateDevice        = 3;    // IDirectInput
+const int kSlotAcquire             = 7;    // IDirectInputDevice from here down
+const int kSlotGetDeviceState      = 9;
+const int kSlotGetDeviceData       = 10;
+const int kSlotSetCooperativeLevel = 13;
+const int kMaxTrackedSlots         = 14;
+
+const DWORD DISCL_EXCLUSIVE    = 0x00000001;
+const DWORD DISCL_NONEXCLUSIVE = 0x00000002;
+const DWORD DISCL_FOREGROUND   = 0x00000004;
+const DWORD DISCL_BACKGROUND   = 0x00000008;
+
+const HRESULT DIERR_INPUTLOST   = (HRESULT)0x8007001EL;
+const HRESULT DIERR_NOTACQUIRED = (HRESULT)0x8007000CL;
+
+// One record per patched vtable, holding the methods it displaced. dinput's mouse and
+// keyboard are separate classes with separate vtables, and QueryInterface can hand back a
+// third for a later interface version, so a single saved "original" would call the wrong
+// implementation the moment a second device appeared.
+struct Vtable {
+    void** table;
+    void* original[kMaxTrackedSlots];
+};
+const int kMaxVtables = 16;
+Vtable g_vtables[kMaxVtables];
+int g_vtableCount = 0;
+
+Vtable* FindVtable(void* object) {
+    if (!object) {
+        return 0;
+    }
+    void** table = *(void***)object;
+    for (int i = 0; i < g_vtableCount; ++i) {
+        if (g_vtables[i].table == table) {
+            return &g_vtables[i];
+        }
+    }
+    return 0;
+}
+
+Vtable* EnsureVtable(void* object) {
+    Vtable* found = FindVtable(object);
+    if (found || g_vtableCount >= kMaxVtables) {
+        return found;
+    }
+    Vtable& v = g_vtables[g_vtableCount++];
+    memset(&v, 0, sizeof(v));
+    v.table = *(void***)object;
+    return &v;
+}
+
+// Replaces one slot, remembering what was there. Returns false if the slot is unreadable or
+// already ours.
+bool PatchMethod(Vtable* v, int slot, void* replacement) {
+    if (!v || slot >= kMaxTrackedSlots) {
+        return false;
+    }
+    if (IsBadReadPtr(v->table, (slot + 1) * sizeof(void*))) {
+        return false;
+    }
+    if (v->original[slot]) {
+        return true;                       // already patched
+    }
+    DWORD previous = 0;
+    if (!VirtualProtect(&v->table[slot], sizeof(void*), PAGE_READWRITE, &previous)) {
+        return false;
+    }
+    v->original[slot] = v->table[slot];
+    v->table[slot] = replacement;
+    DWORD ignored = 0;
+    VirtualProtect(&v->table[slot], sizeof(void*), previous, &ignored);
+    return true;
+}
+
+void PatchDevice(void* device);
+void PatchFactory(void* factory);
+
+// A QueryInterface result is only worth patching if the vtable behind it is at least as long
+// as the slots being written. Every DirectInput device interface (A, 2A, 7A, 8A) has at
+// least 18 methods and every factory interface at least 8, so the one dangerous answer is
+// IID_IUnknown: three methods, after which slot 3, 9, 10 or 13 lands on whatever follows the
+// vtable in dinput's .rdata -- and IsBadReadPtr cannot tell the difference, because that
+// memory is perfectly readable.
+// Spelled out rather than taken from uuid.lib, which this module has no other reason to link.
+const IID kIidUnknown = { 0x00000000, 0x0000, 0x0000,
+                          { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+
+bool IsUnknownIid(const IID& iid) {
+    return IsEqualIID(iid, kIidUnknown) != 0;
+}
+
+// ------------------------------------------------------------------------ device hooks
+
+HRESULT STDMETHODCALLTYPE HookedSetCooperativeLevel(void* self, HWND window, DWORD flags) {
+    Vtable* v = FindVtable(self);
+    if (!v) {
+        return E_FAIL;
+    }
+    SetCooperativeLevelFn original = (SetCooperativeLevelFn)v->original[kSlotSetCooperativeLevel];
+
+    DWORD effective = flags;
+    if (g_forceNonExclusive) {
+        // Exclusive is the whole problem. Foreground-only is what stops the game reading its
+        // devices behind another window's back, and DirectInput enforces that for us by
+        // unacquiring on focus loss.
+        effective &= ~(DISCL_EXCLUSIVE | DISCL_BACKGROUND);
+        effective |= DISCL_NONEXCLUSIVE | DISCL_FOREGROUND;
+    }
+    if (effective != flags) {
+        ++g_coopCallsRewritten;
+        Log("SetCooperativeLevel(hwnd=%p) 0x%08lx -> 0x%08lx", window,
+            (unsigned long)flags, (unsigned long)effective);
+    }
+
+    HRESULT hr = original(self, window, effective);
+    if (FAILED(hr) && effective != flags) {
+        // Some device classes reject combinations the game never asked for. Better the
+        // game's own input than none at all.
+        Log("  rewritten level rejected (hr=0x%08lx); falling back to the original",
+            (unsigned long)hr);
+        hr = original(self, window, flags);
+    }
+
+    if (window) {
+        g_inputWindow = window;
+    }
+    return hr;
+}
+
+// Foreground cooperativity means DirectInput unacquires the device whenever the window loses
+// focus, and the game is on its own to notice. If it does not, its input never comes back
+// after the first Alt+Tab -- so reacquire here rather than depending on the engine.
+HRESULT ReacquireIfLost(Vtable* v, void* self, HRESULT hr) {
+    if (hr != DIERR_INPUTLOST && hr != DIERR_NOTACQUIRED) {
+        return hr;
+    }
+    if (!GameHasFocus() || !v->original[kSlotAcquire]) {
+        return hr;
+    }
+    AcquireFn acquire = (AcquireFn)v->original[kSlotAcquire];
+    if (FAILED(acquire(self))) {
+        return hr;
+    }
+    InterlockedIncrement(&g_reacquires);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE HookedGetDeviceState(void* self, DWORD size, void* data) {
+    Vtable* v = FindVtable(self);
+    if (!v) {
+        return E_FAIL;
+    }
+    if (InputBlocked()) {
+        // A zeroed buffer is a device with nothing pressed and no movement, which is exactly
+        // what the game should see. Failing the call instead makes engines re-acquire in a
+        // loop, and some read the stale buffer as if it were live.
+        if (data && size && !IsBadWritePtr(data, size)) {
+            memset(data, 0, size);
+        }
+        InterlockedIncrement(&g_statesBlocked);
+        return S_OK;
+    }
+    GetDeviceStateFn original = (GetDeviceStateFn)v->original[kSlotGetDeviceState];
+    HRESULT hr = original(self, size, data);
+    if (ReacquireIfLost(v, self, hr) == S_OK && hr != S_OK) {
+        hr = original(self, size, data);
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookedGetDeviceData(void* self, DWORD objectSize, void* buffer,
+                                              DWORD* inOut, DWORD flags) {
+    Vtable* v = FindVtable(self);
+    if (!v) {
+        return E_FAIL;
+    }
+    GetDeviceDataFn original = (GetDeviceDataFn)v->original[kSlotGetDeviceData];
+    if (InputBlocked()) {
+        // Report an empty batch. Buffered events keep queueing while the game is not
+        // looking and would replay as a burst on the way back, so flush the queue: passing
+        // a null buffer with an unlimited count is dinput's own way to discard it.
+        DWORD discard = 0xffffffffu;
+        original(self, objectSize, 0, &discard, 0);
+        if (inOut) {
+            *inOut = 0;
+        }
+        InterlockedIncrement(&g_statesBlocked);
+        return S_OK;
+    }
+    HRESULT hr = original(self, objectSize, buffer, inOut, flags);
+    if (ReacquireIfLost(v, self, hr) == S_OK && hr != S_OK) {
+        hr = original(self, objectSize, buffer, inOut, flags);
+    }
+    return hr;
+}
+
+// A later interface version is a different object with its own vtable, so whatever
+// QueryInterface hands back has to be patched too or the game simply uses the unhooked one.
+HRESULT STDMETHODCALLTYPE HookedDeviceQueryInterface(void* self, const IID& iid, void** out) {
+    Vtable* v = FindVtable(self);
+    if (!v) {
+        return E_FAIL;
+    }
+    QueryInterfaceFn original = (QueryInterfaceFn)v->original[kSlotQueryInterface];
+    HRESULT hr = original(self, iid, out);
+    if (SUCCEEDED(hr) && out && *out && !IsUnknownIid(iid)) {
+        PatchDevice(*out);
+    }
+    return hr;
+}
+
+void PatchDevice(void* device) {
+    if (!device) {
+        return;
+    }
+    const bool fresh = (FindVtable(device) == 0);
+    Vtable* v = EnsureVtable(device);
+    if (!v) {
+        return;
+    }
+    // Acquire is not hooked, only remembered: the recovery path above needs to call it.
+    if (!v->original[kSlotAcquire] && !IsBadReadPtr(v->table, (kSlotAcquire + 1) * sizeof(void*))) {
+        v->original[kSlotAcquire] = v->table[kSlotAcquire];
+    }
+    PatchMethod(v, kSlotSetCooperativeLevel, (void*)&HookedSetCooperativeLevel);
+    PatchMethod(v, kSlotGetDeviceState, (void*)&HookedGetDeviceState);
+    PatchMethod(v, kSlotGetDeviceData, (void*)&HookedGetDeviceData);
+    PatchMethod(v, kSlotQueryInterface, (void*)&HookedDeviceQueryInterface);
+    if (fresh) {
+        ++g_devicesPatched;
+        Log("device vtable %p patched", (void*)v->table);
+    }
+}
+
+// ----------------------------------------------------------------------- factory hooks
+
+HRESULT STDMETHODCALLTYPE HookedCreateDevice(void* self, const GUID* guid, void** out,
+                                             void* outer) {
+    Vtable* v = FindVtable(self);
+    if (!v) {
+        return E_FAIL;
+    }
+    CreateDeviceFn original = (CreateDeviceFn)v->original[kSlotCreateDevice];
+    HRESULT hr = original(self, guid, out, outer);
+    if (SUCCEEDED(hr) && out && *out) {
+        PatchDevice(*out);
+    }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE HookedFactoryQueryInterface(void* self, const IID& iid, void** out) {
+    Vtable* v = FindVtable(self);
+    if (!v) {
+        return E_FAIL;
+    }
+    QueryInterfaceFn original = (QueryInterfaceFn)v->original[kSlotQueryInterface];
+    HRESULT hr = original(self, iid, out);
+    if (SUCCEEDED(hr) && out && *out && !IsUnknownIid(iid)) {
+        PatchFactory(*out);
+    }
+    return hr;
+}
+
+void PatchFactory(void* factory) {
+    if (!factory) {
+        return;
+    }
+    const bool fresh = (FindVtable(factory) == 0);
+    Vtable* v = EnsureVtable(factory);
+    if (!v) {
+        return;
+    }
+    PatchMethod(v, kSlotCreateDevice, (void*)&HookedCreateDevice);
+    PatchMethod(v, kSlotQueryInterface, (void*)&HookedFactoryQueryInterface);
+    if (fresh) {
+        Log("IDirectInput vtable %p patched", (void*)v->table);
+    }
+}
+
+// ---------------------------------------------------------------- executable IAT fixes
+
+// The executable imports ClipCursor, SetCursor and mouse_event and manages the pointer with
+// all three. Those calls do nothing visible while exclusive mode has the cursor suppressed;
+// once it does not, they are exactly what drags the pointer back under the game.
+typedef HCURSOR (WINAPI *SetCursorFn)(HCURSOR);
+typedef BOOL (WINAPI *ClipCursorFn)(const RECT*);
+typedef void (WINAPI *MouseEventFn)(DWORD, DWORD, DWORD, DWORD, ULONG_PTR);
+
+SetCursorFn g_realSetCursor = 0;
+ClipCursorFn g_realClipCursor = 0;
+MouseEventFn g_realMouseEvent = 0;
+
+HCURSOR WINAPI ShimSetCursor(HCURSOR cursor) {
+    g_gameCursor = cursor;
+    // The game hides the pointer by setting it to nothing, which is right while it owns the
+    // mouse. Only refuse that while the pointer has been handed to the desktop, or the game
+    // would take it back on its next frame.
+    if (!cursor && g_keepCursorVisible && g_cursorReleased) {
+        return g_realSetCursor(LoadCursorA(0, IDC_ARROW));
+    }
+    return g_realSetCursor(cursor);
+}
+
+BOOL WINAPI ShimClipCursor(const RECT* rect) {
+    // Confining the pointer to the game window is precisely what stops it reaching anything
+    // else. Let the game believe it worked.
+    (void)rect;
+    return TRUE;
+}
+
+void WINAPI ShimMouseEvent(DWORD flags, DWORD dx, DWORD dy, DWORD data, ULONG_PTR extra) {
+    if (g_inputSuspendedByMenu || (g_suspendWhenUnfocused && !GameHasFocus())) {
+        return;
+    }
+    g_realMouseEvent(flags, dx, dy, data, extra);
+}
+
+// Rewrites one import thunk in the executable, confined to the thunk arrays the import
+// descriptors name rather than searching memory for a pointer value -- a blind
+// search-and-replace across a live heap eventually finds, and destroys, something that
+// merely happens to hold that number.
+int RedirectImport(void* original, void* replacement) {
+    HMODULE exe = GetModuleHandleA(0);
+    if (!exe || !original) {
+        return 0;
+    }
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)exe;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        return 0;
+    }
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)((const char*)exe + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) {
+        return 0;
+    }
+    const IMAGE_DATA_DIRECTORY& dir =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (dir.VirtualAddress == 0 || dir.Size == 0) {
+        return 0;
+    }
+    int patched = 0;
+    const IMAGE_IMPORT_DESCRIPTOR* desc =
+        (const IMAGE_IMPORT_DESCRIPTOR*)((char*)exe + dir.VirtualAddress);
+    for (; !IsBadReadPtr(desc, sizeof(*desc)) && desc->FirstThunk != 0; ++desc) {
+        void** thunk = (void**)((char*)exe + desc->FirstThunk);
+        for (; !IsBadReadPtr(thunk, sizeof(void*)) && *thunk != 0; ++thunk) {
+            if (*thunk != original) {
+                continue;
+            }
+            DWORD previous = 0;
+            if (VirtualProtect(thunk, sizeof(void*), PAGE_READWRITE, &previous)) {
+                *thunk = replacement;
+                DWORD ignored = 0;
+                VirtualProtect(thunk, sizeof(void*), previous, &ignored);
+                ++patched;
+            }
+        }
+    }
+    return patched;
+}
+
+// The executable's imports are already snapped by the time a statically linked DLL's DllMain
+// runs, so its thunks can be rewritten from here. The loader lock is held, so nothing in
+// this path may load a module -- every function it touches is already resident.
+void PatchExecutableImports() {
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    if (!user32) {
+        Log("user32 not resident at load time; cursor thunks left alone");
+        return;
+    }
+    g_realSetCursor = (SetCursorFn)GetProcAddress(user32, "SetCursor");
+    g_realClipCursor = (ClipCursorFn)GetProcAddress(user32, "ClipCursor");
+    g_realMouseEvent = (MouseEventFn)GetProcAddress(user32, "mouse_event");
+
+    int cursor = 0, clip = 0, mouse = 0;
+    if (g_realSetCursor && g_keepCursorVisible) {
+        cursor = RedirectImport((void*)g_realSetCursor, (void*)&ShimSetCursor);
+    }
+    if (g_realClipCursor && g_keepCursorVisible) {
+        clip = RedirectImport((void*)g_realClipCursor, (void*)&ShimClipCursor);
+    }
+    if (g_realMouseEvent) {
+        mouse = RedirectImport((void*)g_realMouseEvent, (void*)&ShimMouseEvent);
+    }
+    Log("executable thunks redirected: SetCursor %d, ClipCursor %d, mouse_event %d",
+        cursor, clip, mouse);
+}
+
+void LoadConfig(HMODULE self) {
+    char modulePath[MAX_PATH];
+    const DWORD len = GetModuleFileNameA(self, modulePath, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        return;
+    }
+    char* slash = strrchr(modulePath, '\\');
+    if (slash) {
+        *(slash + 1) = 0;
+    } else {
+        modulePath[0] = 0;
+    }
+    _snprintf(g_iniPath, MAX_PATH, "%sVideo_D3D9.ini", modulePath);
+    _snprintf(g_logPath, MAX_PATH, "%sDInputShim.log", modulePath);
+    g_iniPath[MAX_PATH - 1] = 0;
+    g_logPath[MAX_PATH - 1] = 0;
+
+    g_forceNonExclusive    = ReadBool("Input", "ForceNonExclusiveInput", true);
+    g_suspendWhenUnfocused = ReadBool("Input", "SuspendInputWhenUnfocused", true);
+    g_menuHotkeySuspends   = ReadBool("Input", "RemixMenuHotkeySuspendsInput", true);
+    g_keepCursorVisible    = ReadBool("Input", "KeepCursorVisible", true);
+}
+
+} // namespace
+
+// ------------------------------------------------------------------------- exports
+
+extern "C" HRESULT WINAPI DirectInputCreateA(HINSTANCE inst, DWORD version, void** out,
+                                             void* outer) {
+    if (!g_realCreateA) {
+        g_realCreateA = (DirectInputCreateAFn)Real("DirectInputCreateA");
+    }
+    if (!g_realCreateA) {
+        return E_FAIL;
+    }
+    HRESULT hr = g_realCreateA(inst, version, out, outer);
+    Log("DirectInputCreateA(version=0x%lx) -> 0x%08lx", (unsigned long)version,
+        (unsigned long)hr);
+    if (SUCCEEDED(hr) && out && *out) {
+        PatchFactory(*out);
+    }
+    return hr;
+}
+
+extern "C" HRESULT WINAPI DirectInputCreateW(HINSTANCE inst, DWORD version, void** out,
+                                             void* outer) {
+    if (!g_realCreateW) {
+        g_realCreateW = (DirectInputCreateWFn)Real("DirectInputCreateW");
+    }
+    if (!g_realCreateW) {
+        return E_FAIL;
+    }
+    HRESULT hr = g_realCreateW(inst, version, out, outer);
+    if (SUCCEEDED(hr) && out && *out) {
+        PatchFactory(*out);
+    }
+    return hr;
+}
+
+extern "C" HRESULT WINAPI DirectInputCreateEx(HINSTANCE inst, DWORD version, const IID& iid,
+                                              void** out, void* outer) {
+    if (!g_realCreateEx) {
+        g_realCreateEx = (DirectInputCreateExFn)Real("DirectInputCreateEx");
+    }
+    if (!g_realCreateEx) {
+        return E_FAIL;
+    }
+    HRESULT hr = g_realCreateEx(inst, version, iid, out, outer);
+    if (SUCCEEDED(hr) && out && *out) {
+        PatchFactory(*out);
+    }
+    return hr;
+}
+
+extern "C" HRESULT WINAPI DllCanUnloadNow(void) {
+    NoArgHrFn fn = (NoArgHrFn)Real("DllCanUnloadNow");
+    return fn ? fn() : S_FALSE;
+}
+
+// Straight passthrough, deliberately: a factory reached this way is not patched. South Park
+// calls DirectInputCreateA, so this exists to keep the module a complete dinput.dll rather
+// than to cover a path the game uses -- anything arriving through CoCreateInstance would
+// keep exclusive mode.
+extern "C" HRESULT WINAPI DllGetClassObject(const CLSID& clsid, const IID& iid, void** out) {
+    DllGetClassObjectFn fn = (DllGetClassObjectFn)Real("DllGetClassObject");
+    return fn ? fn(clsid, iid, out) : E_FAIL;
+}
+
+extern "C" HRESULT WINAPI DllRegisterServer(void) {
+    NoArgHrFn fn = (NoArgHrFn)Real("DllRegisterServer");
+    return fn ? fn() : E_FAIL;
+}
+
+extern "C" HRESULT WINAPI DllUnregisterServer(void) {
+    NoArgHrFn fn = (NoArgHrFn)Real("DllUnregisterServer");
+    return fn ? fn() : E_FAIL;
+}
+
+BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(self);
+        InitializeCriticalSection(&g_logLock);
+        LoadConfig(self);
+        DeleteFileA(g_logPath);
+        g_logReady = true;
+        Log("=== DInputShim loaded ===");
+        Log("ForceNonExclusiveInput=%d SuspendInputWhenUnfocused=%d "
+            "RemixMenuHotkeySuspendsInput=%d KeepCursorVisible=%d",
+            g_forceNonExclusive, g_suspendWhenUnfocused, g_menuHotkeySuspends,
+            g_keepCursorVisible);
+        PatchExecutableImports();
+    } else if (reason == DLL_PROCESS_DETACH) {
+        Log("=== DInputShim unloading: %d device vtables patched, %d cooperative levels "
+            "rewritten, %ld reads blocked, %ld reacquires ===",
+            g_devicesPatched, g_coopCallsRewritten, g_statesBlocked, g_reacquires);
+        g_logReady = false;
+        DeleteCriticalSection(&g_logLock);
+    }
+    return TRUE;
+}

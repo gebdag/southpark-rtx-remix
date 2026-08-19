@@ -20,14 +20,17 @@ void EndFrame();
 // Walks one display list. Recurses for the sub-list opcode.
 void ProcessDisplayList(const unsigned int* list);
 
-// One-shot dump of which opcodes the first frame's lists actually used.
-void LogOpcodeCensus();
-
 // How often a texture was selected and actually bound.
 void LogTextureStats();
 
 // Objective coherency metrics for the interpreted geometry.
 void LogGeometryAudit();
+
+// Log the next frame batch by batch: what texture each draw bound and how transparent it is,
+// the render flags, the combiner mode and constant colour, the triangle and vertex counts,
+// the world bounding box, and the state of the normals. One frame is a few hundred lines,
+// which is readable; a session is not, so this is armed on demand from a key.
+void DumpNextFrame();
 
 void ReleaseResources();
 

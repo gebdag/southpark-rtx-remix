@@ -36,6 +36,14 @@ enum Opcode {
     // The frame's background colour, packed 0xAABBGGRR in word1. The original unpacks it
     // into the viewport clear; without it the background is whatever this renderer picked.
     OP_BACKGROUND = 0xf8,
+    // The N64 combiner's two constant colours. The original multiplies every vertex colour
+    // by one of them, chosen by the mode below. Ignoring them draws South Park's
+    // flat-coloured house walls white.
+    OP_PRIM_COLOUR = 0xfa,
+    OP_ENV_COLOUR  = 0xfb,
+    // Selects one of 41 colour-combiner modes, and with it whether the constant colours
+    // above participate at all. Without this the tint is applied to everything.
+    OP_COMBINER_MODE = 0xaf,
     // Variable-length commands. Every other opcode is exactly 8 bytes; these three consume
     // extra words, and treating them as fixed-length desynchronises the whole walk -- after
     // which operand bytes get decoded as opcodes.
@@ -53,6 +61,98 @@ const unsigned int kFlagLighting = 0x00020000;
 // skirts and horizon geometry the engine expects to be invisible.
 const unsigned int kFlagBackfaceCull = 0x00002000;
 unsigned int g_renderFlags = 0;
+
+// The display list's two constant colours, as opcodes 0xfa (primitive) and 0xfb
+// (environment) deliver them: bytes r, g, b, a from the low byte of word1 upwards.
+//
+// These are not decoration. The original's transform stage multiplies each vertex colour by
+// a constant colour taken from one of them -- South Park's houses are flat-coloured boxes
+// whose walls carry no texture and white vertex colours, so this is the whole of their
+// colour. Confirmed against the original's own packing at 0x10008486, which builds
+// `(alpha << 24) | (vertex[+4] << 16) | (vertex[+5] << 8) | vertex[+6]`: the source bytes
+// are r, g, b, a in memory order, so a D3DCOLOR needs red and blue swapped.
+unsigned int g_primColour = 0xffffffffu;
+unsigned int g_envColour  = 0xffffffffu;
+
+// Which constant colour a batch actually uses -- or none at all.
+//
+// The tint is *gated*, and applying it ungated tints the whole world: snow turns red, people
+// turn blue. The gate is the colour-combiner mode, delivered by opcode 0xaf into
+// DAT_10087ef8, and resolved by FUN_10005850 through a 41-entry jump table at 0x10005edc.
+// Each case raises a set of flags, and FUN_1000ba50 then picks the colour in a fixed order:
+//
+//     envRGB   -> environment colour     (0x10087ee0)
+//     primRGB2 -> primitive colour       (0x10087ee4)
+//     scalar   -> a computed grey        (0x100876b4, when non-negative)
+//     primRGB  -> primitive colour       (0x10087a54)
+//     primRGB3 -> primitive colour       (0x10087a50)
+//     otherwise: no constant colour, and the vertex colour stands as authored
+//
+// The table below is that jump table read back, one entry per mode. The three modes that
+// resolve a computed grey are treated as untinted: their value is derived from the
+// environment colour through per-mode arithmetic, and guessing at it is a good way to
+// discolour something else.
+enum ConstantSource { CONST_NONE, CONST_PRIM, CONST_ENV };
+
+const int kCombinerModeCount = 0x29;
+const unsigned char kConstantSource[kCombinerModeCount] = {
+    CONST_PRIM,  // 0x00
+    CONST_PRIM,  // 0x01
+    CONST_PRIM,  // 0x02
+    CONST_NONE,  // 0x03  alpha only
+    CONST_PRIM,  // 0x04
+    CONST_PRIM,  // 0x05
+    CONST_PRIM,  // 0x06
+    CONST_PRIM,  // 0x07
+    CONST_NONE,  // 0x08  computed grey
+    CONST_PRIM,  // 0x09
+    CONST_ENV,   // 0x0a
+    CONST_ENV,   // 0x0b
+    CONST_NONE,  // 0x0c
+    CONST_NONE,  // 0x0d  alpha only
+    CONST_NONE,  // 0x0e  alpha only
+    CONST_NONE,  // 0x0f  computed grey
+    CONST_ENV,   // 0x10
+    CONST_NONE,  // 0x11  computed grey
+    CONST_PRIM,  // 0x12
+    CONST_PRIM,  // 0x13
+    CONST_PRIM,  // 0x14
+    CONST_PRIM,  // 0x15
+    CONST_PRIM,  // 0x16
+    CONST_ENV,   // 0x17
+    CONST_PRIM,  // 0x18
+    CONST_PRIM,  // 0x19
+    CONST_NONE,  // 0x1a  alpha only
+    CONST_ENV,   // 0x1b
+    CONST_NONE,  // 0x1c
+    CONST_PRIM,  // 0x1d
+    CONST_PRIM,  // 0x1e
+    CONST_NONE,  // 0x1f
+    CONST_PRIM,  // 0x20
+    CONST_NONE,  // 0x21
+    CONST_NONE,  // 0x22
+    CONST_NONE,  // 0x23
+    CONST_NONE,  // 0x24
+    CONST_NONE,  // 0x25
+    CONST_PRIM,  // 0x26
+    CONST_PRIM,  // 0x27
+    CONST_NONE,  // 0x28
+};
+
+// No mode until the list names one, and no mode means no tint -- which is what the engine's
+// own flags read as before anything sets them.
+int g_combinerMode = -1;
+
+unsigned int ConstantColourForBatch() {
+    if (g_combinerMode < 0 || g_combinerMode >= kCombinerModeCount) {
+        return 0xffffffffu;
+    }
+    switch (kConstantSource[g_combinerMode]) {
+    case CONST_PRIM: return g_primColour;
+    case CONST_ENV:  return g_envColour;
+    default:         return 0xffffffffu;
+    }
+}
 
 // Texture set selected by opcode 0xa9. -1 means untextured.
 int g_currentTexture = -1;
@@ -75,6 +175,34 @@ int g_clampLogged = 0;
 int g_texturedFlushes = 0;
 int g_untexturedFlushes = 0;
 int g_skyBatches = 0;
+
+// Per-texture-set draw census. "White house" and "the texture failed to decode" look
+// identical on screen, and so does "this batch never selected a texture at all" -- the only
+// way to tell them apart is to count, per set, how much geometry was drawn with it and
+// whether a texture was actually bound at the time.
+const int kCensusSets = 4096;
+struct SetDraws {
+    unsigned int flushes;
+    unsigned int tris;
+    unsigned int flushesWithoutTexture;
+};
+SetDraws g_setDraws[kCensusSets];
+unsigned int g_noSelectFlushes = 0;   // batches drawn before any 0xa9 named a set
+unsigned int g_noSelectTris = 0;
+unsigned int g_litTris = 0;
+unsigned int g_unlitTris = 0;
+unsigned int g_constantColourChanges = 0;
+unsigned int g_tintedUploads = 0;
+unsigned int g_untintedUploads = 0;
+unsigned int g_modeSelects[0x29];
+unsigned int g_skyFramesYieldedTo2D = 0;
+unsigned int g_opaqueFlushes = 0;
+unsigned int g_blendedFlushes = 0;
+
+// Frame dump. Armed from a key, spent over one frame, so the log stays readable.
+bool g_dumpArmed = false;
+bool g_dumpingFrame = false;
+int  g_dumpBatch = 0;
 
 // Operands above 0x00ffffff are segment-relative. The engine installs the bases through
 // opcode 0xbc, sub-command 6, before any list references them.
@@ -136,6 +264,7 @@ struct GeoAudit {
     // Aspect ratio = longest edge / shortest edge. A stretched sliver has a huge ratio; a
     // well-formed triangle is near 1.
     int culledBatches, unculledBatches;
+    int sublists;       // G_DL recursions: one per object or map chunk the engine chose to draw
     int aspect2, aspect10, aspect100, aspect1000;
     float maxAspect;
     int maxAspectTri[3];
@@ -157,6 +286,8 @@ struct GeoWorst {
     float maxEdge;
     float bbMin[3], bbMax[3];
     bool haveBB;
+    int minFrameTris, maxFrameTris;
+    float widestFrame[3];   // largest per-frame world extent seen
 };
 GeoWorst g_worst;
 unsigned char g_slotWritten[kMaxVertices];   // per display list, not per frame
@@ -315,11 +446,20 @@ int   g_screenHeight = 480;
 int g_matricesLogged = 0;
 int g_factorLogged = 0;
 
-// One-shot opcode census for the first display list, so the stream's real content is known
-// rather than inferred from the original's dispatch table.
-bool g_opcodeCensusDone = false;
+// Running opcode census. Which opcodes the engine actually emits is the only direct evidence
+// of what it culls before the plugin ever sees the stream, so this is cumulative rather than
+// sampled from the first list -- the first list is a menu backdrop and carries no world.
 int  g_opcodeSeen[256];
 int  g_listDepth = 0;
+
+void LogOpcodeCensus() {
+    LogLine("      display-list opcode census (cumulative):");
+    for (int i = 0; i < 256; ++i) {
+        if (g_opcodeSeen[i]) {
+            LogLine("        op 0x%02x  x%d", i, g_opcodeSeen[i]);
+        }
+    }
+}
 
 void Identity(D3DMATRIX& m) {
     memset(&m, 0, sizeof(m));
@@ -399,8 +539,22 @@ void FactorViewProjection(const D3DMATRIX& vp) {
             best = i;
         }
     }
-    const float a = (fabsf(rz[best]) > 1e-6f) ? (m[2 + best * 4] / rz[best]) : 1.0f;
-    const float b = m[14] - v[14] * a;
+    float a = (fabsf(rz[best]) > 1e-6f) ? (m[2 + best * 4] / rz[best]) : 1.0f;
+    float b = m[14] - v[14] * a;
+
+    // The depth row is a = f/(n-f), b = n*f/(n-f), so the engine's own near and far read
+    // straight back out of it. Re-deriving the row against a further far plane keeps the
+    // near plane exactly where the engine put it and moves nothing else -- which matters
+    // once the executable stops culling, because everything it then submits beyond the
+    // engine's own far plane would otherwise be clipped away again here.
+    if (Config::FarPlane() > 0.0f && a < -1.0f) {
+        const float zNear = b / a;
+        const float zFar  = Config::FarPlane();
+        if (zNear > 0.0f && zFar > zNear) {
+            a = zFar / (zNear - zFar);
+            b = a * zNear;
+        }
+    }
 
     memset(&g_proj, 0, sizeof(g_proj));
     g_proj._11 = p0;
@@ -432,6 +586,157 @@ void LogMatrix(const char* label, const D3DMATRIX& m) {
 void BuildProjection();
 void Flush();
 void ApplyRenderStates();
+bool DrawSkybox();
+void DumpBatch(int vertexCount, bool textured, bool culled, bool sky);
+
+// ------------------------------------------------------------------ synthesised sky
+//
+// South Park has no skydome. Where the world does not cover the screen the engine simply
+// leaves the frame's background colour showing, which is fine for a rasteriser and useless
+// to a path tracer: cleared pixels are not a surface, so there is nothing to bound the
+// scene, nothing for rays that miss the world to hit, and no sky to light anything with.
+//
+// So the renderer builds one: a large box centred on the camera, painted with the very
+// colour the engine asked the background to be (display-list opcode 0xf8), drawn before any
+// world geometry with the depth buffer switched off entirely. Depth-off is both physically
+// right for a backdrop -- everything else simply draws over it -- and the shape RTX Remix's
+// sky detection looks for.
+
+bool g_skyboxDrawn = false;      // once per frame
+// g_view and g_proj are written only when a view matrix arrives and deliberately persist
+// across frames, so this tracks whether one has *ever* arrived. Clearing it per frame would
+// drop the sky on any frame that reuses the previous camera without resending it.
+bool g_viewValid = false;
+int  g_skyboxLogged = 0;
+
+// Camera position in world space. The factored view is a rigid transform under the engine's
+// row-vector convention, p_view = p_world * R + t, so the eye is at -t * R^T.
+void CameraPosition(float* out) {
+    const float* v = &g_view._11;
+    out[0] = -(v[12] * v[0] + v[13] * v[1] + v[14] * v[2]);
+    out[1] = -(v[12] * v[4] + v[13] * v[5] + v[14] * v[6]);
+    out[2] = -(v[12] * v[8] + v[13] * v[9] + v[14] * v[10]);
+}
+
+// The box has to sit inside the frustum's far plane or it is clipped away, and depth being
+// off does not change that -- w-clipping still happens. The projection's depth row is
+// a = f/(n-f), b = n*f/(n-f), so the far plane reads straight back out of it.
+float SkyboxHalfSize() {
+    const float configured = Config::SkyboxSize();
+    if (configured > 0.0f) {
+        return configured;
+    }
+    float zFar = g_zFar;
+    if (g_haveProjection && g_proj._33 < -1.0f) {
+        const float derived = g_proj._43 / (1.0f + g_proj._33);
+        if (Finite(derived) && derived > 1.0f) {
+            zFar = derived;
+        }
+    }
+    // A cube's corners are sqrt(3) further out than its faces, so keep the whole box well
+    // inside the far plane rather than just its sides.
+    float half = zFar * 0.4f;
+    if (half < 64.0f)      half = 64.0f;
+    if (half > 1.0e6f)     half = 1.0e6f;
+    return half;
+}
+
+// False when the camera is not usable yet, so the caller can try again on the next batch
+// rather than losing the backdrop for the whole frame.
+bool DrawSkybox() {
+    IDirect3DDevice9* dev = Device::Get();
+    if (!dev || !g_viewValid || !g_haveProjection) {
+        return false;
+    }
+
+    float eye[3];
+    CameraPosition(eye);
+    if (!Finite(eye[0]) || !Finite(eye[1]) || !Finite(eye[2])) {
+        return false;
+    }
+    const float h = SkyboxHalfSize();
+
+    unsigned int rgb = Config::SkyboxColour() >= 0
+                     ? (unsigned int)Config::SkyboxColour()
+                     : (Device::ClearColour() & 0x00ffffffu);
+    // The engine's backdrop is a pale wash picked to sit behind a rasterised scene. As real
+    // geometry lighting a path-traced one it wants to read as sky, so it is pulled towards
+    // one -- keeping the engine's day/night changes rather than replacing them outright.
+    const int shift = Config::SkyboxBlueShift();
+    if (shift > 0) {
+        const unsigned int target = (unsigned int)Config::SkyboxBlueTarget();
+        unsigned int mixed = 0;
+        for (int c = 16; c >= 0; c -= 8) {
+            const int from = (int)((rgb >> c) & 0xff);
+            const int to   = (int)((target >> c) & 0xff);
+            mixed |= (unsigned int)(from + (to - from) * shift / 100) << c;
+        }
+        rgb = mixed;
+    }
+    const D3DCOLOR colour = (D3DCOLOR)(0xff000000u | rgb);
+
+    WorldVertex v[8];
+    for (int i = 0; i < 8; ++i) {
+        v[i].x = eye[0] + ((i & 1) ? h : -h);
+        v[i].y = eye[1] + ((i & 2) ? h : -h);
+        v[i].z = eye[2] + ((i & 4) ? h : -h);
+        // Normals point back at the camera: the viewer is inside the box, so the faces that
+        // matter are the inward ones.
+        const float nx = (i & 1) ? -1.0f : 1.0f;
+        const float ny = (i & 2) ? -1.0f : 1.0f;
+        const float nz = (i & 4) ? -1.0f : 1.0f;
+        const float inv = 0.57735027f;
+        v[i].nx = nx * inv; v[i].ny = ny * inv; v[i].nz = nz * inv;
+        v[i].diffuse = colour;
+        v[i].u = 0.0f;
+        v[i].v = 0.0f;
+    }
+    static const unsigned short kBoxIndices[36] = {
+        0,1,3, 0,3,2,   4,6,7, 4,7,5,     // -z, +z
+        0,4,5, 0,5,1,   2,3,7, 2,7,6,     // -y, +y
+        0,2,6, 0,6,4,   1,5,7, 1,7,3,     // -x, +x
+    };
+
+    D3DMATRIX identity;
+    Identity(identity);
+    dev->SetTransform(D3DTS_WORLD, &identity);
+    dev->SetTransform(D3DTS_VIEW, &g_view);
+    dev->SetTransform(D3DTS_PROJECTION, &g_proj);
+
+    dev->SetTexture(0, 0);
+    dev->SetFVF(kWorldFVF);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    // Seen from the inside, so winding is not worth reasoning about.
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+
+    const HRESULT hr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, 8, 12,
+                                                   kBoxIndices, D3DFMT_INDEX16,
+                                                   v, sizeof(WorldVertex));
+    if (FAILED(hr) && g_skyboxLogged < 4) {
+        ++g_skyboxLogged;
+        LogLine("    skybox draw failed hr=0x%08lx", (unsigned long)hr);
+    } else if (g_skyboxLogged < 2) {
+        ++g_skyboxLogged;
+        LogLine("    skybox: half-size %.0f at eye (%.0f, %.0f, %.0f), colour 0x%06x",
+                h, eye[0], eye[1], eye[2], colour & 0x00ffffffu);
+    }
+
+    // The world pipeline's own state was just overwritten wholesale, so hand it back the way
+    // a pipeline switch would.
+    ApplyRenderStates();
+    return true;
+}
 
 void Flush() {
     IDirect3DDevice9* dev = Device::Get();
@@ -459,6 +764,27 @@ void Flush() {
         ApplyRenderStates();
     }
 
+    // The backdrop goes down before anything else in the frame, which is only possible once
+    // a camera has arrived -- the view matrix reaches the plugin mid-list, not at frame
+    // start. This is the first draw that follows it.
+    //
+    // It is drawn with depth off, so it would erase anything already on screen. The 2D layer
+    // is depth-free too, so a frame that opens with a full-screen 2D backdrop and only then
+    // draws world geometry gets no sky rather than a painted-over menu.
+    if (!g_skyboxDrawn && Config::SynthesiseSkybox()) {
+        if (!Device::FrameHasDrawn()) {
+            // Claimed only on success: a camera that is not usable yet must leave the frame
+            // still empty, so the next batch can try again.
+            if (DrawSkybox()) {
+                Device::ClaimFirstDraw();
+                g_skyboxDrawn = true;
+            }
+        } else {
+            ++g_skyFramesYieldedTo2D;
+            g_skyboxDrawn = true;
+        }
+    }
+
     // Positions are already world space because the model matrix is baked at upload time,
     // so WORLD is identity and VIEW carries the camera alone.
     D3DMATRIX identity;
@@ -475,6 +801,37 @@ void Flush() {
                    && !Config::DisableBackfaceCulling();
     dev->SetRenderState(D3DRS_CULLMODE, cull ? D3DCULL_CCW : D3DCULL_NONE);
 
+    // Blending, per batch, and opaque unless the batch genuinely needs otherwise.
+    //
+    // World draws are not blended by default, because the original does not blend them: a
+    // census of every SetRenderState it makes
+    // shows SRCBLEND set to ONE at three sites and SRCALPHA at only two, and no combiner mode
+    // requests a translucent blend at all -- the two that touch the blend factors set
+    // ONE / ZERO, which is opaque and is also the DX6 device default the rest inherit.
+    //
+    // It is not a cosmetic difference under a path tracer. RTX Remix classifies an
+    // alpha-blended draw as a translucent material, so blending everything would turn solid
+    // house walls into red glass you could see the furniture through.
+    //
+    // Two cases genuinely blend: format 3 is the only palette carrying graduated alpha (the
+    // effects and sky atlas), and combiner mode 0x16 is the one the original sets
+    // D3DTBLEND_ADD for.
+    const int textureFormat = (g_currentTexture >= 0) ? Texture::Format(g_currentTexture) : -1;
+    const bool additive = (g_combinerMode == 0x16);
+    const bool graduated = (textureFormat == 3);
+    if (additive) {
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+        dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
+    } else if (graduated) {
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+        dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    } else {
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    }
+    if (additive || graduated) { ++g_blendedFlushes; } else { ++g_opaqueFlushes; }
+
     // A skydome has no business in the depth buffer, and drawing it depth-free is also the
     // shape Remix's sky auto-detection looks for.
     const bool sky = Config::DepthlessSky() && Texture::IsSkySet(g_currentTexture);
@@ -486,14 +843,37 @@ void Flush() {
                            ? Texture::GetTexture(g_currentTexture, g_currentSubA, g_currentSubB)
                            : 0;
     if (tex) { ++g_texturedFlushes; } else { ++g_untexturedFlushes; }
+    if (g_currentTexture >= 0 && g_currentTexture < kCensusSets) {
+        SetDraws& d = g_setDraws[g_currentTexture];
+        ++d.flushes;
+        d.tris += (unsigned int)(g_indexCount / 3);
+        if (!tex) {
+            ++d.flushesWithoutTexture;
+        }
+    } else {
+        ++g_noSelectFlushes;
+        g_noSelectTris += (unsigned int)(g_indexCount / 3);
+    }
+    if (g_renderFlags & kFlagLighting) { g_litTris += (unsigned int)(g_indexCount / 3); }
+    else { g_unlitTris += (unsigned int)(g_indexCount / 3); }
     if (g_renderFlags & kFlagBackfaceCull) { ++g_audit.culledBatches; }
     else { ++g_audit.unculledBatches; }
     dev->SetTexture(0, tex);
     // Modulating against diffuse keeps pre-lit vertex colours meaningful; lit geometry
     // carries white so the texture passes through untouched.
+    //
+    // With no texture bound, D3DTA_TEXTURE is undefined by the D3D9 specification -- it was
+    // selected here regardless, which is what drew every untextured batch flat white. An
+    // untextured batch has to fall back to the vertex colour, which is where its colour
+    // actually is.
     dev->SetTextureStageState(0, D3DTSS_COLOROP, tex ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, tex ? D3DTOP_SELECTARG1 : D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, tex ? D3DTA_TEXTURE : D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
     dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, tex ? D3DTA_TEXTURE : D3DTA_DIFFUSE);
+
+    if (g_dumpingFrame) {
+        DumpBatch(vertexCount, tex != 0, cull, sky);
+    }
 
     HRESULT hr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, vertexCount,
                                              g_indexCount / 3,
@@ -517,6 +897,7 @@ void SetMatrixFromList(const float* src, unsigned char flags) {
     if (flags & MAT_SET_VIEW) {
         FactorViewProjection(m);
         g_viewDirty = true;
+        g_viewValid = true;
         return;
     }
 
@@ -619,6 +1000,16 @@ void UploadVertices(const SourceVertex* src, int count, int destSlot) {
     // normal when lighting is on, a pre-lit colour when it is off. Never both.
     const bool lit = (g_renderFlags & kFlagLighting) != 0;
 
+    // The original tints in its upload handler, in the same pass as the transform; here the
+    // slot keeps its untinted colour and the constant is applied when the batch is drawn
+    // (Flush), since the engine may change it between upload and draw.
+    const unsigned int constant =
+        Config::ApplyConstantColour() ? ConstantColourForBatch() : 0xffffffffu;
+    const unsigned int constR = constant & 0xff;
+    const unsigned int constG = (constant >> 8) & 0xff;
+    const unsigned int constB = (constant >> 16) & 0xff;
+    if (constant == 0xffffffffu) { ++g_untintedUploads; } else { ++g_tintedUploads; }
+
     for (int i = 0; i < count; ++i) {
         WorldVertex& d = g_vertices[destSlot + i];
         const SourceVertex& s = src[i];
@@ -631,12 +1022,32 @@ void UploadVertices(const SourceVertex* src, int count, int destSlot) {
                           (float)s.ny * (1.0f / 127.0f),
                           (float)s.nz * (1.0f / 127.0f),
                           d.nx, d.ny, d.nz);
-            d.diffuse = 0xffffffffu;
+            // Model matrices carry scale, so rotating a unit normal by one does not leave it
+            // unit length (it is not zero, though). The engine's own rasteriser never noticed, because
+            // it lit in software and D3D lighting is off here either way. A path tracer does
+            // notice: it shades with whatever normal it is handed, and a normal whose length
+            // is wrong shades a flat wall as though it were curved.
+            const float len2 = d.nx * d.nx + d.ny * d.ny + d.nz * d.nz;
+            if (len2 > 1e-12f) {
+                const float inv = 1.0f / sqrtf(len2);
+                d.nx *= inv;
+                d.ny *= inv;
+                d.nz *= inv;
+            }
+            d.diffuse = (D3DCOLOR)(0xff000000u | (constR << 16) | (constG << 8) | constB);
         } else {
             d.nx = 0.0f;
             d.ny = 1.0f;
             d.nz = 0.0f;
-            d.diffuse = s.bgra | 0xff000000u;
+            // The four source bytes sit in memory as r, g, b, a -- the original pairs byte
+            // +0 with the constant colour's red channel. D3DCOLOR is 0xAARRGGBB, so red and
+            // blue swap on the way in; taking the dword as-is tinted the whole world
+            // backwards.
+            const unsigned int c = s.bgra;
+            const unsigned int r = ((c & 0x000000ffu) * constR) / 255u;
+            const unsigned int g = (((c >> 8) & 0xffu) * constG) / 255u;
+            const unsigned int b = (((c >> 16) & 0xffu) * constB) / 255u;
+            d.diffuse = (D3DCOLOR)(0xff000000u | (r << 16) | (g << 8) | b);
         }
         d.u = s.u;
         d.v = s.v;
@@ -724,6 +1135,65 @@ void BuildProjection() {
     dev->SetTransform(D3DTS_PROJECTION, &p);
 }
 
+// One line per draw, plus a second when the normals are not unit length. This is what says
+// whether a wall that looks see-through bound a texture that is mostly transparent, whether
+// it is lit by normals that do not point anywhere sensible, and whether the engine asked for
+// environment-map texture coordinates -- which this renderer does not generate, so such a
+// surface samples its texture somewhere other than where the engine intended.
+void DumpBatch(int vertexCount, bool textured, bool culled, bool sky) {
+    ++g_dumpBatch;
+
+    char texture[160];
+    if (g_currentTexture >= 0) {
+        Texture::Describe(g_currentTexture, g_currentSubA, g_currentSubB, texture,
+                          sizeof(texture));
+    } else {
+        lstrcpynA(texture, "untextured", sizeof(texture));
+    }
+    if (!textured && g_currentTexture >= 0) {
+        lstrcatA(texture, "  [NOT BOUND]");
+    }
+
+    float lo[3] = { 1e30f, 1e30f, 1e30f };
+    float hi[3] = { -1e30f, -1e30f, -1e30f };
+    int zeroNormals = 0;
+    int badLengthNormals = 0;
+    for (int i = 0; i < vertexCount && i < kMaxVertices; ++i) {
+        const WorldVertex& v = g_vertices[i];
+        const float p[3] = { v.x, v.y, v.z };
+        for (int c = 0; c < 3; ++c) {
+            if (p[c] < lo[c]) lo[c] = p[c];
+            if (p[c] > hi[c]) hi[c] = p[c];
+        }
+        const float len2 = v.nx * v.nx + v.ny * v.ny + v.nz * v.nz;
+        if (len2 < 1e-6f) {
+            ++zeroNormals;
+        } else if (len2 < 0.81f || len2 > 1.21f) {
+            ++badLengthNormals;
+        }
+    }
+
+    const unsigned int constant = ConstantColourForBatch();
+    LogLine("      #%-4d %s", g_dumpBatch, texture);
+    LogLine("            %3d tris %3d verts  flags=0x%06x%s%s%s%s  mode=0x%02x const=%06x"
+            "  %s%s",
+            g_indexCount / 3, vertexCount, g_renderFlags,
+            (g_renderFlags & kFlagLighting) ? " lit" : " unlit",
+            (g_renderFlags & 0x40000) ? " TEXGEN-ENV" : "",
+            culled ? " cull" : "",
+            sky ? " sky" : "",
+            g_combinerMode < 0 ? 0xff : g_combinerMode,
+            constant & 0x00ffffffu,
+            zeroNormals ? "ZERO-NORMALS " : "",
+            badLengthNormals ? "NON-UNIT-NORMALS" : "");
+    if (zeroNormals || badLengthNormals) {
+        LogLine("            normals: %d zero, %d non-unit of %d", zeroNormals,
+                badLengthNormals, vertexCount);
+    }
+    LogLine("            bbox x[%.0f..%.0f] y[%.0f..%.0f] z[%.0f..%.0f]",
+            lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+}
+
 void ApplyRenderStates() {
     IDirect3DDevice9* dev = Device::Get();
     if (!dev) {
@@ -734,14 +1204,9 @@ void ApplyRenderStates() {
     dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
     // Cull mode is per-batch state, applied at draw time in Flush().
     dev->SetRenderState(D3DRS_LIGHTING, FALSE);
-    // World surfaces carry either one bit of alpha or four, depending on the palette their
-    // format uses, and both go down this path. Blending covers both: with a 1-bit palette
-    // every texel is 0 or 255, so the blend is a no-op on the opaque ones and the alpha test
-    // discards the rest before they can write depth. With format 3's 4-bit palette the same
-    // states give clouds and explosions their graduated edge.
-    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    // The alpha test is what cuts world surfaces out; blending is applied per batch in
+    // Flush(). The original sets ALPHAREF 0 with D3DCMP_GREATER, which discards exactly the
+    // fully transparent texels -- the same set as >= 1.
     dev->SetRenderState(D3DRS_ALPHATESTENABLE, TRUE);
     dev->SetRenderState(D3DRS_ALPHAREF, 1);
     dev->SetRenderState(D3DRS_ALPHAFUNC, D3DCMP_GREATEREQUAL);
@@ -753,6 +1218,8 @@ void ApplyRenderStates() {
     dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
     dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 }
 
 } // namespace
@@ -767,7 +1234,20 @@ void Geometry::SetViewportSize(int width, int height) {
     g_screenHeight = height;
 }
 
+void Geometry::DumpNextFrame() {
+    g_dumpArmed = true;
+}
+
 void Geometry::BeginFrame() {
+    if (g_dumpArmed) {
+        g_dumpArmed = false;
+        g_dumpingFrame = true;
+        g_dumpBatch = 0;
+        LogLine("    ==== FRAME DUMP ====");
+        const float* v = &g_view._11;
+        LogLine("      camera fwd(%.3f, %.3f, %.3f) t(%.1f, %.1f, %.1f)",
+                v[2], v[6], v[10], v[12], v[13], v[14]);
+    }
     g_indexCount = 0;
     g_highWater = 0;
     g_stackDepth = 0;
@@ -777,6 +1257,13 @@ void Geometry::BeginFrame() {
     g_currentSubB = 0;
     g_skipMask = 0;
     g_skipCounter = 0;
+    // A frame inherits no constant colour: white is the identity for the multiply, so a
+    // batch that never sets one is left exactly as its vertices describe it.
+    // The combiner mode and the two constant colours are deliberately not reset here: they
+    // are plain globals in the original, written only by their opcodes and never cleared per
+    // frame. Clearing them would draw everything ahead of the frame's first 0xaf/0xfa/0xfb
+    // untinted -- white walls, one frame in every few.
+    g_skyboxDrawn = false;
     Identity(g_modelStack[0]);
     if (g_viewDirty) {
         g_viewDirty = false;
@@ -787,6 +1274,10 @@ void Geometry::BeginFrame() {
 
 void Geometry::EndFrame() {
     Flush();
+    if (g_dumpingFrame) {
+        g_dumpingFrame = false;
+        LogLine("    ==== END FRAME DUMP: %d batches ====", g_dumpBatch);
+    }
 }
 
 void Geometry::ProcessDisplayList(const unsigned int* list) {
@@ -808,9 +1299,7 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
         const unsigned int word0 = list[0];
         const unsigned int word1 = list[1];
         const unsigned char op = (unsigned char)(word0 & 0xff);
-        if (!g_opcodeCensusDone) {
-            ++g_opcodeSeen[op];
-        }
+        ++g_opcodeSeen[op];
 
         if (op == OP_END) {
             Flush();
@@ -834,6 +1323,7 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
             break;
         }
         case OP_SUBLIST:
+            ++g_audit.sublists;
             ProcessDisplayList((const unsigned int*)ResolvePointer(word1));
             break;
 
@@ -900,13 +1390,16 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
             if (op == OP_TEXTURE_ALT) {
                 --tex;
             }
-            if (g_textureSelects < 12) {
+            if (g_textureSelects < 60) {
                 ++g_textureSelects;
-                LogLine("    tex select: word0=0x%08x -> index %d", word0, tex);
-                char path[128];
-                _snprintf(path, sizeof(path), "texdump_%03d.bin", tex);
-                path[sizeof(path) - 1] = 0;
-                Texture::DumpSet(tex, path);
+                LogLine("    tex select: word0=0x%08x word1=0x%08x -> index %d  %s",
+                        word0, word1, tex, Texture::Name(tex));
+                if (g_textureSelects <= 12) {
+                    char path[128];
+                    _snprintf(path, sizeof(path), "texdump_%03d.bin", tex);
+                    path[sizeof(path) - 1] = 0;
+                    Texture::DumpSet(tex, path);
+                }
             }
             // word1 holds the two sub-chunk selectors: the low half sign-extended, the
             // high half as-is. Texture::GetTexture turns them into a frame and a palette.
@@ -924,6 +1417,28 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
         case OP_BACKGROUND:
             Device::SetClearColour(word1);
             break;
+
+        case OP_COMBINER_MODE:
+            // FUN_1000c951 stores word1 and marks the state dirty; FUN_10005850 then
+            // resolves it through the mode table the next time it runs.
+            g_combinerMode = (int)word1;
+            if (g_combinerMode >= 0 && g_combinerMode < kCombinerModeCount) {
+                ++g_modeSelects[g_combinerMode];
+            }
+            break;
+
+        case OP_PRIM_COLOUR:
+        case OP_ENV_COLOUR: {
+            // No flush: the colour is folded into vertices as they are uploaded, so
+            // geometry already queued was tinted when it arrived and is unaffected. The
+            // original's handlers do not flush either.
+            unsigned int& slot = (op == OP_PRIM_COLOUR) ? g_primColour : g_envColour;
+            if (slot != word1) {
+                slot = word1;
+                ++g_constantColourChanges;
+            }
+            break;
+        }
 
         case OP_MATRIX_POP:
             // Without this the hierarchy stack only ever grows, and every later object
@@ -987,8 +1502,16 @@ void Geometry::LogGeometryAudit() {
             for (int i = 0; i < 3; ++i) {
                 if (!g_worst.haveBB || g_audit.bbMin[i] < g_worst.bbMin[i]) g_worst.bbMin[i] = g_audit.bbMin[i];
                 if (!g_worst.haveBB || g_audit.bbMax[i] > g_worst.bbMax[i]) g_worst.bbMax[i] = g_audit.bbMax[i];
+                const float span = g_audit.bbMax[i] - g_audit.bbMin[i];
+                if (span > g_worst.widestFrame[i]) g_worst.widestFrame[i] = span;
             }
             g_worst.haveBB = true;
+        }
+        if (g_worst.minFrameTris == 0 || g_audit.tris < g_worst.minFrameTris) {
+            g_worst.minFrameTris = g_audit.tris;
+        }
+        if (g_audit.tris > g_worst.maxFrameTris) {
+            g_worst.maxFrameTris = g_audit.tris;
         }
         // Periodic running summary, which is what actually shows whether any frame breaks.
         if ((g_worst.frames % 400) == 0) {
@@ -1012,12 +1535,16 @@ void Geometry::LogGeometryAudit() {
             LogLine("      longest edge %.1f   world bbox x[%.0f..%.0f] y[%.0f..%.0f] z[%.0f..%.0f]",
                     g_worst.maxEdge, g_worst.bbMin[0], g_worst.bbMax[0],
                     g_worst.bbMin[1], g_worst.bbMax[1], g_worst.bbMin[2], g_worst.bbMax[2]);
+            LogLine("      tris/frame min %d max %d   widest single frame %.0f x %.0f x %.0f",
+                    g_worst.minFrameTris, g_worst.maxFrameTris,
+                    g_worst.widestFrame[0], g_worst.widestFrame[1], g_worst.widestFrame[2]);
+            LogOpcodeCensus();
         }
     }
 
     // Only report frames carrying real scene geometry; the menu backdrop is two triangles
     // and says nothing about whether the interpreter is coherent.
-    if (g_auditFramesLogged >= 4 || g_audit.tris < 300) {
+    if (g_audit.tris < 300 || (g_worst.frames % 200) != 0) {
         memset(&g_audit, 0, sizeof(g_audit));
         return;
     }
@@ -1041,6 +1568,9 @@ void Geometry::LogGeometryAudit() {
             g_audit.bbMin[0], g_audit.bbMax[0],
             g_audit.bbMin[1], g_audit.bbMax[1],
             g_audit.bbMin[2], g_audit.bbMax[2]);
+    const float* v = &g_view._11;
+    LogLine("      view fwd/pos    : fwd(%.3f, %.3f, %.3f) t(%.1f, %.1f, %.1f)   sublists: %d",
+            v[2], v[6], v[10], v[12], v[13], v[14], g_audit.sublists);
     LogLine("      edge length histogram (log2 buckets, world units):");
     for (int i = 0; i < 12; ++i) {
         if (g_audit.edgeHist[i]) {
@@ -1053,26 +1583,51 @@ void Geometry::LogGeometryAudit() {
 void Geometry::LogTextureStats() {
     LogLine("    texture stats: %d selects, %d textured flushes, %d untextured, %d sky",
             g_textureSelects, g_texturedFlushes, g_untexturedFlushes, g_skyBatches);
-}
-
-void Geometry::LogOpcodeCensus() {
-    if (g_opcodeCensusDone) {
-        return;
-    }
-    // Nothing to report until a frame has actually carried a display list.
-    int total = 0;
-    for (int i = 0; i < 256; ++i) {
-        total += g_opcodeSeen[i];
-    }
-    if (total == 0) {
-        return;
-    }
-    g_opcodeCensusDone = true;
-    LogLine("    display-list opcode census:");
-    for (int i = 0; i < 256; ++i) {
-        if (g_opcodeSeen[i]) {
-            LogLine("      op 0x%02x  x%d", i, g_opcodeSeen[i]);
+    LogLine("    lit tris %u / unlit tris %u", g_litTris, g_unlitTris);
+    LogLine("    flushes opaque %u / blended %u", g_opaqueFlushes, g_blendedFlushes);
+    LogLine("    constant-colour changes (opcodes 0xfa/0xfb): %u   uploads tinted %u / plain %u",
+            g_constantColourChanges, g_tintedUploads, g_untintedUploads);
+    LogLine("    combiner modes selected (opcode 0xaf), mode: times selected / constant colour:");
+    for (int i = 0; i < kCombinerModeCount; ++i) {
+        if (g_modeSelects[i]) {
+            const char* src = kConstantSource[i] == CONST_PRIM ? "primitive"
+                            : kConstantSource[i] == CONST_ENV  ? "environment" : "none";
+            LogLine("      0x%02x  %8u  %s", i, g_modeSelects[i], src);
         }
+    }
+    LogLine("    frames where the 2D layer drew first and the sky stood down: %u",
+            g_skyFramesYieldedTo2D);
+    LogLine("    batches drawn with no set selected: %u flushes, %u tris",
+            g_noSelectFlushes, g_noSelectTris);
+
+    // Sorted by triangles, so the sets that actually cover the screen come first. A set
+    // listed with NO TEXTURE draws white -- that is the difference between a wrong palette
+    // and nothing bound at all.
+    LogLine("    DRAW CENSUS (per texture set, by triangles drawn):");
+    // Destructive selection sort: each set is printed once and then zeroed out. This runs at
+    // shutdown, so consuming the counters costs nothing.
+    for (int shown = 0; shown < 60; ++shown) {
+        int best = -1;
+        unsigned int bestTris = 0;
+        for (int i = 0; i < kCensusSets; ++i) {
+            const unsigned int t = g_setDraws[i].tris;
+            if (t == 0) {
+                continue;
+            }
+            if (best < 0 || t > bestTris) {
+                best = i;
+                bestTris = t;
+            }
+        }
+        if (best < 0) {
+            break;
+        }
+        const SetDraws& d = g_setDraws[best];
+        LogLine("      set %4d  %9u tris  %7u flushes%s%s  %s", best, d.tris, d.flushes,
+                d.flushesWithoutTexture ? "   NO TEXTURE BOUND" : "",
+                Texture::DecodeFailed(best) ? " (decode failed)" : "",
+                Texture::Name(best));
+        g_setDraws[best].tris = 0;
     }
 }
 

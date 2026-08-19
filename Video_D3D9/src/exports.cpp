@@ -6,10 +6,14 @@
 // nothing, which is all the engine needs of them.
 
 #include "device.h"
+#include "engine.h"
 #include "log.h"
 #include "pcx.h"
 #include "texture.h"
 #include "geometry.h"
+#include "config.h"
+
+#include <stdio.h>
 
 #include <windows.h>
 
@@ -23,6 +27,15 @@ namespace {
 const signed char kOptionStatus[16] = {
     0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, -128, 0, 0, 0
 };
+
+// F10 arms a one-frame batch-by-batch dump, F11 takes a screenshot. Both are edge-triggered
+// off GetAsyncKeyState's low bit, which reports "pressed since the last call" and so works
+// even while the game holds the devices.
+void MaybeDumpFrame() {
+    if (GetAsyncKeyState(VK_F10) & 1) {
+        Geometry::DumpNextFrame();
+    }
+}
 
 DWORD g_frameStartTicks = 0;
 bool g_vsyncEnabled = false;
@@ -41,6 +54,10 @@ GFXAPI unsigned int GFXDLL_InitializeDriver(HWND window, unsigned int a2, unsign
             "hwnd=%p, %u, %u, %u, %u, %u, %p, %u",
             window, a2, a3, a4, a5, a6, (void*)a7, a8);
 
+    // The executable has unpacked itself by the time it drives any export, so this is the
+    // first point at which its code can be patched.
+    Engine::Install();
+
     if (!Device::Create(window)) {
         return 0xFFFFFFFFu;
     }
@@ -53,23 +70,51 @@ GFXAPI unsigned int GFXDLL_InitializeDriver(HWND window, unsigned int a2, unsign
 GFXAPI void GFXDLL_ShutdownDriver(void) {
     LogCall("GFXDLL_ShutdownDriver");
     Geometry::LogTextureStats();
+    Engine::LogState();
     Geometry::ReleaseResources();
     Pcx::ReleaseAll();
+    // Every cached texture holds a reference on the device, so releasing the device without
+    // them first leaves the whole set -- and the device -- resident. A driver reselect then
+    // creates a second device alongside the first.
+    Texture::ReleaseAll();
     Device::Destroy();
 }
 
 GFXAPI void GFXDLL_BeginScene(void) {
     LogCall("GFXDLL_BeginScene");
+    MaybeDumpFrame();
     if (Device::BeginFrame()) {
         Geometry::BeginFrame();
     }
 }
 
+// PrintWindow returns black for a D3D9 swapchain, so the renderer takes its own screenshots:
+// on F11, and optionally from a fixed frame on ([Debug] ScreenshotFrame / ScreenshotInterval).
+namespace {
+void MaybeScreenshot() {
+    const bool hotkey = (GetAsyncKeyState(VK_F11) & 1) != 0;
+    const int first = Config::ScreenshotFrame();
+    const int interval = Config::ScreenshotInterval();
+    bool automatic = false;
+    if (first > 0 && (int)g_frameCount >= first) {
+        const int since = (int)g_frameCount - first;
+        automatic = (since == 0) || (interval > 0 && (since % interval) == 0);
+    }
+    if (!hotkey && !automatic) {
+        return;
+    }
+    char path[MAX_PATH];
+    _snprintf(path, sizeof(path), "%sshot_%05u.bmp", Config::BaseDir(), g_frameCount);
+    path[sizeof(path) - 1] = 0;
+    Device::RequestScreenshot(path);
+}
+} // namespace
+
 GFXAPI void GFXDLL_EndScene(void) {
     LogCall("GFXDLL_EndScene");
     Geometry::EndFrame();
     Geometry::LogGeometryAudit();
-    Geometry::LogOpcodeCensus();
+    MaybeScreenshot();
     Device::EndFrame();
     ++g_frameCount;
     if ((++g_frameStatCounter % 300) == 0) {
@@ -224,6 +269,7 @@ GFXAPI void GFXDLL_FinishTextureEnumeration(void) {
 
 GFXAPI void GFXDLL_FlushTextureCache(void) {
     LogCall("GFXDLL_FlushTextureCache");
+    Texture::FlushDecoded();
 }
 
 GFXAPI void GFXDLL_SetTextureFileName(const char* name) {

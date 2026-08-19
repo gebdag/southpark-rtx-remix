@@ -4,6 +4,8 @@
 
 #include <d3d9.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 namespace {
 
@@ -20,6 +22,7 @@ D3DPRESENT_PARAMETERS g_params;
 bool g_inScene = false;
 bool g_needsReset = false;
 Device::Pipeline g_pipeline = Device::PipelineNone;
+bool g_frameHadDraw = false;
 
 // Used until the engine sends its own background colour, and whenever the ini says to
 // ignore it. Distinctive on purpose, so a black frame reads as "nothing ran".
@@ -169,6 +172,14 @@ void Device::PreloadD3D9() {
     }
 }
 
+bool Device::FrameHasDrawn() {
+    return g_frameHadDraw;
+}
+
+void Device::ClaimFirstDraw() {
+    g_frameHadDraw = true;
+}
+
 bool Device::ClaimPipeline(Pipeline pipeline) {
     if (g_pipeline == pipeline) {
         return false;
@@ -204,6 +215,7 @@ bool Device::BeginFrame() {
 
     // A fresh frame inherits nothing: whichever pipeline draws first installs its state.
     g_pipeline = PipelineNone;
+    g_frameHadDraw = false;
     g_device->Clear(0, 0, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, g_clearColour, 1.0f, 0);
     if (FAILED(g_device->BeginScene())) {
         return false;
@@ -212,12 +224,115 @@ bool Device::BeginFrame() {
     return true;
 }
 
+namespace {
+
+char g_screenshotPath[MAX_PATH];
+
+bool WriteScreenshot(const char* path) {
+    if (!g_device || !path) {
+        return false;
+    }
+    IDirect3DSurface9* back = 0;
+    if (FAILED(g_device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back)) || !back) {
+        LogLine("    screenshot: no back buffer");
+        return false;
+    }
+    D3DSURFACE_DESC desc;
+    back->GetDesc(&desc);
+
+    IDirect3DSurface9* sys = 0;
+    HRESULT hr = g_device->CreateOffscreenPlainSurface(desc.Width, desc.Height, desc.Format,
+                                                       D3DPOOL_SYSTEMMEM, &sys, 0);
+    if (FAILED(hr) || !sys) {
+        LogLine("    screenshot: CreateOffscreenPlainSurface failed hr=0x%08lx",
+                (unsigned long)hr);
+        back->Release();
+        return false;
+    }
+    hr = g_device->GetRenderTargetData(back, sys);
+    back->Release();
+    if (FAILED(hr)) {
+        LogLine("    screenshot: GetRenderTargetData failed hr=0x%08lx", (unsigned long)hr);
+        sys->Release();
+        return false;
+    }
+
+    D3DLOCKED_RECT lr;
+    if (FAILED(sys->LockRect(&lr, 0, D3DLOCK_READONLY))) {
+        sys->Release();
+        return false;
+    }
+
+    // 24-bit BMP: no dependencies, and every viewer and converter reads it.
+    const int w = (int)desc.Width;
+    const int h = (int)desc.Height;
+    const int rowBytes = (w * 3 + 3) & ~3;
+    const unsigned int pixelBytes = (unsigned int)rowBytes * (unsigned int)h;
+    unsigned char header[54];
+    memset(header, 0, sizeof(header));
+    header[0] = 'B'; header[1] = 'M';
+    const unsigned int fileSize = 54 + pixelBytes;
+    memcpy(header + 2, &fileSize, 4);
+    const unsigned int offset = 54;
+    memcpy(header + 10, &offset, 4);
+    const unsigned int infoSize = 40;
+    memcpy(header + 14, &infoSize, 4);
+    memcpy(header + 18, &w, 4);
+    memcpy(header + 22, &h, 4);
+    const unsigned short planes = 1, bits = 24;
+    memcpy(header + 26, &planes, 2);
+    memcpy(header + 28, &bits, 2);
+    memcpy(header + 34, &pixelBytes, 4);
+
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        sys->UnlockRect();
+        sys->Release();
+        return false;
+    }
+    fwrite(header, 1, sizeof(header), f);
+    unsigned char* row = (unsigned char*)malloc(rowBytes);
+    if (row) {
+        memset(row, 0, rowBytes);
+        // BMP rows run bottom-up.
+        for (int y = h - 1; y >= 0; --y) {
+            const unsigned char* src = (const unsigned char*)lr.pBits + (size_t)y * lr.Pitch;
+            for (int x = 0; x < w; ++x) {
+                row[x * 3 + 0] = src[x * 4 + 0];
+                row[x * 3 + 1] = src[x * 4 + 1];
+                row[x * 3 + 2] = src[x * 4 + 2];
+            }
+            fwrite(row, 1, rowBytes, f);
+        }
+        free(row);
+    }
+    fclose(f);
+    sys->UnlockRect();
+    sys->Release();
+    LogLine("    screenshot: %dx%d -> %s", w, h, path);
+    return true;
+}
+
+} // namespace
+
+void Device::RequestScreenshot(const char* path) {
+    lstrcpynA(g_screenshotPath, path ? path : "", MAX_PATH);
+}
+
 void Device::EndFrame() {
     if (!g_device || !g_inScene) {
+        // A screenshot names the frame it was asked for, so a request that outlives a
+        // skipped frame would write the wrong frame's picture under that name.
+        g_screenshotPath[0] = 0;
         return;
     }
     g_device->EndScene();
     g_inScene = false;
+
+    if (g_screenshotPath[0]) {
+        WriteScreenshot(g_screenshotPath);
+        g_screenshotPath[0] = 0;
+    }
 
     HRESULT hr = g_device->Present(0, 0, 0, 0);
     if (hr == D3DERR_DEVICELOST) {
@@ -234,6 +349,10 @@ void Device::SetClearColour(unsigned int packedAbgr) {
     const unsigned int g = (packedAbgr >> 8) & 0xff;
     const unsigned int b = (packedAbgr >> 16) & 0xff;
     g_clearColour = D3DCOLOR_XRGB(r, g, b);
+}
+
+unsigned int Device::ClearColour() {
+    return (unsigned int)g_clearColour;
 }
 
 void Device::SetVSync(bool enabled) {

@@ -33,9 +33,30 @@ void LogSetCensus();
 
 int Count();
 
+// The ASCII name stored in chunk 3, or "" when the set has none. Empty for an unknown index.
+const char* Name(int index);
+
+// One line describing what a draw actually bound: name, format, dimensions, which frame and
+// palette were chosen, and how much of the decoded image is transparent. That last number is
+// the one that says whether a wall you can see through is see-through because of its texture.
+void Describe(int index, int subA, int subB, char* out, int capacity);
+
+// Format byte from chunk 0, or -1 for an unknown set. Format 3 is the only one whose palette
+// carries graduated alpha.
+int Format(int index);
+
+// Whether a set was tried and could not be decoded. A set that never decodes draws
+// untextured, which is indistinguishable on screen from geometry that asked for no texture.
+bool DecodeFailed(int index);
+
 // Whether a set is one of the sky textures named in the ini. The sky is ordinary world
 // geometry to the engine, so the only thing distinguishing it is the name in chunk 3.
 bool IsSkySet(int index);
+
+// Drops every decoded frame but keeps the blobs, so the next draw decodes afresh. The engine
+// asks for this through GFXDLL_FlushTextureCache, which the original honours by jumping into
+// its own cache code -- a stale decoded frame is an animation that stops moving.
+void FlushDecoded();
 
 void ReleaseAll();
 
