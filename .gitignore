@@ -21,3 +21,8 @@ backups/
 # Engine images dumped from memory: derived artefacts, and game code
 SouthPark_unpacked.exe
 SouthPark_code.exe
+
+# Lookdev build output
+lookdev/bin/
+lookdev/obj/
+__pycache__/
