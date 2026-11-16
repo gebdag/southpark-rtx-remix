@@ -8,6 +8,7 @@
 #include "device.h"
 #include "engine.h"
 #include "log.h"
+#include "lookdev.h"
 #include "pcx.h"
 #include "texture.h"
 #include "geometry.h"
@@ -54,9 +55,14 @@ GFXAPI unsigned int GFXDLL_InitializeDriver(HWND window, unsigned int a2, unsign
             "hwnd=%p, %u, %u, %u, %u, %u, %p, %u",
             window, a2, a3, a4, a5, a6, (void*)a7, a8);
 
+    const unsigned int startup[7] = {a2, a3, a4, a5, a6, (unsigned int)a7, a8};
+    Lookdev::OnInitializeDriver(startup);
+
     // The executable has unpacked itself by the time it drives any export, so this is the
-    // first point at which its code can be patched.
-    Engine::Install();
+    // first point at which its code can be patched. The lookdev host has no executable.
+    if (!Lookdev::IsHost()) {
+        Engine::Install();
+    }
 
     if (!Device::Create(window)) {
         return 0xFFFFFFFFu;
@@ -83,6 +89,7 @@ GFXAPI void GFXDLL_ShutdownDriver(void) {
 
 GFXAPI void GFXDLL_BeginScene(void) {
     LogCall("GFXDLL_BeginScene");
+    Lookdev::OnBeginScene();
     MaybeDumpFrame();
     if (Device::BeginFrame()) {
         Geometry::BeginFrame();
@@ -115,6 +122,7 @@ GFXAPI void GFXDLL_EndScene(void) {
     LogCall("GFXDLL_EndScene");
     Geometry::EndFrame();
     Geometry::LogGeometryAudit();
+    Lookdev::OnEndScene();
     MaybeScreenshot();
     Device::EndFrame();
     ++g_frameCount;
@@ -157,11 +165,14 @@ GFXAPI void GFXDLL_changeViewportSize(void) {
 
 GFXAPI void GFXDLL_ProcessDisplayList(unsigned int* displayList) {
     LogCall("GFXDLL_ProcessDisplayList");
+    Lookdev::BeginList(displayList);
     Geometry::ProcessDisplayList(displayList);
+    Lookdev::EndList();
 }
 
 GFXAPI void GFXDLL_SetZPlanes(float zNear, float zFar) {
     LogCall("GFXDLL_SetZPlanes", "near=%f far=%f", zNear, zFar);
+    Lookdev::OnSetZPlanes(zNear, zFar);
     Geometry::SetZPlanes(zNear, zFar);
 }
 
@@ -253,16 +264,26 @@ GFXAPI int GFXDLL_DoSettingsDialog(void) {
 
 // ------------------------------------------------------------------- textures
 
-GFXAPI void GFXDLL_StartTextureEnumeration(void) {
-    LogCall("GFXDLL_StartTextureEnumeration");
+// The original takes the set count, the window it draws its progress text on, and a value it
+// keeps; this renderer needs none of them, but a lookdev capture records them for a replay
+// through the original.
+//
+// The original returns 1 when its converted store (win32.tex) is already current, and then
+// expects no EnumerateTexture calls: its table for them is never allocated. This renderer keeps
+// no store, so it always asks for the sets.
+GFXAPI int GFXDLL_StartTextureEnumeration(unsigned int count, HWND window, unsigned int a3) {
+    LogCall("GFXDLL_StartTextureEnumeration", "%u, %p, %u", count, window, a3);
+    Lookdev::OnStartTextureEnumeration(count, a3);
     Texture::StartEnumeration();
+    return 0;
 }
 
 GFXAPI void GFXDLL_EnumerateTexture(unsigned int* blob, unsigned int a2, HWND window) {
+    Lookdev::OnEnumerateTexture(a2);
     Texture::Enumerate(blob);
 }
 
-GFXAPI void GFXDLL_FinishTextureEnumeration(void) {
+GFXAPI void GFXDLL_FinishTextureEnumeration(HWND window) {
     LogCall("GFXDLL_FinishTextureEnumeration");
     Texture::FinishEnumeration();
     Texture::LogSetCensus();
@@ -270,11 +291,13 @@ GFXAPI void GFXDLL_FinishTextureEnumeration(void) {
 
 GFXAPI void GFXDLL_FlushTextureCache(void) {
     LogCall("GFXDLL_FlushTextureCache");
+    Lookdev::OnFlushTextureCache();
     Texture::FlushDecoded();
 }
 
 GFXAPI void GFXDLL_SetTextureFileName(const char* name) {
     LogCall("GFXDLL_SetTextureFileName", "\"%s\"", name ? name : "(null)");
+    Lookdev::OnSetTextureFileName(name);
 }
 
 // Returns the copy of the set kept since enumeration (the engine's own buffer is reused) --

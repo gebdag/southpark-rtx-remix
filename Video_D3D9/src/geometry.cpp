@@ -2,6 +2,7 @@
 #include "config.h"
 #include "device.h"
 #include "log.h"
+#include "lookdev.h"
 #include "texture.h"
 
 #include <windows.h>
@@ -1122,6 +1123,7 @@ void Flush() {
 
 void SetMatrixFromList(const float* src, unsigned char flags) {
     D3DMATRIX m;
+    Lookdev::NoteRead(src, sizeof(D3DMATRIX));
     memcpy(&m, src, sizeof(D3DMATRIX));
 
     if (g_matricesLogged < 6) {
@@ -1214,6 +1216,7 @@ void UploadVertices(const SourceVertex* src, int count, int destSlot) {
             return;
         }
     }
+    Lookdev::NoteRead(src, (unsigned int)count * sizeof(SourceVertex));
     // Raw source bytes against the decoded fields, to confirm the 20-byte layout rather than
     // assume it.
     if (g_vertDumped < 2) {
@@ -1541,13 +1544,16 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
         return;
     }
     ++g_listDepth;
+    const unsigned int* const start = list;
     for (int guard = 0; guard < 1 << 20; ++guard) {
         const unsigned int word0 = list[0];
         const unsigned int word1 = list[1];
         const unsigned char op = (unsigned char)(word0 & 0xff);
         ++g_opcodeSeen[op];
+        Lookdev::NoteCommand(word0, word1);
 
         if (op == OP_END) {
+            Lookdev::NoteRead(start, (unsigned int)((list + 2 - start) * sizeof(*list)));
             Flush();
             --g_listDepth;
             return;
@@ -1596,6 +1602,16 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
                 p -= 2;
             }
             list = p;
+            break;
+        }
+        case OP_STATE: {
+            // G_MOVEMEM. Not interpreted here, but the original reads 16 bytes through the raw
+            // operand for sub-commands 0x80 (viewport), 0x82/0x84 (texgen rows) and 0x86/0x88
+            // (lights), so a lookdev capture has to hold them for a reference replay.
+            const unsigned int sub = (word0 >> 8) & 0xff;
+            if (sub >= 0x80 && sub <= 0x88) {
+                Lookdev::NoteRead((const void*)word1, 16);
+            }
             break;
         }
         case OP_2D_PRIM:
@@ -1729,6 +1745,9 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
 
         case OP_SKIPMASK_SET:
             g_skipMask = (const unsigned int*)ResolvePointer(word1);
+            if (g_skipMask) {
+                Lookdev::NoteRead(g_skipMask, kSkipMaskLimit / 8);
+            }
             g_skipCounter = 0;
             break;
 
@@ -1772,6 +1791,7 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
         list += 2;
     }
     LogLine("    display list guard tripped -- malformed stream?");
+    Lookdev::NoteRead(start, (unsigned int)((list - start) * sizeof(*list)));
     --g_listDepth;
 }
 

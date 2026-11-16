@@ -165,6 +165,13 @@ int SkyboxBlueTarget();
 int ScreenshotFrame();
 int ScreenshotInterval();
 
+// --------------------------------------------------------------------------- lookdev
+
+// Virtual-key code that captures frames when the game runs in lookdev mode (SP_LOOKDEV=1),
+// and how many consecutive frames one capture records. See lookdev.h.
+int LookdevCaptureKey();
+int LookdevCaptureFrames();
+
 // Directory the DLL lives in, with a trailing backslash. The engine changes the working
 // directory during startup, so anything written relative to it lands somewhere unhelpful.
 const char* BaseDir();

@@ -1,6 +1,7 @@
 #include "device.h"
 #include "config.h"
 #include "log.h"
+#include "lookdev.h"
 
 #include <d3d9.h>
 #include <string.h>
@@ -54,7 +55,23 @@ void FillPresentParams(HWND window, int width, int height) {
 //
 // A path-qualified LoadLibrary is keyed on the file rather than the name, so it loads the
 // local copy even with a same-named module already loaded.
+HMODULE LoadSystemD3D9() {
+    char path[MAX_PATH];
+    const UINT n = GetSystemDirectoryA(path, MAX_PATH);
+    if (n == 0 || n + sizeof("\\d3d9.dll") > MAX_PATH) {
+        return 0;
+    }
+    strcat(path, "\\d3d9.dll");
+    HMODULE sys = LoadLibraryA(path);
+    LogLine("    d3d9 plain (lookdev): %s%s", path, sys ? "" : " -- failed to load");
+    return sys;
+}
+
 HMODULE LoadD3D9() {
+    // Path-qualified, because a bare "d3d9.dll" would find Remix in the application folder.
+    if (Lookdev::UsePlainD3D9()) {
+        return LoadSystemD3D9();
+    }
     char path[MAX_PATH];
     const DWORD n = GetModuleFileNameA(0, path, MAX_PATH);
     if (n > 0 && n < MAX_PATH) {

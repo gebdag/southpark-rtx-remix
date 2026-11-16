@@ -13,6 +13,8 @@ char g_baseDir[MAX_PATH];
 char g_skyNames[512];
 int g_screenshotFrame = 0;
 int g_screenshotInterval = 0;
+int g_lookdevCaptureKey = 0x78;   // VK_F9
+int g_lookdevCaptureFrames = 1;
 
 bool g_disableBackfaceCulling  = true;
 bool g_disableTriangleSkipMask = false;
@@ -315,6 +317,10 @@ void Config::Load(void* self) {
     if (g_skyboxBlueShift > 100) g_skyboxBlueShift = 100;
     g_screenshotFrame = GetPrivateProfileIntA("Debug", "ScreenshotFrame", 0, g_iniPath);
     g_screenshotInterval = GetPrivateProfileIntA("Debug", "ScreenshotInterval", 0, g_iniPath);
+    g_lookdevCaptureKey = GetPrivateProfileIntA("Lookdev", "CaptureKey", 0x78, g_iniPath);
+    g_lookdevCaptureFrames = GetPrivateProfileIntA("Lookdev", "CaptureFrames", 1, g_iniPath);
+    if (g_lookdevCaptureFrames < 1) g_lookdevCaptureFrames = 1;
+    if (g_lookdevCaptureFrames > 600) g_lookdevCaptureFrames = 600;
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
 
@@ -338,6 +344,8 @@ void Config::Load(void* self) {
             g_skyboxBlueShift, g_skyboxBlueTarget);
     LogLine("    ScreenshotFrame=%d ScreenshotInterval=%d",
             g_screenshotFrame, g_screenshotInterval);
+    LogLine("    Lookdev CaptureKey=0x%02X CaptureFrames=%d",
+            g_lookdevCaptureKey, g_lookdevCaptureFrames);
     LogLine("    LogEveryCall=%d", g_logEveryCall);
     LogSetCallLogging(g_logEveryCall);
 }
@@ -368,4 +376,6 @@ int Config::SkyboxBlueShift()             { return g_skyboxBlueShift; }
 int Config::SkyboxBlueTarget()            { return g_skyboxBlueTarget; }
 int Config::ScreenshotFrame()             { return g_screenshotFrame; }
 int Config::ScreenshotInterval()           { return g_screenshotInterval; }
+int Config::LookdevCaptureKey()           { return g_lookdevCaptureKey; }
+int Config::LookdevCaptureFrames()        { return g_lookdevCaptureFrames; }
 const char* Config::BaseDir()             { return g_baseDir; }

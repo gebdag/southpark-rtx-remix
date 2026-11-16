@@ -752,6 +752,15 @@ int Texture::Count() {
     return g_count;
 }
 
+const void* Texture::Blob(int index, unsigned int* bytes) {
+    *bytes = 0;
+    if (index < 0 || index >= g_count || !g_sets[index]) {
+        return 0;
+    }
+    *bytes = BlobSize(g_sets[index]);
+    return g_sets[index];
+}
+
 int Texture::MeanColour(int index) {
     if (index < 0 || index >= g_count || g_cache[index].n == 0) {
         return -1;

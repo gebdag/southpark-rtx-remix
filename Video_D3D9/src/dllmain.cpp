@@ -1,6 +1,7 @@
 #include "config.h"
 #include "device.h"
 #include "log.h"
+#include "lookdev.h"
 
 #include <windows.h>
 #include <stdio.h>
@@ -23,7 +24,7 @@ void BuildLogPath(HMODULE self, char* out, size_t size) {
     } else {
         modulePath[0] = 0;
     }
-    _snprintf(out, size, "%sVideo_D3D9.log", modulePath);
+    _snprintf(out, size, "%s%s", modulePath, Lookdev::LogFileName());
     out[size - 1] = 0;
 }
 
@@ -32,6 +33,7 @@ void BuildLogPath(HMODULE self, char* out, size_t size) {
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(module);
+        Lookdev::DetectMode();
         char logPath[MAX_PATH];
         BuildLogPath(module, logPath, sizeof(logPath));
         LogOpen(logPath);

@@ -36,6 +36,10 @@ void LogMouthVariants();
 
 int Count();
 
+// The stored copy of a set and its size, for a lookdev capture. Null, with a size of 0, for an
+// unknown index or a set whose header was unreadable when it was enumerated.
+const void* Blob(int index, unsigned int* bytes);
+
 // Mean colour of the decoded texels of a set's first cached frame, as 0x00RRGGBB, and -1 when
 // nothing of it has been decoded. This is the texture as the renderer actually built it,
 // before any tint -- the only way to tell "the palette decoded wrong" from "the right texture
