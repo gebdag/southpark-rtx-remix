@@ -154,6 +154,54 @@ unsigned int ConstantColourForBatch() {
     }
 }
 
+// THE COMBINER MODE ALSO DECIDES WHETHER A TEXTURE IS BOUND AT ALL.
+//
+// This is the other half of the mode gate.
+//
+// A texture selection (opcode 0xa9) is sticky: the engine names a set once and every batch
+// after it keeps that set until another 0xa9 arrives. It never says "and now nothing" --
+// there is no opcode for it. What ends texturing is the *mode*: seven of the 41 combiner
+// modes take no texture input, and the original enforces that inside SP_BeginPrimitiveBatch
+// by unbinding the texture outright before the batch draws --
+//
+//     SetRenderState(D3DRENDERSTATE_TEXTUREHANDLE /* 1 */, 0)
+//     texState+0x90 = 0                       // the pending texture, cleared as well
+//
+// Read back from the 41-entry jump table at 0x10005edc: the cases that write 0 to
+// 0x10087ec0 (= texState+0x90) are 0x12, 0x13, 0x14, 0x15 (0x15 shares 0x13's case), 0x17,
+// 0x19 (0x12 jumps into its body) and 0x1c. Every one of them is a mode that carries a flat
+// constant colour -- exactly the modes South Park's flat-coloured boxes are drawn under.
+//
+// Ignoring this leaves whatever set was last selected bound over geometry the engine wanted
+// flat, and the symptoms follow directly:
+//
+//   * the wall is MODULATEd by a texture that has nothing to do with it, so its colour is
+//     the constant times someone else's texels -- and which set is current depends on what
+//     was drawn just before, so it changes as the camera turns;
+//   * many world sets are cut-outs (TREEB*, TRECLP01/02, TREETL01/02, W-TSIDE, CC_REG are
+//     all "w/mask"), and the alpha test then punches their mask straight through the wall,
+//     so the house turns see-through.
+const unsigned char kModeBindsTexture[kCombinerModeCount] = {
+    1, 1, 1, 1, 1, 1, 1, 1,   // 0x00
+    1, 1, 1, 1, 1, 1, 1, 1,   // 0x08
+    1, 1, 0, 0, 0, 0, 1, 0,   // 0x10  -- 0x12 0x13 0x14 0x15 flat, 0x17 flat
+    1, 0, 1, 1, 0, 1, 1, 1,   // 0x18  -- 0x19 flat, 0x1c flat
+    1, 1, 1, 1, 1, 1, 1, 1,   // 0x20
+    1,                        // 0x28
+};
+
+// An unset mode textures, matching the engine's own state before any 0xaf arrives.
+bool ModeBindsTexture() {
+    if (g_combinerMode < 0 || g_combinerMode >= kCombinerModeCount) {
+        return true;
+    }
+    return kModeBindsTexture[g_combinerMode] != 0;
+}
+
+// Batches whose selected set the mode suppressed: binds that would otherwise tint walls with
+// another set's texels and cut them out with its mask.
+unsigned int g_modeSuppressedBinds = 0;
+
 // Texture set selected by opcode 0xa9. -1 means untextured.
 int g_currentTexture = -1;
 // The two 16-bit fields of that opcode's second word. They choose which frame of an animated
@@ -185,7 +233,52 @@ const int kMaxMouthOperands = 96;
 MouthOperand g_mouthOperands[kMaxMouthOperands];
 int g_mouthOperandCount = 0;
 
+// Frame counter, so the mouth trace below reads as a timeline rather than a session total.
+// The cumulative census answers "which frames were ever asked for"; it cannot answer "did the
+// selector advance while the characters were talking", because a set that cycles for ten
+// seconds and then parks for ten minutes looks the same either way.
+unsigned int g_frameIndex = 0;
+// Last operand seen per mouth set, and the frame it arrived on, so only the transitions are
+// logged and the gap between them is measured in frames.
+int g_lastMouthSet[8];
+unsigned int g_lastMouthWord1[8];
+unsigned int g_lastMouthFrame[8];
+int g_lastMouthCount = 0;
+int g_mouthTransitionsLogged = 0;
+const int kMaxMouthTransitionLogs = 400;
+
+// One line per change of mouth frame, with the frame number and how long the previous frame
+// was held. A lipsync that is working produces a dense run of these during speech; a parked
+// selector produces a handful and then nothing at all.
+void TraceMouthTransition(int set, unsigned int word1) {
+    int slot = -1;
+    for (int i = 0; i < g_lastMouthCount; ++i) {
+        if (g_lastMouthSet[i] == set) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (g_lastMouthCount >= (int)(sizeof(g_lastMouthSet) / sizeof(g_lastMouthSet[0]))) {
+            return;
+        }
+        slot = g_lastMouthCount++;
+        g_lastMouthSet[slot] = set;
+        g_lastMouthWord1[slot] = word1 ^ 1u;   // force the first select to read as a change
+        g_lastMouthFrame[slot] = g_frameIndex;
+    }
+    if (g_lastMouthWord1[slot] == word1) {
+        return;
+    }
+    if (g_mouthTransitionsLogged < kMaxMouthTransitionLogs) {
+        ++g_mouthTransitionsLogged;
+        LogLine("    MOUTH frame %6u: set %4d %s  word1=0x%08x (sub %d)  held %u frames",
+                g_frameIndex, set, Texture::Name(set), word1, (int)(short)(word1 & 0xffff),
+                g_frameIndex - g_lastMouthFrame[slot]);
+    }
+    g_lastMouthWord1[slot] = word1;
+    g_lastMouthFrame[slot] = g_frameIndex;
+}
+
 void RecordMouthOperand(int set, unsigned int word1) {
+    TraceMouthTransition(set, word1);
     for (int i = 0; i < g_mouthOperandCount; ++i) {
         if (g_mouthOperands[i].set == set && g_mouthOperands[i].word1 == word1) {
             ++g_mouthOperands[i].count;
@@ -897,7 +990,16 @@ void Flush() {
     // Two cases genuinely blend: format 3 is the only palette carrying graduated alpha (the
     // effects and sky atlas), and combiner mode 0x16 is the one the original sets
     // D3DTBLEND_ADD for.
-    const int textureFormat = (g_currentTexture >= 0) ? Texture::Format(g_currentTexture) : -1;
+    // Whether this batch has a texture at all is the mode's decision as much as the
+    // selection's -- see kModeBindsTexture. Everything downstream that reads the current set
+    // has to go through this, or a suppressed bind still steers the blend, the depth mode and
+    // the census.
+    const bool modeTextured = ModeBindsTexture();
+    const int activeTexture = modeTextured ? g_currentTexture : -1;
+    if (!modeTextured && g_currentTexture >= 0) {
+        ++g_modeSuppressedBinds;
+    }
+    const int textureFormat = (activeTexture >= 0) ? Texture::Format(activeTexture) : -1;
     const bool additive = (g_combinerMode == 0x16);
     const bool graduated = (textureFormat == 3);
     if (additive) {
@@ -912,7 +1014,7 @@ void Flush() {
         dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     }
     if (additive || graduated) { ++g_blendedFlushes; } else { ++g_opaqueFlushes; }
-    if (g_currentTexture < 0) {
+    if (activeTexture < 0) {
         RecordUntexturedBatch(g_combinerMode,
                               Config::ApplyConstantColour() ? ConstantColourForBatch()
                                                             : 0xffffffffu,
@@ -922,17 +1024,17 @@ void Flush() {
 
     // A skydome has no business in the depth buffer, and drawing it depth-free is also the
     // shape Remix's sky auto-detection looks for.
-    const bool sky = Config::DepthlessSky() && Texture::IsSkySet(g_currentTexture);
+    const bool sky = Config::DepthlessSky() && Texture::IsSkySet(activeTexture);
     dev->SetRenderState(D3DRS_ZENABLE, sky ? D3DZB_FALSE : D3DZB_TRUE);
     dev->SetRenderState(D3DRS_ZWRITEENABLE, sky ? FALSE : TRUE);
     if (sky) { ++g_skyBatches; }
 
-    IDirect3DTexture9* tex = (g_currentTexture >= 0)
-                           ? Texture::GetTexture(g_currentTexture, g_currentSubA, g_currentSubB)
+    IDirect3DTexture9* tex = (activeTexture >= 0)
+                           ? Texture::GetTexture(activeTexture, g_currentSubA, g_currentSubB)
                            : 0;
     if (tex) { ++g_texturedFlushes; } else { ++g_untexturedFlushes; }
-    if (g_currentTexture >= 0 && g_currentTexture < kCensusSets) {
-        SetDraws& d = g_setDraws[g_currentTexture];
+    if (activeTexture >= 0 && activeTexture < kCensusSets) {
+        SetDraws& d = g_setDraws[activeTexture];
         d.lastConstant = Config::ApplyConstantColour() ? ConstantColourForBatch() : 0xffffffffu;
         d.lastMode = g_combinerMode;
         ++d.flushes;
@@ -1028,6 +1130,10 @@ void SetMatrixFromList(const float* src, unsigned char flags) {
     }
 
     if (flags & MAT_SET_VIEW) {
+        // The camera is applied at draw time, not baked into the vertices, so a batch still
+        // queued when a new one arrives would be drawn through it. The model matrix needs no
+        // such flush -- it is baked as the vertices are uploaded.
+        Flush();
         FactorViewProjection(m);
         g_viewDirty = true;
         g_viewValid = true;
@@ -1280,7 +1386,9 @@ void DumpBatch(int vertexCount, bool textured, bool culled, bool sky) {
         lstrcpynA(texture, "untextured", sizeof(texture));
     }
     if (!textured && g_currentTexture >= 0) {
-        lstrcatA(texture, "  [NOT BOUND]");
+        // Two different reasons a selected set does not reach the draw, and telling them
+        // apart is the whole point of the dump: the mode refused it, or the decode did.
+        lstrcatA(texture, ModeBindsTexture() ? "  [NOT BOUND]" : "  [MODE: FLAT, no texture]");
     }
 
     float lo[3] = { 1e30f, 1e30f, 1e30f };
@@ -1377,21 +1485,30 @@ void Geometry::BeginFrame() {
         LogLine("      camera fwd(%.3f, %.3f, %.3f) t(%.1f, %.1f, %.1f)",
                 v[2], v[6], v[10], v[12], v[13], v[14]);
     }
+    ++g_frameIndex;
     g_indexCount = 0;
     g_highWater = 0;
     g_stackDepth = 0;
-    g_renderFlags = 0;
-    g_currentTexture = -1;
-    g_currentSubA = 0;
-    g_currentSubB = 0;
-    g_skipMask = 0;
-    g_skipCounter = 0;
-    // A frame inherits no constant colour: white is the identity for the multiply, so a
-    // batch that never sets one is left exactly as its vertices describe it.
     // The combiner mode and the two constant colours are deliberately not reset here: they
     // are plain globals in the original, written only by their opcodes and never cleared per
     // frame. Clearing them would draw everything ahead of the frame's first 0xaf/0xfa/0xfb
     // untinted -- white walls, one frame in every few.
+    //
+    // The render flags and the texture selection are exactly the same kind of state, and the
+    // original is just as consistent about them: a sweep of the whole DLL finds the flag word
+    // at 0x10087f14 written only by the two opcode handlers (0x1000c18f, 0x1000c1fc), and the
+    // texture latch cleared only where a batch consumes it. So they carry over too, unless
+    // [Colour] ResetStatePerFrame asks otherwise: a reset makes the frame's opening geometry
+    // decode its vertices as pre-lit colours while the engine still has lighting enabled --
+    // reading a normal as a colour -- a wrong colour that comes and goes with the camera.
+    if (Config::ResetStatePerFrame()) {
+        g_renderFlags = 0;
+        g_currentTexture = -1;
+        g_currentSubA = 0;
+        g_currentSubB = 0;
+    }
+    g_skipMask = 0;
+    g_skipCounter = 0;
     g_skyboxDrawn = false;
     Identity(g_modelStack[0]);
     if (g_viewDirty) {
@@ -1626,12 +1743,28 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
             break;
 
         case OP_FLAGS_SET:
-            g_renderFlags |= (word1 & kFlagMask);
+        case OP_FLAGS_CLR: {
+            // The cull bit is draw-time state here, so a change to it has to break the batch
+            // for the same reason the constant colours do: anything still queued was emitted
+            // under the old value and would otherwise be drawn under the new one.
+            //
+            // The original has no such problem because it does not defer. FUN_1000c178 and
+            // FUN_1000c1e3 compare the flags before and after and act on the difference on
+            // the spot: bit 0x2000 calls FUN_10007030, which is SetRenderState(CULLMODE,
+            // D3DCULL_CCW) or SetRenderState(CULLMODE, D3DCULL_NONE); bit 0x20000 goes to the
+            // lighting path and bit 0x10000 to SetRenderState(FOGENABLE).
+            //
+            // The lighting bit needs no flush: it is consumed when vertices are uploaded, and
+            // an upload flushes anyway.
+            const unsigned int masked = word1 & kFlagMask;
+            const unsigned int updated = (op == OP_FLAGS_SET) ? (g_renderFlags | masked)
+                                                             : (g_renderFlags & ~masked);
+            if ((updated ^ g_renderFlags) & kFlagBackfaceCull) {
+                Flush();
+            }
+            g_renderFlags = updated;
             break;
-
-        case OP_FLAGS_CLR:
-            g_renderFlags &= ~(word1 & kFlagMask);
-            break;
+        }
 
         default:
             break;
@@ -1753,6 +1886,8 @@ void Geometry::LogTextureStats() {
                 m.set, m.word1, (int)(short)(m.word1 & 0xffff), (int)(m.word1 >> 16),
                 m.count, Texture::Name(m.set));
     }
+    LogLine("    binds suppressed by the combiner mode (flat modes 0x12-0x15, 0x17, 0x19, "
+            "0x1c): %u", g_modeSuppressedBinds);
     LogLine("    UNTEXTURED batches by (mode, constant, blend) -- this is where the houses are:");
     for (int i = 0; i < g_untexturedKindCount; ++i) {
         const UntexturedKind& k = g_untexturedKinds[i];

@@ -107,6 +107,21 @@ int EffectPaletteMode();
 // the only thing that gives them their colour.
 bool ApplyConstantColour();
 
+// Clear the engine's sticky display-list state -- render flags and the selected texture set
+// -- at the start of every frame.
+//
+// The original does not. Its render-flag word at 0x10087f14 is written by opcodes 0xb7 and
+// 0xb6 and by nothing else in the whole DLL, and the texture selection is armed by 0xa9 and
+// cleared only when a batch consumes it, never per frame. Resetting them makes the geometry
+// drawn before a frame's first 0xb7 or 0xa9 read differently from every other frame: with
+// the lighting bit cleared the four bytes at vertex+16 are decoded as a pre-lit colour when
+// they are really a normal, which is a wrong colour that appears and disappears with the
+// camera.
+//
+// 0 is faithful. Kept switchable because it is the one change here whose blast radius covers
+// every frame's opening geometry.
+bool ResetStatePerFrame();
+
 // ------------------------------------------------------------------------------- sky
 
 // Clear to the colour the engine supplies through display-list opcode 0xf8 rather than to

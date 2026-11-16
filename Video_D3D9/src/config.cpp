@@ -31,6 +31,7 @@ unsigned int g_cameraDrawListScale = 1;
 int g_effectPaletteMode = 1;
 float g_farPlane = 100000.0f;
 bool g_applyConstantColour = true;
+bool g_resetStatePerFrame = false;
 bool g_synthesiseSkybox = true;
 float g_skyboxSize = 0.0f;
 int g_skyboxColour = -1;
@@ -291,6 +292,7 @@ void Config::Load(void* self) {
     g_effectPaletteMode = GetPrivateProfileIntA("Textures", "EffectPaletteMode", 1, g_iniPath);
     if (g_effectPaletteMode < 1 || g_effectPaletteMode > 3) g_effectPaletteMode = 1;
     g_applyConstantColour        = ReadBool("Colour", "ApplyConstantColour", true);
+    g_resetStatePerFrame         = ReadBool("Colour", "ResetStatePerFrame", false);
     g_synthesiseSkybox           = ReadBool("Sky", "SynthesiseSkybox", true);
     g_skyboxSize = (float)GetPrivateProfileIntA("Sky", "SkyboxSize", 0, g_iniPath);
     if (g_skyboxSize < 0.0f) g_skyboxSize = 0.0f;
@@ -328,7 +330,8 @@ void Config::Load(void* self) {
     LogLine("    DrawDistance=%.0f CameraDrawListScale=%u",
             g_drawDistance, g_cameraDrawListScale);
     LogLine("    EffectPaletteMode=%d", g_effectPaletteMode);
-    LogLine("    ApplyConstantColour=%d", g_applyConstantColour);
+    LogLine("    ApplyConstantColour=%d ResetStatePerFrame=%d",
+            g_applyConstantColour, g_resetStatePerFrame);
     LogLine("    SynthesiseSkybox=%d SkyboxSize=%.0f SkyboxColour=%d "
             "SkyboxBlueShift=%d SkyboxBlueTarget=0x%06X",
             g_synthesiseSkybox, g_skyboxSize, g_skyboxColour,
@@ -357,6 +360,7 @@ float Config::DrawDistance()              { return g_drawDistance; }
 float Config::FarPlane()                  { return g_farPlane; }
 int Config::EffectPaletteMode()           { return g_effectPaletteMode; }
 bool Config::ApplyConstantColour()        { return g_applyConstantColour; }
+bool Config::ResetStatePerFrame()        { return g_resetStatePerFrame; }
 bool Config::SynthesiseSkybox()           { return g_synthesiseSkybox; }
 float Config::SkyboxSize()                { return g_skyboxSize; }
 int Config::SkyboxColour()                { return g_skyboxColour; }
