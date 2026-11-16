@@ -200,10 +200,23 @@ unsigned int BlobSize(const void* blob) {
     return total;
 }
 
-// Chunk 0 carries the source dimensions as bytes at +2 and +3. The engine reads the
-// *processed* dimensions from +6 and +7 instead -- those arrive zeroed and the original
-// fills them in while building its texture store. Leaving them zero makes the engine divide
-// by zero (SouthPark.exe+0x28ce2), so the copy is completed here.
+// Number of sub-chunks in chunk `index`, itself a count+offsets blob, or 0 if it is unreadable.
+unsigned int SubChunkCount(const unsigned char* base, unsigned int size, unsigned int index) {
+    const unsigned int count = *(const unsigned int*)base;
+    if (index >= count) {
+        return 0;
+    }
+    const unsigned int offset = *(const unsigned int*)(base + 4 + index * 4);
+    return offset + 4 <= size ? *(const unsigned int*)(base + offset) : 0;
+}
+
+// Chunk 0 bytes +6 and +7 hold the set's frame count and palette count. They arrive zeroed,
+// and the original fills them in while building its texture store (its header at chunk 0:
+// +6 = chunk 1's sub-chunk count, +7 = chunk 2's). The engine animates a set by dividing a
+// timer by them (SouthPark.exe+0x28ce2 and +0x28cf1) and sends the remainders back as
+// opcode 0xa9's frame and palette selectors -- so anything else there makes the engine ask
+// for frames the set does not have. The palette divide is skipped when it is zero, the frame
+// divide is not, so a set without frames still reports one.
 void CompleteHeader(void* blob) {
     unsigned char* base = (unsigned char*)blob;
     const unsigned int size = BlobSize(blob);
@@ -215,12 +228,9 @@ void CompleteHeader(void* blob) {
         return;
     }
     unsigned char* chunk = base + offset;
-    if (chunk[6] == 0) {
-        chunk[6] = chunk[2];
-    }
-    if (chunk[7] == 0) {
-        chunk[7] = chunk[3];
-    }
+    const unsigned int frames = SubChunkCount(base, size, 1);
+    chunk[6] = (unsigned char)(frames ? frames : 1);
+    chunk[7] = (unsigned char)SubChunkCount(base, size, 2);
 }
 
 // Dimensions are single bytes at chunk 0 +2 and +3, matching the byte read the original
