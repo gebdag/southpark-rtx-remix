@@ -35,7 +35,6 @@ bool g_disableBackfaceCulling  = true;
 bool g_disableTriangleSkipMask = false;
 bool g_disableOffscreenQuadReject = false;
 bool g_useEngineBackgroundColour = true;
-bool g_depthlessSky = true;
 bool g_logEveryCall = false;
 bool g_loadEntireMap = true;
 bool g_disableFrustumTest = true;
@@ -52,8 +51,7 @@ bool g_resetStatePerFrame = false;
 bool g_synthesiseSkybox = true;
 float g_skyboxSize = 0.0f;
 int g_skyboxColour = -1;
-int g_skyboxBlueShift = 45;
-int g_skyboxBlueTarget = 0x4A82D6;
+float g_smoothingAngle = 45.0f;
 
 // Written out when no ini exists, so the options are discoverable without the source.
 const char* kDefaultIni =
@@ -213,15 +211,10 @@ const char* kDefaultIni =
     "; the way the original renderer does, instead of to a fixed colour.\r\n"
     "UseEngineBackgroundColour=1\r\n"
     "\r\n"
-    "; Draw sky-textured batches with no depth test and no depth write. A skydome should be\r\n"
-    "; drawn that way regardless, and it is what Remix's sky auto-detection looks for.\r\n"
-    "DepthlessSky=1\r\n"
-    "\r\n"
-    "; Draw a large box around the camera in the background colour, before any world\r\n"
-    "; geometry and with depth off. The game has no skydome -- where the world does not\r\n"
-    "; cover the screen it simply leaves the cleared frame showing -- and a path tracer\r\n"
-    "; needs a real surface there: something to bound the scene, to catch the rays that\r\n"
-    "; miss the world, and to light it.\r\n"
+    "; Draw a large box around the camera in the background colour, at the far plane, first\r\n"
+    "; in the frame. The game has no skydome -- where the world does not cover the screen it\r\n"
+    "; simply leaves the cleared frame showing -- and RTX Remix needs a sky there. Like every\r\n"
+    "; sky draw it goes into Remix's sky layer rather than being path traced.\r\n"
     "SynthesiseSkybox=1\r\n"
     "\r\n"
     "; Half-extent of that box in world units. 0 derives it from the projection's far plane,\r\n"
@@ -233,15 +226,17 @@ const char* kDefaultIni =
     "; keeps its day/night changes.\r\n"
     "SkyboxColour=-1\r\n"
     "\r\n"
-    "; How far to pull that colour towards SkyboxBlueTarget, 0-100. The engine's backdrop is\r\n"
-    "; a pale wash chosen to sit behind a rasterised scene; as a real surface lighting a\r\n"
-    "; path-traced one it wants to read as sky. 0 leaves the colour exactly as chosen.\r\n"
-    "SkyboxBlueShift=45\r\n"
-    "SkyboxBlueTarget=0x4A82D6\r\n"
-    "\r\n"
     "; Texture-set names treated as sky, matched against the name stored in chunk 3 of the\r\n"
-    "; set. Matching is by prefix, so 'Day' covers Day1 and Day2.\r\n"
+    "; set. Matching is by prefix, so 'Day' covers Day1 and Day2. Sky batches are drawn at\r\n"
+    "; the far plane, behind everything, and RTX Remix rasterises them into its sky layer\r\n"
+    "; exactly as the game shades them: the cloud layers, and the intro's star cards.\r\n"
     "SkyTextureNames=Dawn,Day,Nite\r\n"
+    "\r\n"
+    "[Normals]\r\n"
+    "; Pre-lit geometry -- most of the world -- carries vertex colours instead of normals, so\r\n"
+    "; its normals are computed from its triangles. Faces meeting at less than this angle, in\r\n"
+    "; degrees, share smoothed normals; sharper edges stay hard. 0 makes every face flat.\r\n"
+    "SmoothingAngle=45\r\n"
     "\r\n"
     "[Debug]\r\n"
     "; Two keys are always live and need no setting here:\r\n"
@@ -300,7 +295,6 @@ void Config::Load(void* self) {
     g_disableTriangleSkipMask    = ReadBool("Culling", "DisableTriangleSkipMask", false);
     g_disableOffscreenQuadReject = ReadBool("Culling", "DisableOffscreenQuadReject", false);
     g_useEngineBackgroundColour  = ReadBool("Sky", "UseEngineBackgroundColour", true);
-    g_depthlessSky               = ReadBool("Sky", "DepthlessSky", true);
     g_logEveryCall               = ReadBool("Log", "LogEveryCall", false);
     g_loadEntireMap              = ReadBool("FullMap", "LoadEntireMap", true);
     g_disableFrustumTest         = ReadBool("FullMap", "DisableFrustumTest", true);
@@ -338,13 +332,10 @@ void Config::Load(void* self) {
         } else {
             g_skyboxColour = -1;
         }
-        GetPrivateProfileStringA("Sky", "SkyboxBlueTarget", "0x4A82D6", colour, sizeof(colour),
-                                 g_iniPath);
-        g_skyboxBlueTarget = (int)strtol(colour, 0, 0) & 0x00ffffff;
     }
-    g_skyboxBlueShift = GetPrivateProfileIntA("Sky", "SkyboxBlueShift", 45, g_iniPath);
-    if (g_skyboxBlueShift < 0)   g_skyboxBlueShift = 0;
-    if (g_skyboxBlueShift > 100) g_skyboxBlueShift = 100;
+    g_smoothingAngle = (float)GetPrivateProfileIntA("Normals", "SmoothingAngle", 45, g_iniPath);
+    if (g_smoothingAngle < 0.0f)   g_smoothingAngle = 0.0f;
+    if (g_smoothingAngle > 180.0f) g_smoothingAngle = 180.0f;
     g_screenshotFrame = GetPrivateProfileIntA("Debug", "ScreenshotFrame", 0, g_iniPath);
     g_screenshotInterval = GetPrivateProfileIntA("Debug", "ScreenshotInterval", 0, g_iniPath);
     g_lookdevCaptureKey = GetPrivateProfileIntA("Lookdev", "CaptureKey", 0x78, g_iniPath);
@@ -388,8 +379,8 @@ void Config::Load(void* self) {
             g_displayX, g_displayY, g_keepAspect, g_pauseWhenUnfocused);
     LogLine("    DisableBackfaceCulling=%d DisableTriangleSkipMask=%d DisableOffscreenQuadReject=%d",
             g_disableBackfaceCulling, g_disableTriangleSkipMask, g_disableOffscreenQuadReject);
-    LogLine("    UseEngineBackgroundColour=%d DepthlessSky=%d SkyTextureNames=%s",
-            g_useEngineBackgroundColour, g_depthlessSky, g_skyNames);
+    LogLine("    UseEngineBackgroundColour=%d SkyTextureNames=%s SmoothingAngle=%.0f",
+            g_useEngineBackgroundColour, g_skyNames, g_smoothingAngle);
     LogLine("    LoadEntireMap=%d DisableFrustumTest=%d UncullRooms=%d UncullEntities=%d "
             "UncullBudget=%d BatchLimitScale=%u FarPlane=%.0f",
             g_loadEntireMap, g_disableFrustumTest, g_uncullRooms, g_uncullEntities,
@@ -399,10 +390,8 @@ void Config::Load(void* self) {
     LogLine("    EffectPaletteMode=%d", g_effectPaletteMode);
     LogLine("    ApplyConstantColour=%d ResetStatePerFrame=%d",
             g_applyConstantColour, g_resetStatePerFrame);
-    LogLine("    SynthesiseSkybox=%d SkyboxSize=%.0f SkyboxColour=%d "
-            "SkyboxBlueShift=%d SkyboxBlueTarget=0x%06X",
-            g_synthesiseSkybox, g_skyboxSize, g_skyboxColour,
-            g_skyboxBlueShift, g_skyboxBlueTarget);
+    LogLine("    SynthesiseSkybox=%d SkyboxSize=%.0f SkyboxColour=%d",
+            g_synthesiseSkybox, g_skyboxSize, g_skyboxColour);
     LogLine("    ScreenshotFrame=%d ScreenshotInterval=%d",
             g_screenshotFrame, g_screenshotInterval);
     LogLine("    Lookdev CaptureKey=0x%02X CaptureFrames=%d GameWindow=%dx%d at %d,%d "
@@ -418,7 +407,6 @@ bool Config::DisableBackfaceCulling()     { return g_disableBackfaceCulling; }
 bool Config::DisableTriangleSkipMask()    { return g_disableTriangleSkipMask; }
 bool Config::DisableOffscreenQuadReject() { return g_disableOffscreenQuadReject; }
 bool Config::UseEngineBackgroundColour()  { return g_useEngineBackgroundColour; }
-bool Config::DepthlessSky()               { return g_depthlessSky; }
 const char* Config::SkyTextureNames()     { return g_skyNames; }
 bool Config::LogEveryCall()               { return g_logEveryCall; }
 bool Config::LoadEntireMap()              { return g_loadEntireMap; }
@@ -436,8 +424,7 @@ bool Config::ResetStatePerFrame()        { return g_resetStatePerFrame; }
 bool Config::SynthesiseSkybox()           { return g_synthesiseSkybox; }
 float Config::SkyboxSize()                { return g_skyboxSize; }
 int Config::SkyboxColour()                { return g_skyboxColour; }
-int Config::SkyboxBlueShift()             { return g_skyboxBlueShift; }
-int Config::SkyboxBlueTarget()            { return g_skyboxBlueTarget; }
+float Config::SmoothingAngle()            { return g_smoothingAngle; }
 int Config::ScreenshotFrame()             { return g_screenshotFrame; }
 int Config::ScreenshotInterval()           { return g_screenshotInterval; }
 int Config::LookdevCaptureKey()           { return g_lookdevCaptureKey; }

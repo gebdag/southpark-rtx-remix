@@ -128,17 +128,13 @@ bool ResetStatePerFrame();
 // a fixed colour.
 bool UseEngineBackgroundColour();
 
-// Draw sky-textured batches with no depth test and no depth write. That is how a skydome
-// should be drawn in any case, and it is the signal Remix's sky auto-detection looks for.
-bool DepthlessSky();
-
 // Comma-separated texture-set names treated as sky, matched against the name in chunk 3.
+// Sky batches are drawn at the far plane, which RTX Remix takes as its sky layer.
 const char* SkyTextureNames();
 
-// Draw a large box around the camera in the background colour, before any world geometry
-// and with depth off. The game has no skydome -- it leaves the cleared frame showing --
-// and a path tracer needs an actual surface there: something to bound the scene, to catch
-// rays that miss the world, and to light it.
+// Draw a large box around the camera in the background colour, at the far plane, first in
+// the frame. The game has no skydome -- it leaves the cleared frame showing -- and Remix
+// needs a sky there.
 bool SynthesiseSkybox();
 
 // Half-extent of that box in world units, or 0 to derive it from the projection's far
@@ -149,13 +145,12 @@ float SkyboxSize();
 // through display-list opcode 0xf8.
 int SkyboxColour();
 
-// How far to pull that colour towards sky blue, 0-100. The engine's own backdrop is a pale
-// wash chosen to sit behind a rasterised scene; as a real surface lighting a path-traced one
-// it wants to read as sky. 0 leaves the colour exactly as chosen.
-int SkyboxBlueShift();
+// ---------------------------------------------------------------------------- normals
 
-// The colour SkyboxBlueShift pulls towards, as 0xRRGGBB.
-int SkyboxBlueTarget();
+// Pre-lit geometry carries vertex colours where lit geometry carries normals, so its normals
+// are computed from its triangles. Faces meeting at less than this angle, in degrees, share a
+// smoothed normal; sharper edges stay hard.
+float SmoothingAngle();
 
 // --------------------------------------------------------------------------- display
 

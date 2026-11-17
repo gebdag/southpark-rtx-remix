@@ -24,6 +24,11 @@ bool g_inScene = false;
 bool g_needsReset = false;
 Device::Pipeline g_pipeline = Device::PipelineNone;
 bool g_frameHadDraw = false;
+bool g_worldDrawn = false;
+// The viewport depth range last set; negative forces the next SetDepthRange through, as after
+// a reset, which puts the viewport back to the device's default.
+float g_depthMin = -1.0f;
+float g_depthMax = -1.0f;
 
 // Used until the engine sends its own background colour, and whenever the ini says to
 // ignore it. Distinctive on purpose, so a black frame reads as "nothing ran".
@@ -134,13 +139,71 @@ HMODULE LoadD3D9() {
     return sys;
 }
 
+// Geometry is streamed through one dynamic vertex/index buffer pair rather than drawn with
+// DrawPrimitiveUP: RTX Remix rasterises sky draws into its sky layer from the buffers bound
+// to the draw, and a UP draw's temporary buffers are gone by the time it does. Each draw
+// appends behind the previous one (NOOVERWRITE) and the ring restarts with DISCARD when full.
+const UINT kStreamVertexBytes = 1u << 20;
+const UINT kStreamIndexBytes = 1u << 18;
+IDirect3DVertexBuffer9* g_streamVertices = 0;
+IDirect3DIndexBuffer9* g_streamIndices = 0;
+UINT g_streamVertexEnd = 0;
+UINT g_streamIndexEnd = 0;
+
+void ReleaseStream() {
+    if (g_streamVertices) {
+        g_streamVertices->Release();
+        g_streamVertices = 0;
+    }
+    if (g_streamIndices) {
+        g_streamIndices->Release();
+        g_streamIndices = 0;
+    }
+}
+
+bool EnsureStream() {
+    if (g_streamVertices && g_streamIndices) {
+        return true;
+    }
+    ReleaseStream();
+    const DWORD usage = D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY;
+    HRESULT hr = g_device->CreateVertexBuffer(kStreamVertexBytes, usage, 0, D3DPOOL_DEFAULT,
+                                              &g_streamVertices, 0);
+    if (SUCCEEDED(hr)) {
+        hr = g_device->CreateIndexBuffer(kStreamIndexBytes, usage, D3DFMT_INDEX16,
+                                         D3DPOOL_DEFAULT, &g_streamIndices, 0);
+    }
+    if (FAILED(hr)) {
+        LogLine("    stream buffers could not be created hr=0x%08lx", (unsigned long)hr);
+        ReleaseStream();
+        return false;
+    }
+    g_streamVertexEnd = kStreamVertexBytes;  // the first draw discards
+    g_streamIndexEnd = kStreamIndexBytes;
+    return true;
+}
+
+// Reserves `bytes` in a ring at a multiple of `align`, returning the offset and the lock flag.
+UINT ReserveInRing(UINT* end, UINT capacity, UINT bytes, UINT align, DWORD* lockFlags) {
+    UINT offset = (*end + align - 1) / align * align;
+    *lockFlags = D3DLOCK_NOOVERWRITE;
+    if (offset + bytes > capacity) {
+        offset = 0;
+        *lockFlags = D3DLOCK_DISCARD;
+    }
+    *end = offset + bytes;
+    return offset;
+}
+
 bool Reset() {
     g_inScene = false;
+    ReleaseStream();
     HRESULT hr = g_device->Reset(&g_params);
     if (FAILED(hr)) {
         return false;
     }
     g_needsReset = false;
+    g_depthMin = g_depthMax = -1.0f;
     LogLine("    device reset ok (%dx%d)", g_params.BackBufferWidth, g_params.BackBufferHeight);
     return true;
 }
@@ -201,6 +264,7 @@ void Device::Destroy() {
             g_device->EndScene();
             g_inScene = false;
         }
+        ReleaseStream();
         g_device->Release();
         g_device = 0;
     }
@@ -224,6 +288,75 @@ bool Device::FrameHasDrawn() {
 
 void Device::ClaimFirstDraw() {
     g_frameHadDraw = true;
+}
+
+void Device::NoteWorldDraw() {
+    g_worldDrawn = true;
+}
+
+bool Device::WorldHasDrawn() {
+    return g_worldDrawn;
+}
+
+void Device::SetDepthRange(float minZ, float maxZ) {
+    if (!g_device || (minZ == g_depthMin && maxZ == g_depthMax)) {
+        return;
+    }
+    D3DVIEWPORT9 vp;
+    vp.X = 0;
+    vp.Y = 0;
+    vp.Width = g_params.BackBufferWidth;
+    vp.Height = g_params.BackBufferHeight;
+    vp.MinZ = minZ;
+    vp.MaxZ = maxZ;
+    if (SUCCEEDED(g_device->SetViewport(&vp))) {
+        g_depthMin = minZ;
+        g_depthMax = maxZ;
+    }
+}
+
+bool Device::DrawTriangles(const void* vertices, unsigned int stride, unsigned int vertexCount,
+                           const unsigned short* indices, unsigned int indexCount) {
+    if (!g_device || stride == 0 || indexCount < 3 || !EnsureStream()) {
+        return false;
+    }
+    const UINT vertexBytes = stride * vertexCount;
+    const UINT indexBytes = indexCount * sizeof(unsigned short);
+    if (vertexBytes > kStreamVertexBytes || indexBytes > kStreamIndexBytes) {
+        LogLine("    draw of %u vertices / %u indices exceeds the stream buffers",
+                vertexCount, indexCount);
+        return false;
+    }
+
+    DWORD vertexLock = 0;
+    DWORD indexLock = 0;
+    const UINT vertexOffset = ReserveInRing(&g_streamVertexEnd, kStreamVertexBytes, vertexBytes,
+                                            stride, &vertexLock);
+    const UINT indexOffset = ReserveInRing(&g_streamIndexEnd, kStreamIndexBytes, indexBytes,
+                                           sizeof(unsigned short), &indexLock);
+    void* dst = 0;
+    if (FAILED(g_streamVertices->Lock(vertexOffset, vertexBytes, &dst, vertexLock))) {
+        return false;
+    }
+    memcpy(dst, vertices, vertexBytes);
+    g_streamVertices->Unlock();
+    if (FAILED(g_streamIndices->Lock(indexOffset, indexBytes, &dst, indexLock))) {
+        return false;
+    }
+    memcpy(dst, indices, indexBytes);
+    g_streamIndices->Unlock();
+
+    g_device->SetStreamSource(0, g_streamVertices, 0, stride);
+    g_device->SetIndices(g_streamIndices);
+    const HRESULT hr = g_device->DrawIndexedPrimitive(D3DPT_TRIANGLELIST,
+                                                      (INT)(vertexOffset / stride), 0, vertexCount,
+                                                      indexOffset / sizeof(unsigned short),
+                                                      indexCount / 3);
+    if (FAILED(hr)) {
+        LogLine("    DrawIndexedPrimitive failed hr=0x%08lx", (unsigned long)hr);
+        return false;
+    }
+    return true;
 }
 
 bool Device::ClaimPipeline(Pipeline pipeline) {
@@ -262,6 +395,7 @@ bool Device::BeginFrame() {
     // A fresh frame inherits nothing: whichever pipeline draws first installs its state.
     g_pipeline = PipelineNone;
     g_frameHadDraw = false;
+    g_worldDrawn = false;
     g_device->Clear(0, 0, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, g_clearColour, 1.0f, 0);
     if (FAILED(g_device->BeginScene())) {
         return false;

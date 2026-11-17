@@ -66,6 +66,18 @@ struct ScreenVertex {
 };
 const DWORD kScreenFVF = D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1;
 
+// The same quad as geometry, for the backdrop: RTX Remix path traces or skips every
+// pre-transformed draw, and only geometry it can place can go into its sky layer.
+struct BackdropVertex {
+    float x, y, z;
+    D3DCOLOR diffuse;
+    float u, v;
+};
+const DWORD kBackdropFVF = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1;
+
+// A quad's four corners in fan order, as two triangles.
+const unsigned short kQuadIndices[6] = {0, 1, 2, 0, 2, 3};
+
 // The engine's 2D coordinates are always 640x480; the original hardcodes the 479.0 flip.
 // The backbuffer is the window, which is larger, so quads are scaled on the way out.
 const float kAuthoredWidth  = 640.0f;
@@ -164,6 +176,119 @@ void FreeEntry(Entry& e) {
     e.refcount = 0;
     e.synthetic = false;
     e.dx0 = e.dy0 = e.dx1 = e.dy1 = 0;
+}
+
+// State both 2D pipelines share: no fog, no culling, no alpha test, clamped texture lookups,
+// and none of the world's per-draw tags for Remix.
+void InstallQuadStates(IDirect3DDevice9* dev) {
+    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_CONSTANT, 0);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+}
+
+// Mode 1 is the only one that modulates the texture by the vertex colour; mode 0 and 2 draw
+// it opaque, the rest blend it.
+void ApplyQuadBlend(IDirect3DDevice9* dev, Entry& e, int blendMode) {
+    dev->SetTexture(0, e.texture);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE,
+                        (blendMode == 0 || blendMode == 2) ? FALSE : TRUE);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP,
+                              (blendMode == 1) ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP,
+                              (blendMode == 1) ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
+}
+
+// The UI: on top of the scene unconditionally, pre-transformed, no depth. RTX Remix
+// rasterises it over the path traced frame (rtx.preTransformedVerticesIsUI).
+bool DrawOverlay(IDirect3DDevice9* dev, Entry& e, const ScreenVertex* v, int blendMode) {
+    if (Device::ClaimPipeline(Device::Pipeline2D)) {
+        dev->SetFVF(kScreenFVF);
+        dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+        dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        InstallQuadStates(dev);
+    }
+    Device::SetDepthRange(0.0f, 1.0f);
+    ApplyQuadBlend(dev, e, blendMode);
+    return Device::DrawTriangles(v, sizeof(ScreenVertex), 4, kQuadIndices, 6);
+}
+
+// The backdrop: the same quad as geometry through an orthographic projection that lands each
+// vertex on the pixel the pre-transformed one would, at the far plane -- which Remix takes as
+// its sky layer. It writes depth, harmlessly at 1, because an orthographic draw that writes
+// none is what Remix's UI heuristic (rtx.orthographicIsUI) looks for.
+bool DrawBackdrop(IDirect3DDevice9* dev, Entry& e, const ScreenVertex* v, int blendMode) {
+    if (Device::ClaimPipeline(Device::Pipeline2DBackdrop)) {
+        dev->SetFVF(kBackdropFVF);
+        dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+        dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+        dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+        dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+        InstallQuadStates(dev);
+    }
+    Device::SetDepthRange(1.0f, 1.0f);
+
+    // Screen x lands at NDC (x + 0.5) * 2 / W - 1: D3D9 puts NDC -1 on the left edge of pixel
+    // 0, half a pixel before the coordinate a pre-transformed vertex names.
+    const float w = (float)Device::Width();
+    const float h = (float)Device::Height();
+    D3DMATRIX identity;
+    memset(&identity, 0, sizeof(identity));
+    identity._11 = identity._22 = identity._33 = identity._44 = 1.0f;
+    D3DMATRIX ortho = identity;
+    ortho._11 = 2.0f / w;
+    ortho._22 = -2.0f / h;
+    ortho._41 = -1.0f + 1.0f / w;
+    ortho._42 = 1.0f - 1.0f / h;
+    dev->SetTransform(D3DTS_WORLD, &identity);
+    dev->SetTransform(D3DTS_VIEW, &identity);
+    dev->SetTransform(D3DTS_PROJECTION, &ortho);
+
+    BackdropVertex b[4];
+    for (int i = 0; i < 4; ++i) {
+        b[i].x = v[i].x;
+        b[i].y = v[i].y;
+        b[i].z = 0.0f;
+        b[i].diffuse = v[i].diffuse;
+        b[i].u = v[i].u;
+        b[i].v = v[i].v;
+    }
+    ApplyQuadBlend(dev, e, blendMode);
+    return Device::DrawTriangles(b, sizeof(BackdropVertex), 4, kQuadIndices, 6);
+}
+
+// Quads drawn before any world geometry this frame. Whether they are a backdrop or a 2D
+// screen is only known once the world draws -- or the frame ends without it.
+struct PendingQuad {
+    int handle;
+    int blendMode;
+    ScreenVertex v[4];
+};
+const int kMaxPendingQuads = 4096;
+PendingQuad g_pending[kMaxPendingQuads];
+int g_pendingCount = 0;
+
+typedef bool (*QuadDrawFn)(IDirect3DDevice9*, Entry&, const ScreenVertex*, int);
+
+void DrawPending(QuadDrawFn draw) {
+    IDirect3DDevice9* dev = Device::Get();
+    for (int i = 0; dev && i < g_pendingCount; ++i) {
+        const PendingQuad& q = g_pending[i];
+        // The engine may have unloaded the image since; it drew nothing then either.
+        if (Valid(q.handle) && g_entries[q.handle].texture &&
+            draw(dev, g_entries[q.handle], q.v, q.blendMode)) {
+            ++g_quadsDrawn;
+        }
+    }
+    g_pendingCount = 0;
 }
 
 } // namespace
@@ -415,41 +540,33 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
                 v[0].x, v[0].y, v[2].x, v[2].y);
     }
 
-    // 2D sits on top of the scene unconditionally: no depth test, no depth write, no fog,
-    // no culling.
-    // Counts against the frame's first draw, so the depth-free skybox knows not to paint
-    // over a 2D backdrop that went down before any world geometry.
+    // After the world, a quad is the UI on top. Before it, it waits: a frame that goes on to
+    // draw the world was showing a backdrop (the main menu's night sky), and one that never
+    // does is a 2D screen (a menu, the loading art). RTX Remix needs the two apart, because it
+    // composites the path traced frame at the first UI draw -- a backdrop sent as UI would end
+    // path tracing before the world was drawn. A waiting quad still counts as the frame's first
+    // draw, so the synthesised sky does not paint over it.
+    if (Device::WorldHasDrawn()) {
+        if (DrawOverlay(dev, e, v, g_blendMode)) {
+            ++g_quadsDrawn;
+        }
+        return;
+    }
     Device::ClaimFirstDraw();
-    if (Device::ClaimPipeline(Device::Pipeline2D)) {
-        dev->SetFVF(kScreenFVF);
-        dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
-        dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-        dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
-        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-        dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-        dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-        dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-        dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-        dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-        dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-        dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
-        dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-        dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    if (g_pendingCount < kMaxPendingQuads) {
+        PendingQuad& q = g_pending[g_pendingCount++];
+        q.handle = handle;
+        q.blendMode = g_blendMode;
+        memcpy(q.v, v, sizeof(q.v));
     }
+}
 
-    // Mode 1 is the only one that modulates the texture by the vertex colour; mode 0 and 2
-    // draw it opaque, the rest blend it.
-    dev->SetTexture(0, e.texture);
-    dev->SetRenderState(D3DRS_ALPHABLENDENABLE,
-                        (g_blendMode == 0 || g_blendMode == 2) ? FALSE : TRUE);
-    dev->SetTextureStageState(0, D3DTSS_COLOROP,
-                              (g_blendMode == 1) ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAOP,
-                              (g_blendMode == 1) ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
+void Pcx::DrawPendingAsBackdrop() {
+    DrawPending(&DrawBackdrop);
+}
 
-    if (SUCCEEDED(dev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, v, sizeof(ScreenVertex)))) {
-        ++g_quadsDrawn;
-    }
+void Pcx::DrawPendingAsScreen() {
+    DrawPending(&DrawOverlay);
 }
 
 void Pcx::LogQuadStats() {

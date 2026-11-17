@@ -32,16 +32,35 @@ void PreloadD3D9();
 enum Pipeline {
     PipelineNone,
     PipelineWorld,
-    Pipeline2D,
+    Pipeline2D,           // screen-space quads on top of the scene: the UI
+    Pipeline2DBackdrop,   // screen-space quads behind it, drawn as sky
 };
 bool ClaimPipeline(Pipeline pipeline);
 
-// The synthesised skybox is drawn with depth off, so it is only safe while the frame is
-// still empty; the 2D layer is depth-free too and can legitimately go down first. Ask with
+// The synthesised skybox covers the whole screen at the far plane, so it is only drawn while
+// the frame is still empty; a 2D backdrop can legitimately go down first. Ask with
 // FrameHasDrawn, and claim only once something has actually been drawn -- a claim spent on
 // an attempt that then fails costs the frame its backdrop.
 bool FrameHasDrawn();
 void ClaimFirstDraw();
+
+// Whether any world geometry has been drawn this frame. The engine's 2D layer means two
+// different things depending on the answer: before the world it is a backdrop (the menu's
+// night sky), after it the UI on top.
+void NoteWorldDraw();
+bool WorldHasDrawn();
+
+// The viewport's depth range, over the whole back buffer. RTX Remix treats a draw whose
+// viewport starts at depth 1 as sky (rtx.skyMinZThreshold, 1 by default) and rasterises it
+// into its sky layer instead of path tracing it; the rasteriser draws it at the far plane,
+// behind everything, however late in the frame it comes.
+void SetDepthRange(float minZ, float maxZ);
+
+// Draws an indexed triangle list with the vertex format the caller has set. Every draw goes
+// through here: the geometry is streamed into device-owned buffers, never drawn "UP", because
+// RTX Remix rasterises sky draws from the buffers bound to the draw after the draw itself.
+bool DrawTriangles(const void* vertices, unsigned int stride, unsigned int vertexCount,
+                   const unsigned short* indices, unsigned int indexCount);
 
 // Null until Create succeeds. Subsystems that own D3D resources must tolerate this.
 IDirect3DDevice9* Get();

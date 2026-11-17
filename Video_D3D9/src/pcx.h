@@ -45,6 +45,13 @@ IDirect3DTexture9* Texture(int handle);
 // colours are 4 x {r, g, b, a} in 0..1; uvs are 4 x {u, v}.
 void DrawQuad(int handle, const float* positions, const float* colours, const float* uvs);
 
+// Quads drawn before any world geometry wait until the frame says what they were. The world
+// pipeline draws them as the frame's backdrop, at the far plane where RTX Remix takes them as
+// sky, just before its first batch; a frame that ends without drawing any world was a 2D
+// screen, and draws them as UI at its end.
+void DrawPendingAsBackdrop();
+void DrawPendingAsScreen();
+
 // Blend mode for subsequent quads, as set by GFXDLL_SetBlendModePCX. Only mode 1 modulates
 // by the vertex colour; the rest draw the texture flat, with or without blending.
 void SetBlendMode(int mode);

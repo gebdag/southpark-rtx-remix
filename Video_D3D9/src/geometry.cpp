@@ -3,6 +3,7 @@
 #include "device.h"
 #include "log.h"
 #include "lookdev.h"
+#include "pcx.h"
 #include "texture.h"
 
 #include <windows.h>
@@ -158,6 +159,69 @@ unsigned int ConstantColourForBatch() {
     default:         return 0xffffffffu;
     }
 }
+
+// The other half of the same resolution: which alpha the batch's vertices carry. FUN_1000ba50
+// computes a constant alpha (0x100877d4) from flags the mode raises, and the vertex stage
+// (FUN_10007fc0, 0x100083ab) writes it into every vertex in place of the vertex's own alpha
+// whenever one was computed (0x10087844). In its order of precedence:
+//
+//   prim and env alpha both raised   -> prim.a * env.a
+//   squared prim alpha (0x10087ef4)  -> prim.a * prim.a
+//   env alpha                        -> env.a
+//   prim alpha                       -> prim.a
+//   half (0x10087a4c)                -> 0x7f
+//   otherwise                        -> the vertex's own alpha
+//
+// read back per mode from the same jump table. 0x1e and 0x1f raise "half" -- the original's
+// own debug string calls it "use CA5" -- which is what makes the cloud layers translucent:
+// drawn under 0x1e with a black primitive colour, they come out as a 50% darkening of the sky,
+// the grey clouds of the original, rather than as black.
+enum AlphaSource { ALPHA_VERTEX, ALPHA_PRIM, ALPHA_ENV, ALPHA_PRIM_ENV, ALPHA_PRIM_SQUARED,
+                   ALPHA_HALF };
+
+const unsigned char kAlphaSource[kCombinerModeCount] = {
+    ALPHA_VERTEX,        ALPHA_ENV,      ALPHA_PRIM,     ALPHA_ENV,        // 0x00
+    ALPHA_PRIM,          ALPHA_VERTEX,   ALPHA_PRIM,     ALPHA_PRIM_ENV,   // 0x04
+    ALPHA_PRIM,          ALPHA_PRIM,     ALPHA_PRIM_ENV, ALPHA_PRIM_SQUARED, // 0x08
+    ALPHA_VERTEX,        ALPHA_PRIM,     ALPHA_PRIM_ENV, ALPHA_VERTEX,     // 0x0c
+    ALPHA_PRIM_ENV,      ALPHA_PRIM_SQUARED, ALPHA_PRIM, ALPHA_PRIM,       // 0x10
+    ALPHA_PRIM_ENV,      ALPHA_PRIM,     ALPHA_PRIM,     ALPHA_PRIM_ENV,   // 0x14
+    ALPHA_PRIM,          ALPHA_PRIM,     ALPHA_ENV,      ALPHA_ENV,        // 0x18
+    ALPHA_VERTEX,        ALPHA_PRIM,     ALPHA_HALF,     ALPHA_HALF,       // 0x1c
+    ALPHA_PRIM,          ALPHA_VERTEX,   ALPHA_VERTEX,   ALPHA_VERTEX,     // 0x20
+    ALPHA_VERTEX,        ALPHA_VERTEX,   ALPHA_VERTEX,   ALPHA_VERTEX,     // 0x24
+    ALPHA_VERTEX,                                                          // 0x28
+};
+
+// Mode 0x0b also raises 0x10087864, which inverts whatever alpha was picked.
+const int kModeInvertingAlpha = 0x0b;
+
+// The batch's constant alpha, or -1 when its vertices keep their own. The constant colours
+// arrive packed r, g, b, a from the low byte up, so alpha is the top byte.
+int ConstantAlphaForBatch() {
+    if (g_combinerMode < 0 || g_combinerMode >= kCombinerModeCount) {
+        return -1;
+    }
+    const int prim = (int)(g_primColour >> 24);
+    const int env = (int)(g_envColour >> 24);
+    int alpha;
+    switch (kAlphaSource[g_combinerMode]) {
+    case ALPHA_PRIM:         alpha = prim; break;
+    case ALPHA_ENV:          alpha = env; break;
+    case ALPHA_PRIM_ENV:     alpha = (prim * env) >> 8; break;
+    case ALPHA_PRIM_SQUARED: alpha = (prim * prim) >> 8; break;
+    case ALPHA_HALF:         alpha = 0x7f; break;
+    default:                 return -1;
+    }
+    return g_combinerMode == kModeInvertingAlpha ? 255 - alpha : alpha;
+}
+
+// Two modes change what the texture stage does with the texture, both set through
+// TEXTUREMAPBLEND in their case of the jump table: 0x16 adds the texture to the vertex colour
+// (D3DTBLEND_ADD) and 0x28 takes the texture alone (D3DTBLEND_DECAL), switching the alpha
+// test and blending off as it does. Every other mode modulates (MODULATEALPHA).
+const int kModeAddsTexture = 0x16;
+const int kModeTextureOnly = 0x28;
 
 // THE COMBINER MODE ALSO DECIDES WHETHER A TEXTURE IS BOUND AT ALL.
 //
@@ -351,7 +415,7 @@ SetDraws g_setDraws[kCensusSets];
 struct UntexturedKind {
     int mode;
     unsigned int constant;
-    unsigned char blend;      // 0 opaque, 1 additive ONE/ONE, 2 SRCALPHA
+    unsigned char blend;      // 0 opaque, 1 blended (SRCALPHA / INVSRCALPHA)
     unsigned int flushes;
     unsigned int tris;
 };
@@ -434,10 +498,14 @@ const int kMaxIndices  = 8192;
 WorldVertex g_vertices[kMaxVertices];
 unsigned short g_indices[kMaxIndices];
 // Scratch for compacting a batch down to the vertices it actually indexes, so the range handed
-// to D3D -- and therefore the range Remix hashes -- is exactly the geometry being drawn.
-WorldVertex    g_compactVertices[kMaxVertices];
+// to D3D -- and therefore the range Remix hashes -- is exactly the geometry being drawn. A slot
+// can come out as several vertices, one per distinct computed normal, so this is sized by
+// corners rather than by slots.
+WorldVertex    g_compactVertices[kMaxIndices];
 unsigned short g_compactIndices[kMaxIndices];
-int            g_compactMap[kMaxVertices];
+// Whether a slot was uploaded lit, with the engine's own normal, or pre-lit, with a colour in
+// its place. A batch can index slots from several uploads, so this is per slot.
+unsigned char  g_slotLit[kMaxVertices];
 int g_indexCount = 0;
 int g_highWater  = 0;   // highest slot written this frame; the window outlives a flush
 
@@ -785,13 +853,330 @@ void LogMatrix(const char* label, const D3DMATRIX& m) {
     }
 }
 
+// ------------------------------------------------------------------ normals
+//
+// Most of the world is pre-lit: its vertices carry a colour where lit geometry carries a
+// normal, because the original never lights it. A path tracer lights everything, and needs a
+// normal for that, so one is computed from the triangles. Each corner takes the area-weighted
+// normals of the faces around its vertex that meet its own face at less than
+// [Normals] SmoothingAngle, so a mountain shades smoothly and a house's corner stays hard; a
+// slot whose corners disagree becomes one vertex per normal.
+//
+// The normal follows each triangle's own winding, so a card whose two triangles are wound
+// opposite ways -- the intro's star cards are -- gets a normal that agrees with each triangle's
+// geometry instead of one that points out of one and into the other.
+
+const int kMaxBatchTriangles = kMaxIndices / 3;
+float g_faceNormal[kMaxBatchTriangles][3];   // area-weighted
+float g_faceUnit[kMaxBatchTriangles][3];
+int g_slotFirstCorner[kMaxVertices];          // index positions that name each slot, chained
+int g_cornerNext[kMaxIndices];
+int g_slotFirstVariant[kMaxVertices];         // compacted vertices made from each slot, chained
+int g_variantNext[kMaxIndices];
+
+void Cross(const float* a, const float* b, float* out) {
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+float Dot(const float* a, const float* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+bool Normalise(float* v) {
+    const float len2 = Dot(v, v);
+    if (!(len2 > 1e-20f)) {
+        return false;
+    }
+    const float inv = 1.0f / sqrtf(len2);
+    v[0] *= inv; v[1] *= inv; v[2] *= inv;
+    return true;
+}
+
+void FaceNormal(const WorldVertex& a, const WorldVertex& b, const WorldVertex& c, float* out) {
+    const float e1[3] = { b.x - a.x, b.y - a.y, b.z - a.z };
+    const float e2[3] = { c.x - a.x, c.y - a.y, c.z - a.z };
+    Cross(e1, e2, out);
+}
+
+void ComputeFaceNormals(int vertexCount) {
+    for (int t = 0; t < g_indexCount / 3; ++t) {
+        const int a = g_indices[t * 3], b = g_indices[t * 3 + 1], c = g_indices[t * 3 + 2];
+        float* n = g_faceNormal[t];
+        if (a >= vertexCount || b >= vertexCount || c >= vertexCount) {
+            n[0] = n[1] = n[2] = 0.0f;
+        } else {
+            FaceNormal(g_vertices[a], g_vertices[b], g_vertices[c], n);
+        }
+        float* u = g_faceUnit[t];
+        u[0] = n[0]; u[1] = n[1]; u[2] = n[2];
+        if (!Normalise(u)) {
+            u[0] = u[1] = u[2] = 0.0f;
+        }
+    }
+}
+
+// The smoothed normal of corner `corner` (an index position), from the faces around its slot.
+void CornerNormal(int corner, float creaseCos, float* out) {
+    const int t = corner / 3;
+    const float* own = g_faceUnit[t];
+    out[0] = out[1] = out[2] = 0.0f;
+    for (int j = g_slotFirstCorner[g_indices[corner]]; j >= 0; j = g_cornerNext[j]) {
+        const int t2 = j / 3;
+        if (Dot(own, g_faceUnit[t2]) >= creaseCos) {
+            out[0] += g_faceNormal[t2][0];
+            out[1] += g_faceNormal[t2][1];
+            out[2] += g_faceNormal[t2][2];
+        }
+    }
+    if (!Normalise(out)) {
+        out[0] = own[0]; out[1] = own[1]; out[2] = own[2];
+        if (!Normalise(out)) {
+            out[0] = 0.0f; out[1] = 1.0f; out[2] = 0.0f;
+        }
+    }
+}
+
+bool SameNormal(const WorldVertex& v, const float* n) {
+    return fabsf(v.nx - n[0]) < 1e-4f && fabsf(v.ny - n[1]) < 1e-4f && fabsf(v.nz - n[2]) < 1e-4f;
+}
+
+// Fills g_compactVertices / g_compactIndices with exactly the vertices the batch indexes --
+// pre-lit ones with computed normals -- and returns how many there are.
+int CompactBatch(int vertexCount) {
+    // A small slack keeps faces that are parallel up to rounding together at 0 degrees.
+    const float creaseCos = cosf(Config::SmoothingAngle() * 3.14159265f / 180.0f) - 1e-4f;
+    ComputeFaceNormals(vertexCount);
+    for (int v = 0; v < vertexCount; ++v) {
+        g_slotFirstCorner[v] = -1;
+        g_slotFirstVariant[v] = -1;
+    }
+    for (int i = 0; i < g_indexCount; ++i) {
+        const int v = g_indices[i];
+        if (v < vertexCount) {
+            g_cornerNext[i] = g_slotFirstCorner[v];
+            g_slotFirstCorner[v] = i;
+        }
+    }
+    int count = 0;
+    for (int i = 0; i < g_indexCount; ++i) {
+        const int v = g_indices[i];
+        if (v >= vertexCount) {
+            g_compactIndices[i] = 0;
+            continue;
+        }
+        float n[3] = { g_vertices[v].nx, g_vertices[v].ny, g_vertices[v].nz };
+        if (!g_slotLit[v]) {
+            CornerNormal(i, creaseCos, n);
+        }
+        int found = -1;
+        for (int k = g_slotFirstVariant[v]; k >= 0; k = g_variantNext[k]) {
+            if (SameNormal(g_compactVertices[k], n)) {
+                found = k;
+                break;
+            }
+        }
+        if (found < 0) {
+            found = count++;
+            g_compactVertices[found] = g_vertices[v];
+            g_compactVertices[found].nx = n[0];
+            g_compactVertices[found].ny = n[1];
+            g_compactVertices[found].nz = n[2];
+            g_variantNext[found] = g_slotFirstVariant[v];
+            g_slotFirstVariant[v] = found;
+        }
+        g_compactIndices[i] = (unsigned short)found;
+    }
+    return count;
+}
+
+// ------------------------------------------------------------------ decals
+//
+// A decal is geometry laid exactly onto a surface drawn earlier in the frame: the TICKETS
+// sign on the ticket booth, the poster beside it, the Terrance & Phillip art on its board. The
+// engine marks none of them -- they go down as ordinary opaque batches, and the original shows
+// them only because its depth test passes on equal depth and the later draw wins. A path
+// tracer has no "later": two surfaces in one plane are one surface hit at random, and the
+// sign loses.
+//
+// So they are found here. Every opaque world triangle drawn this frame is filed by its plane;
+// a batch with a triangle lying in the plane of an earlier one, facing the same way and
+// overlapping it by more than a sliver, is laid onto that surface, and is tagged for Remix as
+// a decal (stage 0's D3DTSS_CONSTANT = 0xD15DECA1, rtx.fixedFunctionDecalMarkerEnabled), which
+// blends it onto the surface beneath instead of fighting it. The constant is inert to the
+// rasteriser: no stage argument reads D3DTA_CONSTANT.
+
+const DWORD kRemixDecalMarker = 0xD15DECA1u;
+
+struct PlaneTriangle {
+    float n[3];          // unit normal, in the triangle's own winding
+    float d;             // n . p for any p in the plane
+    float p[3][3];
+    int next;            // next triangle filed in the same bucket
+};
+const int kMaxPlaneTriangles = 1 << 16;
+const int kPlaneBuckets = 1 << 14;
+PlaneTriangle g_planeTriangles[kMaxPlaneTriangles];
+int g_planeTriangleCount = 0;
+int g_planeBucket[kPlaneBuckets];
+unsigned int g_decalBatches = 0;
+
+// Planes closer than this, in world units and in normal, count as the same plane.
+const float kCoplanarDistance = 0.75f;
+const float kCoplanarCos = 0.999f;
+// Overlap smaller than this in either direction is triangles touching along an edge, which
+// neighbouring tiles of one floor do, not one lying on the other.
+const float kOverlapMargin = 0.5f;
+
+void ResetDecalPlanes() {
+    memset(g_planeBucket, 0xff, sizeof(g_planeBucket));
+    g_planeTriangleCount = 0;
+}
+
+unsigned int PlaneBucket(const float* n, int distanceCell) {
+    const int qx = (int)floorf(n[0] * 16.0f + 0.5f);
+    const int qy = (int)floorf(n[1] * 16.0f + 0.5f);
+    const int qz = (int)floorf(n[2] * 16.0f + 0.5f);
+    unsigned int h = (unsigned int)qx * 73856093u ^ (unsigned int)qy * 19349663u ^
+                     (unsigned int)qz * 83492791u ^ (unsigned int)distanceCell * 2654435761u;
+    return h & (kPlaneBuckets - 1);
+}
+
+int DistanceCell(float d) {
+    return (int)floorf(d / 4.0f);
+}
+
+bool MakePlaneTriangle(const WorldVertex& a, const WorldVertex& b, const WorldVertex& c,
+                       PlaneTriangle& out) {
+    FaceNormal(a, b, c, out.n);
+    if (!Normalise(out.n)) {
+        return false;
+    }
+    const WorldVertex* v[3] = { &a, &b, &c };
+    for (int i = 0; i < 3; ++i) {
+        out.p[i][0] = v[i]->x; out.p[i][1] = v[i]->y; out.p[i][2] = v[i]->z;
+    }
+    out.d = Dot(out.n, out.p[0]);
+    return true;
+}
+
+// Separating-axis test in the shared plane, demanding a real overlap rather than contact.
+bool TrianglesOverlap(const PlaneTriangle& a, const PlaneTriangle& b) {
+    const float axis[3] = { fabsf(a.n[0]) < 0.9f ? 1.0f : 0.0f, fabsf(a.n[0]) < 0.9f ? 0.0f : 1.0f,
+                            0.0f };
+    float u[3], w[3];
+    Cross(a.n, axis, u);
+    Normalise(u);
+    Cross(a.n, u, w);
+    float pa[3][2], pb[3][2];
+    for (int i = 0; i < 3; ++i) {
+        pa[i][0] = Dot(a.p[i], u); pa[i][1] = Dot(a.p[i], w);
+        pb[i][0] = Dot(b.p[i], u); pb[i][1] = Dot(b.p[i], w);
+    }
+    const float (*tri[2])[2] = { pa, pb };
+    for (int t = 0; t < 2; ++t) {
+        for (int e = 0; e < 3; ++e) {
+            const float* p0 = tri[t][e];
+            const float* p1 = tri[t][(e + 1) % 3];
+            float ax = -(p1[1] - p0[1]), ay = p1[0] - p0[0];
+            const float len = sqrtf(ax * ax + ay * ay);
+            if (len < 1e-6f) {
+                continue;
+            }
+            ax /= len; ay /= len;
+            float minA = 1e30f, maxA = -1e30f, minB = 1e30f, maxB = -1e30f;
+            for (int i = 0; i < 3; ++i) {
+                const float sa = pa[i][0] * ax + pa[i][1] * ay;
+                const float sb = pb[i][0] * ax + pb[i][1] * ay;
+                if (sa < minA) minA = sa;
+                if (sa > maxA) maxA = sa;
+                if (sb < minB) minB = sb;
+                if (sb > maxB) maxB = sb;
+            }
+            if (maxA < minB + kOverlapMargin || maxB < minA + kOverlapMargin) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool LiesOnEarlierGeometry(const PlaneTriangle& t) {
+    const int cell = DistanceCell(t.d);
+    for (int dc = -1; dc <= 1; ++dc) {
+        for (int i = g_planeBucket[PlaneBucket(t.n, cell + dc)]; i >= 0;
+             i = g_planeTriangles[i].next) {
+            const PlaneTriangle& o = g_planeTriangles[i];
+            if (Dot(o.n, t.n) >= kCoplanarCos && fabsf(o.d - t.d) <= kCoplanarDistance &&
+                TrianglesOverlap(o, t)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// True when the batch models its own back faces: some triangle has a twin in the same plane,
+// facing the other way and covering it -- a zero-thickness board drawn once per side, as the
+// ticket booth's TICKETS sign is. The engine culls one side of such a board by winding. Drawn
+// with culling off, both sides are the same surface to a path tracer and the wrong one can
+// win, so these batches keep the engine's culling (see Flush).
+bool BatchModelsBackFaces(const WorldVertex* verts, const unsigned short* indices, int indexCount) {
+    const int kMaxTwinCheck = 256;
+    PlaneTriangle tris[kMaxTwinCheck];
+    int count = 0;
+    for (int i = 0; i + 2 < indexCount && count < kMaxTwinCheck; i += 3) {
+        if (MakePlaneTriangle(verts[indices[i]], verts[indices[i + 1]], verts[indices[i + 2]],
+                              tris[count])) {
+            ++count;
+        }
+    }
+    for (int a = 0; a < count; ++a) {
+        for (int b = a + 1; b < count; ++b) {
+            if (Dot(tris[a].n, tris[b].n) <= -kCoplanarCos &&
+                fabsf(tris[a].d + tris[b].d) <= kCoplanarDistance &&
+                TrianglesOverlap(tris[a], tris[b])) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// True when any of the batch's triangles is laid onto geometry drawn earlier this frame. The
+// batch's own triangles are filed afterwards, so it never matches itself.
+bool BatchIsDecal(const WorldVertex* verts, const unsigned short* indices, int indexCount) {
+    bool decal = false;
+    const int first = g_planeTriangleCount;
+    for (int i = 0; i + 2 < indexCount; i += 3) {
+        PlaneTriangle t;
+        if (!MakePlaneTriangle(verts[indices[i]], verts[indices[i + 1]], verts[indices[i + 2]], t)) {
+            continue;
+        }
+        if (!decal && LiesOnEarlierGeometry(t)) {
+            decal = true;
+        }
+        if (g_planeTriangleCount < kMaxPlaneTriangles) {
+            g_planeTriangles[g_planeTriangleCount++] = t;
+        }
+    }
+    for (int i = first; i < g_planeTriangleCount; ++i) {
+        PlaneTriangle& t = g_planeTriangles[i];
+        const unsigned int bucket = PlaneBucket(t.n, DistanceCell(t.d));
+        t.next = g_planeBucket[bucket];
+        g_planeBucket[bucket] = i;
+    }
+    return decal;
+}
+
 // ------------------------------------------------------------------ submission
 
 void BuildProjection();
 void Flush();
 void ApplyRenderStates();
 bool DrawSkybox();
-void DumpBatch(int vertexCount, bool textured, bool culled, bool sky);
+void DumpBatch(int vertexCount, bool textured, bool culled, bool sky, bool decal);
 
 // ------------------------------------------------------------------ synthesised sky
 //
@@ -860,23 +1245,9 @@ bool DrawSkybox() {
     }
     const float h = SkyboxHalfSize();
 
-    unsigned int rgb = Config::SkyboxColour() >= 0
-                     ? (unsigned int)Config::SkyboxColour()
-                     : (Device::ClearColour() & 0x00ffffffu);
-    // The engine's backdrop is a pale wash picked to sit behind a rasterised scene. As real
-    // geometry lighting a path-traced one it wants to read as sky, so it is pulled towards
-    // one -- keeping the engine's day/night changes rather than replacing them outright.
-    const int shift = Config::SkyboxBlueShift();
-    if (shift > 0) {
-        const unsigned int target = (unsigned int)Config::SkyboxBlueTarget();
-        unsigned int mixed = 0;
-        for (int c = 16; c >= 0; c -= 8) {
-            const int from = (int)((rgb >> c) & 0xff);
-            const int to   = (int)((target >> c) & 0xff);
-            mixed |= (unsigned int)(from + (to - from) * shift / 100) << c;
-        }
-        rgb = mixed;
-    }
+    const unsigned int rgb = Config::SkyboxColour() >= 0
+                           ? (unsigned int)Config::SkyboxColour()
+                           : (Device::ClearColour() & 0x00ffffffu);
     const D3DCOLOR colour = (D3DCOLOR)(0xff000000u | rgb);
 
     WorldVertex v[8];
@@ -909,8 +1280,13 @@ bool DrawSkybox() {
 
     dev->SetTexture(0, 0);
     dev->SetFVF(kWorldFVF);
-    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    // At the far plane, where Remix takes it as sky; first in the frame, so it fills every
+    // pixel, and writing no depth, so everything after it draws over it.
+    Device::SetDepthRange(1.0f, 1.0f);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
     dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetTextureStageState(0, D3DTSS_CONSTANT, 0);
     dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     dev->SetRenderState(D3DRS_LIGHTING, FALSE);
@@ -924,12 +1300,10 @@ bool DrawSkybox() {
     dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
     dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-    const HRESULT hr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, 8, 12,
-                                                   kBoxIndices, D3DFMT_INDEX16,
-                                                   v, sizeof(WorldVertex));
-    if (FAILED(hr) && g_skyboxLogged < 4) {
+    const bool drawn = Device::DrawTriangles(v, sizeof(WorldVertex), 8, kBoxIndices, 36);
+    if (!drawn && g_skyboxLogged < 4) {
         ++g_skyboxLogged;
-        LogLine("    skybox draw failed hr=0x%08lx", (unsigned long)hr);
+        LogLine("    skybox draw failed");
     } else if (g_skyboxLogged < 2) {
         ++g_skyboxLogged;
         LogLine("    skybox: half-size %.0f at eye (%.0f, %.0f, %.0f), colour 0x%06x",
@@ -949,7 +1323,7 @@ void Flush() {
         return;
     }
     // Indices are bytes and may point past what this batch actually uploaded; clamping the
-    // declared vertex count keeps DrawIndexedPrimitiveUP inside the array either way.
+    // declared vertex count keeps the draw inside the array either way.
     int maxIndex = 0;
     for (int i = 0; i < g_indexCount; ++i) {
         if (g_indices[i] > maxIndex) {
@@ -959,6 +1333,13 @@ void Flush() {
     const int vertexCount = (maxIndex + 1 > g_highWater) ? maxIndex + 1 : g_highWater;
     if (Config::LogEveryCall()) {
         LogLine("    flush: %d tris, %d verts", g_indexCount / 3, vertexCount);
+    }
+
+    // The frame's first world batch: any 2D quads already drawn were its backdrop, and go
+    // down now, behind everything, before the world pipeline takes the device back.
+    if (!Device::WorldHasDrawn()) {
+        Device::NoteWorldDraw();
+        Pcx::DrawPendingAsBackdrop();
     }
 
     // The 2D layer leaves the device set up for screen-space quads, so reclaim it before
@@ -972,9 +1353,9 @@ void Flush() {
     // a camera has arrived -- the view matrix reaches the plugin mid-list, not at frame
     // start. This is the first draw that follows it.
     //
-    // It is drawn with depth off, so it would erase anything already on screen. The 2D layer
-    // is depth-free too, so a frame that opens with a full-screen 2D backdrop and only then
-    // draws world geometry gets no sky rather than a painted-over menu.
+    // It fills every pixel at the far plane, so a frame that opens with a full-screen 2D
+    // backdrop -- which sits at the far plane too -- gets no box rather than a painted-over
+    // menu.
     if (!g_skyboxDrawn && Config::SynthesiseSkybox()) {
         if (!Device::FrameHasDrawn()) {
             // Claimed only on success: a camera that is not usable yet must leave the frame
@@ -999,65 +1380,47 @@ void Flush() {
     // start, where it would still be the previous frame's.
     BuildProjection();
 
-    // CCW matches the original directly: the engine's negated Y scale cancels out through the
-    // projection and viewport, so the winding is not reversed.
-    const bool cull = (g_renderFlags & kFlagBackfaceCull) != 0
-                   && !Config::DisableBackfaceCulling();
-    dev->SetRenderState(D3DRS_CULLMODE, cull ? D3DCULL_CCW : D3DCULL_NONE);
-
-    // Blending, per batch, and opaque unless the batch genuinely needs otherwise.
-    //
-    // World draws are not blended by default, because the original does not blend them: a
-    // census of every SetRenderState it makes
-    // shows SRCBLEND set to ONE at three sites and SRCALPHA at only two, and no combiner mode
-    // requests a translucent blend at all -- the two that touch the blend factors set
-    // ONE / ZERO, which is opaque and is also the DX6 device default the rest inherit.
-    //
-    // It is not a cosmetic difference under a path tracer. RTX Remix classifies an
-    // alpha-blended draw as a translucent material, so blending everything would turn solid
-    // house walls into red glass you could see the furniture through.
-    //
-    // Two cases genuinely blend: format 3 is the only palette carrying graduated alpha (the
-    // effects and sky atlas), and combiner mode 0x16 is the one the original sets
-    // D3DTBLEND_ADD for.
     // Whether this batch has a texture at all is the mode's decision as much as the
     // selection's -- see kModeBindsTexture. Everything downstream that reads the current set
-    // has to go through this, or a suppressed bind still steers the blend, the depth mode and
-    // the census.
+    // has to go through this, or a suppressed bind still steers the depth mode and the census.
     const bool modeTextured = ModeBindsTexture();
     const int activeTexture = modeTextured ? g_currentTexture : -1;
     if (!modeTextured && g_currentTexture >= 0) {
         ++g_modeSuppressedBinds;
     }
-    const int textureFormat = (activeTexture >= 0) ? Texture::Format(activeTexture) : -1;
-    const bool additive = (g_combinerMode == 0x16);
-    const bool graduated = (textureFormat == 3);
-    if (additive) {
-        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-        dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
-        dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ONE);
-    } else if (graduated) {
-        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+
+    // Blending is the render mode's (opcode 0xb9), exactly as the original sets it: clear bits
+    // 0x30000 mean SRCALPHA / INVSRCALPHA, set ones ONE / ZERO. The combiner mode has no say --
+    // and under RTX Remix that distinction matters, because Remix classifies a blended draw as
+    // translucent: blending solid walls turns them into glass. The game blends its clouds,
+    // fire, flame trails and blob shadows, and nothing else.
+    const bool textureOnly = g_combinerMode == kModeTextureOnly;
+    const bool blend = RenderModeBlends(g_renderMode) && !textureOnly;
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, blend ? TRUE : FALSE);
+    if (blend) {
         dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
         dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-    } else {
-        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     }
-    if (additive || graduated) { ++g_blendedFlushes; } else { ++g_opaqueFlushes; }
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, textureOnly ? FALSE : TRUE);
+    if (blend) { ++g_blendedFlushes; } else { ++g_opaqueFlushes; }
     if (activeTexture < 0) {
         RecordUntexturedBatch(g_combinerMode,
                               Config::ApplyConstantColour() ? ConstantColourForBatch()
                                                             : 0xffffffffu,
-                              additive ? 1 : (graduated ? 2 : 0),
-                              (unsigned int)(g_indexCount / 3));
+                              blend ? 1 : 0, (unsigned int)(g_indexCount / 3));
     }
 
-    // A skydome has no business in the depth buffer, and drawing it depth-free is also the
-    // shape Remix's sky auto-detection looks for.
-    const bool sky = Config::DepthlessSky() && Texture::IsSkySet(activeTexture);
-    dev->SetRenderState(D3DRS_ZENABLE, sky ? D3DZB_FALSE : D3DZB_TRUE);
-    dev->SetRenderState(D3DRS_ZWRITEENABLE, sky ? FALSE : TRUE);
+    // Depth, also the render mode's: Z_CMP tests (LESSEQUAL, else ALWAYS), Z_UPD writes. A sky
+    // batch goes to the far plane -- behind everything however late it is drawn, and into
+    // Remix's sky layer -- and never writes.
+    const bool sky = Texture::IsSkySet(activeTexture);
     if (sky) { ++g_skyBatches; }
+    Device::SetDepthRange(sky ? 1.0f : 0.0f, 1.0f);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    dev->SetRenderState(D3DRS_ZFUNC, (g_renderMode & kRenderModeZCompare) ? D3DCMP_LESSEQUAL
+                                                                          : D3DCMP_ALWAYS);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE,
+                        (!sky && (g_renderMode & kRenderModeZUpdate)) ? TRUE : FALSE);
 
     IDirect3DTexture9* tex = (activeTexture >= 0)
                            ? Texture::GetTexture(activeTexture, g_currentSubA, g_currentSubB)
@@ -1081,19 +1444,25 @@ void Flush() {
     if (g_renderFlags & kFlagBackfaceCull) { ++g_audit.culledBatches; }
     else { ++g_audit.unculledBatches; }
     dev->SetTexture(0, tex);
-    // Modulating against diffuse keeps pre-lit vertex colours meaningful; lit geometry
-    // carries white so the texture passes through untouched.
-    //
-    // With no texture bound, D3DTA_TEXTURE is undefined by the D3D9 specification -- it was
-    // selected here regardless, which is what drew every untextured batch flat white. An
-    // untextured batch has to fall back to the vertex colour, which is where its colour
-    // actually is.
-    dev->SetTextureStageState(0, D3DTSS_COLOROP, tex ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
-    dev->SetTextureStageState(0, D3DTSS_COLORARG1, tex ? D3DTA_TEXTURE : D3DTA_DIFFUSE);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, tex ? D3DTA_TEXTURE : D3DTA_DIFFUSE);
+    // The texture stage as the mode's TEXTUREMAPBLEND has it: the texture modulated by the
+    // vertex colour and alpha, added to the colour (0x16), or taken alone (0x28). With no
+    // texture bound D3DTA_TEXTURE is undefined by the D3D9 specification, so an untextured
+    // batch is its vertex colour -- which is where its colour actually is.
+    const D3DTEXTUREOP colourOp = !tex ? D3DTOP_SELECTARG2
+                                : textureOnly ? D3DTOP_SELECTARG1
+                                : g_combinerMode == kModeAddsTexture ? D3DTOP_ADD
+                                : D3DTOP_MODULATE;
+    const D3DTEXTUREOP alphaOp = !tex ? D3DTOP_SELECTARG2
+                               : textureOnly ? D3DTOP_SELECTARG1
+                               : D3DTOP_MODULATE;
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, colourOp);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, alphaOp);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
 
-    // The combiner constant, applied here rather than when the vertices were loaded, so a
+    // The combiner constants, applied here rather than when the vertices were loaded, so a
     // colour the engine sets after loading a block still reaches the triangles drawn from it.
     // Kept in the vertex colour rather than a texture-stage factor deliberately: a vertex
     // colour survives Remix's material conversion, where a fixed-function stage factor need
@@ -1102,18 +1471,16 @@ void Flush() {
         const unsigned int k = Config::ApplyConstantColour() ? ConstantColourForBatch()
                                                             : 0xffffffffu;
         const unsigned int kr = k & 0xff, kg = (k >> 8) & 0xff, kb = (k >> 16) & 0xff;
+        const int constantAlpha = ConstantAlphaForBatch();
         if (k == 0xffffffffu) { ++g_untintedUploads; } else { ++g_tintedUploads; }
         for (int i = 0; i < vertexCount; ++i) {
             const unsigned int u = g_slotUntinted[i];
             const unsigned int r = (((u >> 16) & 0xffu) * kr) / 255u;
             const unsigned int g = (((u >> 8) & 0xffu) * kg) / 255u;
             const unsigned int b = ((u & 0xffu) * kb) / 255u;
-            g_vertices[i].diffuse = (D3DCOLOR)(0xff000000u | (r << 16) | (g << 8) | b);
+            const unsigned int a = constantAlpha >= 0 ? (unsigned int)constantAlpha : (u >> 24);
+            g_vertices[i].diffuse = (D3DCOLOR)((a << 24) | (r << 16) | (g << 8) | b);
         }
-    }
-
-    if (g_dumpingFrame) {
-        DumpBatch(vertexCount, tex != 0, cull, sky);
     }
 
     // Hand over ONLY the vertices this batch actually indexes.
@@ -1127,26 +1494,29 @@ void Flush() {
     //
     // Compacting makes the hashed data exactly the drawn geometry, so a wall that does not
     // change keeps its identity from frame to frame.
-    int compactCount = 0;
-    for (int i = 0; i < vertexCount; ++i) {
-        g_compactMap[i] = -1;
-    }
-    for (int i = 0; i < g_indexCount; ++i) {
-        const unsigned short src = g_indices[i];
-        if (src < vertexCount && g_compactMap[src] < 0) {
-            g_compactMap[src] = compactCount;
-            g_compactVertices[compactCount++] = g_vertices[src];
-        }
-        g_compactIndices[i] = (unsigned short)(src < vertexCount ? g_compactMap[src] : 0);
+    const int compactCount = CompactBatch(vertexCount);
+
+    // CCW matches the original directly: the engine's negated Y scale cancels out through the
+    // projection and viewport, so the winding is not reversed. With
+    // DisableBackfaceCulling the engine's request is overridden, except for a batch that
+    // models its own back faces, which only renders right culled.
+    const bool engineCulls = (g_renderFlags & kFlagBackfaceCull) != 0;
+    const bool cull = engineCulls &&
+                      (!Config::DisableBackfaceCulling() ||
+                       BatchModelsBackFaces(g_compactVertices, g_compactIndices, g_indexCount));
+    dev->SetRenderState(D3DRS_CULLMODE, cull ? D3DCULL_CCW : D3DCULL_NONE);
+
+    const bool decal = !sky && !blend && BatchIsDecal(g_compactVertices, g_compactIndices,
+                                                      g_indexCount);
+    if (decal) { ++g_decalBatches; }
+    dev->SetTextureStageState(0, D3DTSS_CONSTANT, decal ? kRemixDecalMarker : 0);
+
+    if (g_dumpingFrame) {
+        DumpBatch(compactCount, tex != 0, cull, sky, decal);
     }
 
-    HRESULT hr = dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, compactCount,
-                                             g_indexCount / 3,
-                                             g_compactIndices, D3DFMT_INDEX16,
-                                             g_compactVertices, sizeof(WorldVertex));
-    if (FAILED(hr)) {
-        LogLine("    DrawIndexedPrimitiveUP failed hr=0x%08lx", (unsigned long)hr);
-    }
+    Device::DrawTriangles(g_compactVertices, sizeof(WorldVertex), compactCount,
+                          g_compactIndices, g_indexCount);
     g_indexCount = 0;
 }
 
@@ -1209,12 +1579,29 @@ void TransformToWorld(const D3DMATRIX& m, float x, float y, float z,
     oz = x * f[2] + y * f[6] + z * f[10] + f[14];
 }
 
-void RotateToWorld(const D3DMATRIX& m, float x, float y, float z,
+// Normals transform by the inverse transpose of the model matrix, not by the matrix: a model
+// scaled more along one axis than another -- the intro's planets are -- would otherwise tilt
+// its normals towards the stretched axis and shade the surface as though it were dented.
+// Under the row-vector convention the inverse transpose is the cofactor matrix over the
+// determinant, and only the direction is wanted, so the cofactors alone do, sign-corrected
+// for a mirroring matrix.
+void NormalToWorld(const D3DMATRIX& m, float x, float y, float z,
                    float& ox, float& oy, float& oz) {
     const float* f = &m._11;
-    ox = x * f[0] + y * f[4] + z * f[8];
-    oy = x * f[1] + y * f[5] + z * f[9];
-    oz = x * f[2] + y * f[6] + z * f[10];
+    const float c00 = f[5] * f[10] - f[6] * f[9];
+    const float c01 = f[6] * f[8]  - f[4] * f[10];
+    const float c02 = f[4] * f[9]  - f[5] * f[8];
+    const float c10 = f[2] * f[9]  - f[1] * f[10];
+    const float c11 = f[0] * f[10] - f[2] * f[8];
+    const float c12 = f[1] * f[8]  - f[0] * f[9];
+    const float c20 = f[1] * f[6]  - f[2] * f[5];
+    const float c21 = f[2] * f[4]  - f[0] * f[6];
+    const float c22 = f[0] * f[5]  - f[1] * f[4];
+    const float det = f[0] * c00 + f[1] * c01 + f[2] * c02;
+    const float s = det < 0.0f ? -1.0f : 1.0f;
+    ox = s * (x * c00 + y * c10 + z * c20);
+    oy = s * (x * c01 + y * c11 + z * c21);
+    oz = s * (x * c02 + y * c12 + z * c22);
 }
 
 void UploadVertices(const SourceVertex* src, int count, int destSlot) {
@@ -1282,16 +1669,13 @@ void UploadVertices(const SourceVertex* src, int count, int destSlot) {
         TransformToWorld(model, (float)s.x, (float)s.y, (float)s.z, d.x, d.y, d.z);
 
         if (lit) {
-            RotateToWorld(model,
+            NormalToWorld(model,
                           (float)s.nx * (1.0f / 127.0f),
                           (float)s.ny * (1.0f / 127.0f),
                           (float)s.nz * (1.0f / 127.0f),
                           d.nx, d.ny, d.nz);
-            // Model matrices carry scale, so rotating a unit normal by one does not leave it
-            // unit length (it is not zero, though). The engine's own rasteriser never noticed, because
-            // it lit in software and D3D lighting is off here either way. A path tracer does
-            // notice: it shades with whatever normal it is handed, and a normal whose length
-            // is wrong shades a flat wall as though it were curved.
+            // A path tracer shades with whatever normal it is handed, and one whose length is
+            // wrong shades a flat wall as though it were curved.
             const float len2 = d.nx * d.nx + d.ny * d.ny + d.nz * d.nz;
             if (len2 > 1e-12f) {
                 const float inv = 1.0f / sqrtf(len2);
@@ -1300,20 +1684,24 @@ void UploadVertices(const SourceVertex* src, int count, int destSlot) {
                 d.nz *= inv;
             }
             // Lit vertices take their colour from the constant alone, so white is what is
-            // left once the constant is factored back out.
+            // left once the constant is factored back out; their four bytes are the normal,
+            // so their alpha is opaque unless the mode supplies one.
             g_slotUntinted[destSlot + i] = 0xffffffffu;
         } else {
+            // Computed from the triangles when the batch is drawn (CompactBatch).
             d.nx = 0.0f;
             d.ny = 1.0f;
             d.nz = 0.0f;
             // The four source bytes sit in memory as r, g, b, a -- the original pairs byte
             // +0 with the constant colour's red channel. D3DCOLOR is 0xAARRGGBB, so red and
-            // blue swap on the way in; taking the dword as-is tinted the whole world
-            // backwards.
+            // blue swap on the way in; taken as-is, the dword would tint the whole world
+            // backwards. The alpha byte is the vertex's own, which the original keeps
+            // whenever the mode supplies no constant alpha.
             const unsigned int c = s.bgra;
-            g_slotUntinted[destSlot + i] = 0xff000000u | ((c & 0x000000ffu) << 16) |
+            g_slotUntinted[destSlot + i] = (c & 0xff000000u) | ((c & 0x000000ffu) << 16) |
                                            (((c >> 8) & 0xffu) << 8) | ((c >> 16) & 0xffu);
         }
+        g_slotLit[destSlot + i] = lit ? 1 : 0;
         // Filled properly at draw time, when the constant that actually applies is known.
         d.diffuse = g_slotUntinted[destSlot + i];
         d.u = s.u;
@@ -1407,7 +1795,7 @@ void BuildProjection() {
 // it is lit by normals that do not point anywhere sensible, and whether the engine asked for
 // environment-map texture coordinates -- which this renderer does not generate, so such a
 // surface samples its texture somewhere other than where the engine intended.
-void DumpBatch(int vertexCount, bool textured, bool culled, bool sky) {
+void DumpBatch(int vertexCount, bool textured, bool culled, bool sky, bool decal) {
     ++g_dumpBatch;
 
     char texture[160];
@@ -1427,8 +1815,8 @@ void DumpBatch(int vertexCount, bool textured, bool culled, bool sky) {
     float hi[3] = { -1e30f, -1e30f, -1e30f };
     int zeroNormals = 0;
     int badLengthNormals = 0;
-    for (int i = 0; i < vertexCount && i < kMaxVertices; ++i) {
-        const WorldVertex& v = g_vertices[i];
+    for (int i = 0; i < vertexCount; ++i) {
+        const WorldVertex& v = g_compactVertices[i];
         const float p[3] = { v.x, v.y, v.z };
         for (int c = 0; c < 3; ++c) {
             if (p[c] < lo[c]) lo[c] = p[c];
@@ -1449,13 +1837,13 @@ void DumpBatch(int vertexCount, bool textured, bool culled, bool sky) {
             (g_renderMode & kRenderModeZUpdate) ? " zupd" : " NOZWRITE",
             RenderModeBlends(g_renderMode) ? " BLEND" : "",
             RenderModeIsDecal(g_renderMode) ? " DECAL" : "");
-    LogLine("            %3d tris %3d verts  flags=0x%06x%s%s%s%s  mode=0x%02x const=%06x"
+    LogLine("            %3d tris %3d verts  flags=0x%06x%s%s%s%s%s  mode=0x%02x const=%06x"
             "  %s%s",
             g_indexCount / 3, vertexCount, g_renderFlags,
             (g_renderFlags & kFlagLighting) ? " lit" : " unlit",
             (g_renderFlags & 0x40000) ? " TEXGEN-ENV" : "",
             culled ? " cull" : "",
-            sky ? " sky" : "",
+            sky ? " sky" : "", decal ? " DECAL-OVERLAY" : "",
             g_combinerMode < 0 ? 0xff : g_combinerMode,
             constant & 0x00ffffffu,
             zeroNormals ? "ZERO-NORMALS " : "",
@@ -1466,6 +1854,19 @@ void DumpBatch(int vertexCount, bool textured, bool culled, bool sky) {
     }
     LogLine("            bbox x[%.0f..%.0f] y[%.0f..%.0f] z[%.0f..%.0f]",
             lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+    // The plane of each triangle of a small batch: what decides whether a sign lies on its
+    // board, and which way a face is wound.
+    if (g_indexCount / 3 <= 16) {
+        for (int i = 0; i + 2 < g_indexCount; i += 3) {
+            PlaneTriangle t;
+            if (MakePlaneTriangle(g_compactVertices[g_compactIndices[i]],
+                                  g_compactVertices[g_compactIndices[i + 1]],
+                                  g_compactVertices[g_compactIndices[i + 2]], t)) {
+                LogLine("            tri n(%.3f %.3f %.3f) d=%.1f  p0(%.0f %.0f %.0f)",
+                        t.n[0], t.n[1], t.n[2], t.d, t.p[0][0], t.p[0][1], t.p[0][2]);
+            }
+        }
+    }
 }
 
 void ApplyRenderStates() {
@@ -1475,6 +1876,9 @@ void ApplyRenderStates() {
     }
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
     dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    dev->SetTextureStageState(0, D3DTSS_CONSTANT, 0);
+    Device::SetDepthRange(0.0f, 1.0f);
     dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
     // Cull mode is per-batch state, applied at draw time in Flush().
     dev->SetRenderState(D3DRS_LIGHTING, FALSE);
@@ -1547,6 +1951,7 @@ void Geometry::BeginFrame() {
     g_skipMask = 0;
     g_skipCounter = 0;
     g_skyboxDrawn = false;
+    ResetDecalPlanes();
     Identity(g_modelStack[0]);
     if (g_viewDirty) {
         g_viewDirty = false;
@@ -1941,7 +2346,8 @@ void Geometry::LogTextureStats() {
     LogLine("    texture stats: %d selects, %d textured flushes, %d untextured, %d sky",
             g_textureSelects, g_texturedFlushes, g_untexturedFlushes, g_skyBatches);
     LogLine("    lit tris %u / unlit tris %u", g_litTris, g_unlitTris);
-    LogLine("    flushes opaque %u / blended %u", g_opaqueFlushes, g_blendedFlushes);
+    LogLine("    flushes opaque %u / blended %u, decals laid onto earlier geometry %u",
+            g_opaqueFlushes, g_blendedFlushes, g_decalBatches);
     LogLine("    MOUTH selector operands, every one counted (%u selects):", g_mouthSelects);
     for (int i = 0; i < g_mouthOperandCount; ++i) {
         const MouthOperand& m = g_mouthOperands[i];

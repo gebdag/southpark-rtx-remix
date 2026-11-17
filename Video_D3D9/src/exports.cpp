@@ -520,6 +520,8 @@ GFXAPI void GFXDLL_EndScene(void) {
     EnsureRoutes();
     LogCall("GFXDLL_EndScene");
     Geometry::EndFrame();
+    // 2D quads still waiting belong to a frame that drew no world: a 2D screen.
+    Pcx::DrawPendingAsScreen();
     Geometry::LogGeometryAudit();
     Lookdev::OnEndScene();
     MaybeScreenshot();
