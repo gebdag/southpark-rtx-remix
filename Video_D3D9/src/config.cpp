@@ -31,7 +31,6 @@ int g_displayY = -1;
 float g_aspectRatio = Config::kOriginalAspect;
 bool g_pauseWhenUnfocused = true;
 
-bool g_disableBackfaceCulling  = true;
 bool g_disableTriangleSkipMask = false;
 bool g_disableOffscreenQuadReject = false;
 bool g_useEngineBackgroundColour = true;
@@ -79,11 +78,6 @@ const char* kDefaultIni =
     "PauseWhenUnfocused=1\r\n"
     "\r\n"
     "[Culling]\r\n"
-    "; Force D3DCULL_NONE. The engine asks for backface culling on essentially every batch\r\n"
-    "; through render-flag bit 0x2000; with it on, a path tracer never sees those faces and\r\n"
-    "; thin geometry lights and shadows incorrectly. 0 follows the engine.\r\n"
-    "DisableBackfaceCulling=1\r\n"
-    "\r\n"
     "; Ignore the per-triangle skip bitmask (display-list opcodes 0xa8 / 0xa7): 1 draws the\r\n"
     "; triangles the engine marks to be skipped.\r\n"
     "DisableTriangleSkipMask=0\r\n"
@@ -184,6 +178,12 @@ const char* kDefaultIni =
     "; entitled to the pointer.\r\n"
     "KeepCursorVisible=1\r\n"
     "\r\n"
+    "; Gamepads: the game sees one joystick, fed by an Xbox pad (XInput) or a DualSense,\r\n"
+    "; DualShock 4 or other pad, with a twin-stick layout -- left stick walk and strafe, right\r\n"
+    "; stick turn and look, RT fire, A jump, Start pause. 0 leaves the game's own joystick\r\n"
+    "; handling alone.\r\n"
+    "Controller=1\r\n"
+    "\r\n"
     "[Textures]\r\n"
     "; How to read a format-3 palette entry. Format 3 is the effect atlas -- blood, smoke,\r\n"
     "; explosions, splats, the sky -- and its entries are not packed colour: the shape is\r\n"
@@ -237,7 +237,7 @@ const char* kDefaultIni =
     "; Pre-lit geometry -- most of the world -- carries vertex colours instead of normals, so\r\n"
     "; its normals are computed from its triangles. Faces meeting at less than this angle, in\r\n"
     "; degrees, share smoothed normals; sharper edges stay hard. 0 makes every face flat.\r\n"
-    "SmoothingAngle=45\r\n"
+    "SmoothingAngle=80\r\n"
     "\r\n"
     "[Debug]\r\n"
     "; Two keys are always live and need no setting here:\r\n"
@@ -272,7 +272,21 @@ const char* kDefaultIni =
     "ScaleByReach=1\r\n"
     "SwapRedBlue=0\r\n"
     "Markers=0\r\n"
-    "KeepFallbackLight=1\r\n";
+    "KeepFallbackLight=1\r\n"
+    "; Level light zones: the lamps and fills a level's designers placed (the yellow and blue\r\n"
+    "; light in Chef's room). The game only tints objects with them; these send them to Remix\r\n"
+    "; as lights. ZoneMaxRadius: zones larger than this, in world units, are street-wide fills\r\n"
+    "; rather than lamps, and are not sent.\r\n"
+    "ZoneLights=1\r\n"
+    "ZoneRadianceScale=1500\r\n"
+    "ZoneMaxRadius=512\r\n"
+    "; PlayerLight: a soft light above the camera, coloured by the light the game gives an\r\n"
+    "; object standing there, so rooms lit only by the level's large fills do not go black.\r\n"
+    "; It travels with the player. PlayerLightReach works like a zone's radius for brightness.\r\n"
+    "PlayerLight=0\r\n"
+    "PlayerLightScale=1500\r\n"
+    "PlayerLightReach=512\r\n"
+    "PlayerLightHeight=40\r\n";
 
 bool ReadBool(const char* section, const char* key, bool fallback) {
     return GetPrivateProfileIntA(section, key, fallback ? 1 : 0, g_iniPath) != 0;
@@ -325,7 +339,6 @@ void Config::Load(void* self) {
         }
     }
 
-    g_disableBackfaceCulling     = ReadBool("Culling", "DisableBackfaceCulling", true);
     g_disableTriangleSkipMask    = ReadBool("Culling", "DisableTriangleSkipMask", false);
     g_disableOffscreenQuadReject = ReadBool("Culling", "DisableOffscreenQuadReject", false);
     g_useEngineBackgroundColour  = ReadBool("Sky", "UseEngineBackgroundColour", true);
@@ -367,7 +380,7 @@ void Config::Load(void* self) {
             g_skyboxColour = -1;
         }
     }
-    g_smoothingAngle = (float)GetPrivateProfileIntA("Normals", "SmoothingAngle", 45, g_iniPath);
+    g_smoothingAngle = (float)GetPrivateProfileIntA("Normals", "SmoothingAngle", 80, g_iniPath);
     if (g_smoothingAngle < 0.0f)   g_smoothingAngle = 0.0f;
     if (g_smoothingAngle > 180.0f) g_smoothingAngle = 180.0f;
     g_screenshotFrame = GetPrivateProfileIntA("Debug", "ScreenshotFrame", 0, g_iniPath);
@@ -412,8 +425,8 @@ void Config::Load(void* self) {
             g_displayWindowed ? "windowed" : "borderless", g_displayWidth, g_displayHeight,
             g_displayX, g_displayY, g_aspectRatio, g_aspectRatio == 0.0f ? " (window)" : "",
             g_pauseWhenUnfocused);
-    LogLine("    DisableBackfaceCulling=%d DisableTriangleSkipMask=%d DisableOffscreenQuadReject=%d",
-            g_disableBackfaceCulling, g_disableTriangleSkipMask, g_disableOffscreenQuadReject);
+    LogLine("    DisableTriangleSkipMask=%d DisableOffscreenQuadReject=%d",
+            g_disableTriangleSkipMask, g_disableOffscreenQuadReject);
     LogLine("    UseEngineBackgroundColour=%d SkyTextureNames=%s SmoothingAngle=%.0f",
             g_useEngineBackgroundColour, g_skyNames, g_smoothingAngle);
     LogLine("    LoadEntireMap=%d DisableFrustumTest=%d UncullRooms=%d UncullEntities=%d "
@@ -438,7 +451,6 @@ void Config::Load(void* self) {
     LogSetCallLogging(g_logEveryCall);
 }
 
-bool Config::DisableBackfaceCulling()     { return g_disableBackfaceCulling; }
 bool Config::DisableTriangleSkipMask()    { return g_disableTriangleSkipMask; }
 bool Config::DisableOffscreenQuadReject() { return g_disableOffscreenQuadReject; }
 bool Config::UseEngineBackgroundColour()  { return g_useEngineBackgroundColour; }

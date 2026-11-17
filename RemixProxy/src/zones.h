@@ -30,6 +30,14 @@ struct Zone {
     float axis[3] = {};        // world direction: a cone's axis, a box's light direction
 };
 
+// The light the engine gives an object at one point (FUN_00441d90): an ambient colour and a
+// directional one, 0..255 per channel. Where no zone reaches, the engine's default light.
+struct PointLight {
+    bool valid = false;
+    float ambient[3] = {};
+    float directional[3] = {};
+};
+
 // Checks this is the expected game build and hooks the release of the zone sets. False leaves
 // Latest() empty.
 bool Install();
@@ -37,5 +45,9 @@ bool Install();
 // The zones registered in the engine's last world tick, each once: neighbouring sections
 // repeat zones that cross between them.
 std::vector<Zone> Latest();
+
+// Where LightAtProbe() samples, in world space; sampled in the engine's next world tick.
+void SetProbe(const float* position);
+PointLight LightAtProbe();
 
 } // namespace Zones

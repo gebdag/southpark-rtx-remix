@@ -81,6 +81,13 @@ struct Settings {
     // Most zones are not lamps but fills hundreds to thousands of units across, hung over the
     // town to tint whole streets. As lights they would be suns.
     float zoneMaxRadius = 512.0f;
+    // A soft light above the camera, coloured by the light the engine gives an object standing
+    // there. It keeps rooms that have only the level's large fills -- no lamp-sized zone to send --
+    // from going black, at the cost of a light that travels with the player.
+    bool playerLight = false;
+    float playerLightScale = 1500.0f;
+    float playerLightReach = 512.0f;
+    float playerLightHeight = 40.0f;
 } g_settings;
 
 // The test light: one light of the same kind, placed by hand, to see the Remix side work without
@@ -321,6 +328,10 @@ void Lights::Init(const char* ini) {
     g_settings.zoneLights = ReadBool(ini, "ZoneLights", g_settings.zoneLights);
     g_settings.zoneRadianceScale = ReadFloat(ini, "ZoneRadianceScale", g_settings.zoneRadianceScale);
     g_settings.zoneMaxRadius = ReadFloat(ini, "ZoneMaxRadius", g_settings.zoneMaxRadius);
+    g_settings.playerLight = ReadBool(ini, "PlayerLight", g_settings.playerLight);
+    g_settings.playerLightScale = ReadFloat(ini, "PlayerLightScale", g_settings.playerLightScale);
+    g_settings.playerLightReach = ReadFloat(ini, "PlayerLightReach", g_settings.playerLightReach);
+    g_settings.playerLightHeight = ReadFloat(ini, "PlayerLightHeight", g_settings.playerLightHeight);
 
     g_gameSupported = Matches(0x00426970, kUploadPrologue, sizeof(kUploadPrologue)) &&
                       Matches(0x0043f470, kLookupPrologue, sizeof(kLookupPrologue));
@@ -340,6 +351,9 @@ void Lights::OnSetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* m) {
     if (state == D3DTS_VIEW && memcmp(m, &kIdentity, sizeof(*m)) != 0) {
         memcpy(g_view, m, sizeof(g_view));
         g_haveView = true;
+        float camera[3], forward[3];
+        Camera(camera, forward);
+        Zones::SetProbe(camera);
     } else if (state == D3DTS_PROJECTION && m->_34 != 0.0f) {
         memcpy(g_projection, m, sizeof(g_projection));
         g_haveProjection = true;
@@ -387,6 +401,19 @@ void Lights::SubmitFrame() {
             ZoneRgb(z, rgb);
             SubmitLight(Hash(name), z.centre, rgb, Brightness(1.0f, z.radius, g_settings.zoneRadianceScale),
                         z.shape == Zones::Cone ? z.axis : nullptr);
+        }
+    }
+    if (g_settings.playerLight) {
+        const Zones::PointLight engine = Zones::LightAtProbe();
+        float camera[3], forward[3];
+        if (engine.valid && Camera(camera, forward)) {
+            camera[1] += g_settings.playerLightHeight;
+            float rgb[3];
+            for (int c = 0; c < 3; ++c) {
+                rgb[c] = (engine.ambient[c] + engine.directional[c]) / 255.0f;
+            }
+            SubmitLight(Hash("sp_player_light"), camera, rgb,
+                        Brightness(1.0f, g_settings.playerLightReach, g_settings.playerLightScale));
         }
     }
     if (g_test.enabled) {
@@ -503,6 +530,22 @@ void Lights::DrawPanel() {
                       z.centre[1], z.centre[2], distance, z.flickers ? "  flicker" : "");
         }
         Ui::LabelDim("%d more not sent: larger than the limit, boxes, or subtractive.", notSent);
+    }
+
+    Ui::Heading("Player light");
+    Ui::Checkbox("Light above the camera, coloured by the game's light there", &g_settings.playerLight);
+    Ui::Slider("Player light scale", &g_settings.playerLightScale, 10.0f, 100000.0f, "%.0f", true);
+    Ui::Slider("Player light reach", &g_settings.playerLightReach, 50.0f, 4096.0f, "%.0f units", true);
+    Ui::Slider("Height above the camera", &g_settings.playerLightHeight, 0.0f, 200.0f, "%.0f units");
+    {
+        const Zones::PointLight engine = Zones::LightAtProbe();
+        if (engine.valid) {
+            Ui::LabelDim("Game's light here: ambient %.0f %.0f %.0f, directional %.0f %.0f %.0f", engine.ambient[0],
+                         engine.ambient[1], engine.ambient[2], engine.directional[0], engine.directional[1],
+                         engine.directional[2]);
+        } else {
+            Ui::LabelDim("Game's light here: not sampled yet.");
+        }
     }
 
     Ui::Heading("Test light");

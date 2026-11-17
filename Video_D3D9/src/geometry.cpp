@@ -3,6 +3,7 @@
 #include "device.h"
 #include "log.h"
 #include "lookdev.h"
+#include "normal_cache.h"
 #include "pcx.h"
 #include "texture.h"
 
@@ -50,6 +51,9 @@ enum Opcode {
     // Selects one of 41 colour-combiner modes, and with it whether the constant colours
     // above participate at all. Without this the tint is applied to everything.
     OP_COMBINER_MODE = 0xaf,
+    // Sub-command 0 (word0 bits 16..31 clear) switches the first-person weapon's depth
+    // treatment on (word1 1) and off (0); see g_foreground.
+    OP_FOREGROUND = 0xae,
     // Variable-length commands. Every other opcode is exactly 8 bytes; these three consume
     // extra words, and treating them as fixed-length desynchronises the whole walk -- after
     // which operand bytes get decoded as opcodes.
@@ -287,6 +291,19 @@ const unsigned int kRenderModeZModeMask = 0xc00;
 const unsigned int kRenderModeZModeDecal = 0xc00;
 const unsigned int kRenderModeOpaque   = 0x30000;
 unsigned int g_renderMode = kRenderModeZCompare | kRenderModeZUpdate | kRenderModeOpaque;
+
+// Opcode 0xae, sub-command 0: the first-person weapon. The engine places the weapon in the
+// world, 75 to 120 units in front of the camera and as big as it has to be to look right from
+// there, so on its own it sinks into any slope or wall in front of the player. The original
+// draws it while this is set with every vertex's depth pulled 0.5 towards the camera
+// (FUN_10007fc0, 0x10087f7c), so it lands in front of the world. Here the batch's viewport
+// depth range is squeezed instead, which does the same for a rasteriser and is what RTX Remix
+// looks for to treat a draw as a view model (rtx.viewModel.maxZThreshold): Remix then shrinks
+// the weapon towards the camera (rtx.viewModel.scale), where it no longer reaches the world,
+// and it covers the same pixels as before. Like the original's flag, it is never reset per
+// frame.
+const float kForegroundMaxZ = 0.1f;
+bool g_foreground = false;
 
 bool RenderModeIsDecal(unsigned int mode) {
     return (mode & kRenderModeZModeMask) == kRenderModeZModeDecal;
@@ -858,9 +875,10 @@ void LogMatrix(const char* label, const D3DMATRIX& m) {
 // Most of the world is pre-lit: its vertices carry a colour where lit geometry carries a
 // normal, because the original never lights it. A path tracer lights everything, and needs a
 // normal for that, so one is computed from the triangles. Each corner takes the area-weighted
-// normals of the faces around its vertex that meet its own face at less than
-// [Normals] SmoothingAngle, so a mountain shades smoothly and a house's corner stays hard; a
-// slot whose corners disagree becomes one vertex per normal.
+// normals of the faces that meet at its point and lie within [Normals] SmoothingAngle of its
+// own face, so a mountain shades smoothly and a house's corner stays hard; a slot whose corners
+// disagree becomes one vertex per normal. The faces around a point are gathered across draws
+// (NormalCache): one draw holds a handful of triangles, often with its own copy of each corner.
 //
 // The normal follows each triangle's own winding, so a card whose two triangles are wound
 // opposite ways -- the intro's star cards are -- gets a normal that agrees with each triangle's
@@ -869,8 +887,6 @@ void LogMatrix(const char* label, const D3DMATRIX& m) {
 const int kMaxBatchTriangles = kMaxIndices / 3;
 float g_faceNormal[kMaxBatchTriangles][3];   // area-weighted
 float g_faceUnit[kMaxBatchTriangles][3];
-int g_slotFirstCorner[kMaxVertices];          // index positions that name each slot, chained
-int g_cornerNext[kMaxIndices];
 int g_slotFirstVariant[kMaxVertices];         // compacted vertices made from each slot, chained
 int g_variantNext[kMaxIndices];
 
@@ -917,24 +933,25 @@ void ComputeFaceNormals(int vertexCount) {
     }
 }
 
-// The smoothed normal of corner `corner` (an index position), from the faces around its slot.
-void CornerNormal(int corner, float creaseCos, float* out) {
-    const int t = corner / 3;
-    const float* own = g_faceUnit[t];
-    out[0] = out[1] = out[2] = 0.0f;
-    for (int j = g_slotFirstCorner[g_indices[corner]]; j >= 0; j = g_cornerNext[j]) {
-        const int t2 = j / 3;
-        if (Dot(own, g_faceUnit[t2]) >= creaseCos) {
-            out[0] += g_faceNormal[t2][0];
-            out[1] += g_faceNormal[t2][1];
-            out[2] += g_faceNormal[t2][2];
+// Records the batch's pre-lit faces, so its corners -- and those of every later draw -- are
+// smoothed over them.
+void RecordPrelitFaces(int vertexCount) {
+    for (int t = 0; t < g_indexCount / 3; ++t) {
+        const int a = g_indices[t * 3], b = g_indices[t * 3 + 1], c = g_indices[t * 3 + 2];
+        if (a >= vertexCount || b >= vertexCount || c >= vertexCount ||
+            g_slotLit[a] || g_slotLit[b] || g_slotLit[c]) {
+            continue;
         }
+        NormalCache::AddFace(&g_vertices[a].x, &g_vertices[b].x, &g_vertices[c].x);
     }
+}
+
+// The smoothed normal of corner `corner` (an index position).
+void CornerNormal(int corner, float creaseCos, float* out) {
+    const float* own = g_faceUnit[corner / 3];
+    NormalCache::CornerNormal(&g_vertices[g_indices[corner]].x, own, creaseCos, out);
     if (!Normalise(out)) {
-        out[0] = own[0]; out[1] = own[1]; out[2] = own[2];
-        if (!Normalise(out)) {
-            out[0] = 0.0f; out[1] = 1.0f; out[2] = 0.0f;
-        }
+        out[0] = 0.0f; out[1] = 1.0f; out[2] = 0.0f;
     }
 }
 
@@ -948,16 +965,9 @@ int CompactBatch(int vertexCount) {
     // A small slack keeps faces that are parallel up to rounding together at 0 degrees.
     const float creaseCos = cosf(Config::SmoothingAngle() * 3.14159265f / 180.0f) - 1e-4f;
     ComputeFaceNormals(vertexCount);
+    RecordPrelitFaces(vertexCount);
     for (int v = 0; v < vertexCount; ++v) {
-        g_slotFirstCorner[v] = -1;
         g_slotFirstVariant[v] = -1;
-    }
-    for (int i = 0; i < g_indexCount; ++i) {
-        const int v = g_indices[i];
-        if (v < vertexCount) {
-            g_cornerNext[i] = g_slotFirstCorner[v];
-            g_slotFirstCorner[v] = i;
-        }
     }
     int count = 0;
     for (int i = 0; i < g_indexCount; ++i) {
@@ -1110,33 +1120,6 @@ bool LiesOnEarlierGeometry(const PlaneTriangle& t) {
             const PlaneTriangle& o = g_planeTriangles[i];
             if (Dot(o.n, t.n) >= kCoplanarCos && fabsf(o.d - t.d) <= kCoplanarDistance &&
                 TrianglesOverlap(o, t)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-// True when the batch models its own back faces: some triangle has a twin in the same plane,
-// facing the other way and covering it -- a zero-thickness board drawn once per side, as the
-// ticket booth's TICKETS sign is. The engine culls one side of such a board by winding. Drawn
-// with culling off, both sides are the same surface to a path tracer and the wrong one can
-// win, so these batches keep the engine's culling (see Flush).
-bool BatchModelsBackFaces(const WorldVertex* verts, const unsigned short* indices, int indexCount) {
-    const int kMaxTwinCheck = 256;
-    PlaneTriangle tris[kMaxTwinCheck];
-    int count = 0;
-    for (int i = 0; i + 2 < indexCount && count < kMaxTwinCheck; i += 3) {
-        if (MakePlaneTriangle(verts[indices[i]], verts[indices[i + 1]], verts[indices[i + 2]],
-                              tris[count])) {
-            ++count;
-        }
-    }
-    for (int a = 0; a < count; ++a) {
-        for (int b = a + 1; b < count; ++b) {
-            if (Dot(tris[a].n, tris[b].n) <= -kCoplanarCos &&
-                fabsf(tris[a].d + tris[b].d) <= kCoplanarDistance &&
-                TrianglesOverlap(tris[a], tris[b])) {
                 return true;
             }
         }
@@ -1415,7 +1398,11 @@ void Flush() {
     // Remix's sky layer -- and never writes.
     const bool sky = Texture::IsSkySet(activeTexture);
     if (sky) { ++g_skyBatches; }
-    Device::SetDepthRange(sky ? 1.0f : 0.0f, 1.0f);
+    if (sky) {
+        Device::SetDepthRange(1.0f, 1.0f);
+    } else {
+        Device::SetDepthRange(0.0f, g_foreground ? kForegroundMaxZ : 1.0f);
+    }
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
     dev->SetRenderState(D3DRS_ZFUNC, (g_renderMode & kRenderModeZCompare) ? D3DCMP_LESSEQUAL
                                                                           : D3DCMP_ALWAYS);
@@ -1496,14 +1483,14 @@ void Flush() {
     // change keeps its identity from frame to frame.
     const int compactCount = CompactBatch(vertexCount);
 
-    // CCW matches the original directly: the engine's negated Y scale cancels out through the
-    // projection and viewport, so the winding is not reversed. With
-    // DisableBackfaceCulling the engine's request is overridden, except for a batch that
-    // models its own back faces, which only renders right culled.
-    const bool engineCulls = (g_renderFlags & kFlagBackfaceCull) != 0;
-    const bool cull = engineCulls &&
-                      (!Config::DisableBackfaceCulling() ||
-                       BatchModelsBackFaces(g_compactVertices, g_compactIndices, g_indexCount));
+    // The engine's front faces are counter-clockwise on screen, as in the original.
+    //
+    // The engine's request goes to RTX Remix as it is. Remix culls only the rays from the
+    // camera by it (rtx.enableCulling); light and shadow rays see both sides
+    // (rtx.enableCullingInSecondaryRays is off), so one-sided walls still block light. And the
+    // camera has to cull: cutscene cameras stand outside the room they film, looking through
+    // the back of its near wall.
+    const bool cull = (g_renderFlags & kFlagBackfaceCull) != 0;
     dev->SetRenderState(D3DRS_CULLMODE, cull ? D3DCULL_CCW : D3DCULL_NONE);
 
     const bool decal = !sky && !blend && BatchIsDecal(g_compactVertices, g_compactIndices,
@@ -1927,6 +1914,7 @@ void Geometry::BeginFrame() {
                 v[2], v[6], v[10], v[12], v[13], v[14]);
     }
     ++g_frameIndex;
+    NormalCache::BeginFrame(g_frameIndex);
     g_indexCount = 0;
     g_highWater = 0;
     g_stackDepth = 0;
@@ -2132,6 +2120,13 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
             if (((word0 >> 16) & 0xff) == 3 && word1 != g_renderMode) {
                 Flush();
                 g_renderMode = word1;
+            }
+            break;
+
+        case OP_FOREGROUND:
+            if ((word0 >> 16) == 0 && (word1 != 0) != g_foreground) {
+                Flush();
+                g_foreground = word1 != 0;
             }
             break;
 

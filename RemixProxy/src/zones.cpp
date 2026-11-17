@@ -44,9 +44,16 @@ const unsigned char kBlendPrologue[] = {0x83, 0xec, 0x28, 0x56, 0x57, 0x8b, 0x7c
 const unsigned char kReleaseCallBytes[] = {0x56, 0xe8, 0xa0, 0x32, 0x00, 0x00};   // push esi; call
 
 typedef void(__cdecl* ReleaseFn)(unsigned int world);
+// FUN_00441d90(world, position, out): an object's light at a point, as the N64 Lights1 block
+// the engine uploads: ambient rgb at +0, directional rgb at +8, direction at +0x10.
+typedef void(__cdecl* LightAtPointFn)(unsigned int world, const float* position, unsigned char* out);
+const unsigned int kLightAtPoint = 0x00441d90;
 
 CRITICAL_SECTION g_lock;
 std::vector<Zones::Zone> g_latest;
+float g_probe[3] = {};
+bool g_probeSet = false;
+Zones::PointLight g_probeLight;
 
 bool Readable(unsigned int address, unsigned int size) {
     return address && !IsBadReadPtr((const void*)address, size);
@@ -166,10 +173,29 @@ std::vector<Zones::Zone> ReadRegistered() {
     return zones;
 }
 
+Zones::PointLight SampleProbe(unsigned int world, const float* position) {
+    unsigned char block[24] = {};
+    ((LightAtPointFn)kLightAtPoint)(world, position, block);
+    Zones::PointLight light;
+    light.valid = true;
+    for (int c = 0; c < 3; ++c) {
+        light.ambient[c] = block[c];
+        light.directional[c] = block[8 + c];
+    }
+    return light;
+}
+
 void __cdecl ReleaseZoneSets(unsigned int world) {
     std::vector<Zones::Zone> zones = ReadRegistered();
     EnterCriticalSection(&g_lock);
+    const bool probeSet = g_probeSet;
+    const float probe[3] = {g_probe[0], g_probe[1], g_probe[2]};
+    LeaveCriticalSection(&g_lock);
+    // Sampled while the zone sets are still registered, as the engine samples its own objects.
+    const Zones::PointLight light = probeSet ? SampleProbe(world, probe) : Zones::PointLight();
+    EnterCriticalSection(&g_lock);
     g_latest.swap(zones);
+    g_probeLight = light;
     LeaveCriticalSection(&g_lock);
     ((ReleaseFn)kRelease)(world);
 }
@@ -202,6 +228,20 @@ bool Zones::Install() {
         return false;
     }
     return RedirectCall(kReleaseCall, (void*)&ReleaseZoneSets);
+}
+
+void Zones::SetProbe(const float* position) {
+    EnterCriticalSection(&g_lock);
+    memcpy(g_probe, position, sizeof(g_probe));
+    g_probeSet = true;
+    LeaveCriticalSection(&g_lock);
+}
+
+Zones::PointLight Zones::LightAtProbe() {
+    EnterCriticalSection(&g_lock);
+    const Zones::PointLight light = g_probeLight;
+    LeaveCriticalSection(&g_lock);
+    return light;
 }
 
 std::vector<Zones::Zone> Zones::Latest() {

@@ -13,7 +13,6 @@ void Load(void* self);
 
 // --------------------------------------------------------------------------- culling
 
-bool DisableBackfaceCulling();
 
 // Ignore the per-triangle skip bitmask installed by opcodes 0xa8/0xa7.
 bool DisableTriangleSkipMask();
