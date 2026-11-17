@@ -1,6 +1,7 @@
 # Build output
 Video_D3D9/build/
 DInputShim/build/
+RemixProxy/build/
 
 # Ghidra project -- large, machine-local, regenerable from the binary
 ghidra/

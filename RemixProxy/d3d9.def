@@ -1,0 +1,5 @@
+LIBRARY d3d9
+EXPORTS
+    ; The one entry point this proxy implements: it hooks the device the renderer creates.
+    ; Everything else the bridge client exports is forwarded to it (see proxy.cpp).
+    Direct3DCreate9
