@@ -36,10 +36,12 @@ float g_mouseY = -1.0f;
 bool g_mouseDown = false;
 bool g_mousePressed = false;      // went down since the last frame; consumed by one widget
 unsigned int g_dragging = 0;      // the slider being dragged
+int g_wheel = 0;                  // wheel movement since the last frame, in WHEEL_DELTA units
 
 void SetOpen(bool open) {
     g_open = open;
     g_dragging = 0;
+    g_wheel = 0;
     g_mouseDown = false;
     g_mousePressed = false;
     // The input shim stops the game reading its devices while this says the overlay is open.
@@ -93,11 +95,13 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             g_mouseDown = false;
             ReleaseCapture();
             return 0;
+        case WM_MOUSEWHEEL:
+            g_wheel += GET_WHEEL_DELTA_WPARAM(wp);
+            return 0;
         // The rest of the mouse and the keyboard belong to the overlay too. System keys still
         // pass, so Alt+Enter and the Remix menu's Alt+X keep working.
         case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
         case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
-        case WM_MOUSEWHEEL:
         case WM_KEYDOWN: case WM_KEYUP: case WM_CHAR:
             return 0;
         }
@@ -205,6 +209,11 @@ std::vector<Vertex> g_panelBack;
 std::vector<Vertex> g_panelFront;
 std::vector<Vertex>* g_layer = &g_markers;
 
+// The panel's scrolled content is clipped to its visible area: quads are cut on the CPU, and a
+// widget outside it does not see the mouse.
+bool g_clipping = false;
+float g_clip[4] = {};    // x0, y0, x1, y1
+
 void CellUv(int c, float* u0, float* v0, float* u1, float* v1) {
     const int index = c - kFirstChar;
     const float x = (float)((index % kAtlasColumns) * g_cellWidth);
@@ -218,6 +227,21 @@ void CellUv(int c, float* u0, float* v0, float* u1, float* v1) {
 // Pre-transformed pixel centres sit on integer coordinates in D3D9; the half-pixel shift lands
 // each texel exactly on a pixel.
 void Quad(float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, D3DCOLOR c) {
+    if (g_clipping) {
+        const float cx0 = x0 > g_clip[0] ? x0 : g_clip[0];
+        const float cy0 = y0 > g_clip[1] ? y0 : g_clip[1];
+        const float cx1 = x1 < g_clip[2] ? x1 : g_clip[2];
+        const float cy1 = y1 < g_clip[3] ? y1 : g_clip[3];
+        if (cx0 >= cx1 || cy0 >= cy1) {
+            return;
+        }
+        // Texture coordinates follow the cut. A solid rectangle has u0 == u1, which stays put.
+        const float du = x1 > x0 ? (u1 - u0) / (x1 - x0) : 0.0f;
+        const float dv = y1 > y0 ? (v1 - v0) / (y1 - y0) : 0.0f;
+        u1 = u0 + (cx1 - x0) * du; u0 = u0 + (cx0 - x0) * du;
+        v1 = v0 + (cy1 - y0) * dv; v0 = v0 + (cy0 - y0) * dv;
+        x0 = cx0; y0 = cy0; x1 = cx1; y1 = cy1;
+    }
     const Vertex a = {x0 - 0.5f, y0 - 0.5f, 0.0f, 1.0f, c, u0, v0};
     const Vertex b = {x1 - 0.5f, y0 - 0.5f, 0.0f, 1.0f, c, u1, v0};
     const Vertex d = {x1 - 0.5f, y1 - 0.5f, 0.0f, 1.0f, c, u1, v1};
@@ -247,8 +271,16 @@ const D3DCOLOR kFillColour    = D3DCOLOR_ARGB(255, 70, 120, 200);
 
 const int kPanelChars = 74;      // the panel's content width, in characters
 
-float g_panelX = 0.0f;
+// The panel stays where it was dragged, and is never taller than the picture: what does not fit
+// scrolls, with the wheel or the bar on its right.
+float g_panelX = -1.0f;   // unplaced until the first frame open
 float g_panelY = 0.0f;
+bool g_movingPanel = false;
+float g_grabX = 0.0f, g_grabY = 0.0f;
+float g_scroll = 0.0f;
+float g_contentHeight = 0.0f;   // laid out last frame
+bool g_draggingScrollbar = false;
+float g_viewTop = 0.0f, g_viewHeight = 0.0f;
 float g_contentX = 0.0f;
 float g_contentRight = 0.0f;
 float g_rowTop = 0.0f;
@@ -275,6 +307,10 @@ void Place(float w, float h, float* x, float* y) {
 }
 
 bool Hovered(float x0, float y0, float x1, float y1) {
+    if (g_clipping && !(g_mouseX >= g_clip[0] && g_mouseX < g_clip[2] && g_mouseY >= g_clip[1] &&
+                        g_mouseY < g_clip[3])) {
+        return false;
+    }
     return g_mouseX >= x0 && g_mouseX < x1 && g_mouseY >= y0 && g_mouseY < y1;
 }
 
@@ -313,30 +349,113 @@ void TextN(float x, float y, D3DCOLOR colour, const char* text, int length) {
     }
 }
 
+float PanelWidth() { return kPanelChars * g_cellWidth + Pad() * 4.0f; }
+float TitleHeight() { return g_cellHeight + Pad() * 2.0f; }
+float ScrollRange() { return g_contentHeight > g_viewHeight ? g_contentHeight - g_viewHeight : 0.0f; }
+
+// The scrollbar's track: in the panel's right margin, beside the content.
+void ScrollTrack(float* x0, float* x1) {
+    *x1 = g_panelX + PanelWidth() - Pad() * 0.5f;
+    *x0 = *x1 - Pad();
+}
+
+void ClampPanel() {
+    const float w = PanelWidth();
+    g_panelX = g_panelX > g_backBufferWidth - w ? g_backBufferWidth - w : g_panelX;
+    g_panelY = g_panelY > g_backBufferHeight - TitleHeight() ? g_backBufferHeight - TitleHeight() : g_panelY;
+    g_panelX = g_panelX < 0.0f ? 0.0f : g_panelX;
+    g_panelY = g_panelY < 0.0f ? 0.0f : g_panelY;
+}
+
 void BeginPanel() {
+    if (g_panelX < 0.0f) {
+        g_panelX = g_panelY = g_cellHeight * 1.5f;
+    }
+    const float titleHeight = TitleHeight();
+    // Dragged by its title bar.
+    if (g_mousePressed && !g_dragging &&
+        g_mouseX >= g_panelX && g_mouseX < g_panelX + PanelWidth() &&
+        g_mouseY >= g_panelY && g_mouseY < g_panelY + titleHeight) {
+        g_movingPanel = true;
+        g_grabX = g_mouseX - g_panelX;
+        g_grabY = g_mouseY - g_panelY;
+        g_mousePressed = false;
+    }
+    if (g_movingPanel) {
+        if (g_mouseDown) {
+            g_panelX = g_mouseX - g_grabX;
+            g_panelY = g_mouseY - g_grabY;
+        } else {
+            g_movingPanel = false;
+        }
+    }
+    ClampPanel();
+
+    // What fits below the title, down to the bottom of the picture.
+    const float margin = (float)g_cellHeight * 0.5f;
+    g_viewTop = g_panelY + titleHeight;
+    const float room = g_backBufferHeight - margin - g_viewTop;
+    g_viewHeight = g_contentHeight < room ? g_contentHeight : room;
+    g_viewHeight = g_viewHeight > (float)g_cellHeight ? g_viewHeight : (float)g_cellHeight;
+
+    // The wheel scrolls three lines a notch; the bar is dragged.
+    g_scroll -= g_wheel / (float)WHEEL_DELTA * 3.0f * (g_cellHeight + Pad() * 0.6f);
+    g_wheel = 0;
+    float trackX0, trackX1;
+    ScrollTrack(&trackX0, &trackX1);
+    if (ScrollRange() > 0.0f && g_mousePressed && !g_dragging && g_mouseX >= trackX0 &&
+        g_mouseX < trackX1 && g_mouseY >= g_viewTop && g_mouseY < g_viewTop + g_viewHeight) {
+        g_draggingScrollbar = true;
+        g_mousePressed = false;
+    }
+    if (g_draggingScrollbar) {
+        if (g_mouseDown) {
+            const float thumb = g_viewHeight * g_viewHeight / g_contentHeight;
+            const float t = (g_mouseY - g_viewTop - thumb * 0.5f) / (g_viewHeight - thumb);
+            g_scroll = t * ScrollRange();
+        } else {
+            g_draggingScrollbar = false;
+        }
+    }
+    g_scroll = g_scroll > ScrollRange() ? ScrollRange() : g_scroll;
+    g_scroll = g_scroll < 0.0f ? 0.0f : g_scroll;
+
     g_layer = &g_panelFront;
-    g_panelX = g_cellHeight * 1.5f;
-    g_panelY = g_cellHeight * 1.5f;
     g_contentX = g_panelX + Pad() * 2.0f;
     g_contentRight = g_contentX + kPanelChars * g_cellWidth;
-    const float titleBottom = g_panelY + g_cellHeight + Pad() * 2.0f;
     Ui::Text(g_contentX, g_panelY + Pad(), kTextColour, "South Park");
-    const char* hint = "F4 / Esc closes";
+    const char* hint = "drag to move   F4 / Esc closes";
     Ui::Text(g_contentRight - (float)strlen(hint) * g_cellWidth, g_panelY + Pad(), kDimColour, hint);
-    g_rowTop = g_rowBottom = titleBottom;
+
+    g_clipping = true;
+    g_clip[0] = g_panelX;
+    g_clip[1] = g_viewTop;
+    g_clip[2] = g_panelX + PanelWidth();
+    g_clip[3] = g_viewTop + g_viewHeight;
+    g_rowTop = g_rowBottom = g_viewTop - g_scroll;
     g_sameLine = false;
 }
 
 void EndPanel() {
-    const float bottom = g_rowBottom + Pad() * 2.0f;
-    const float right = g_contentRight + Pad() * 2.0f;
-    const float titleBottom = g_panelY + g_cellHeight + Pad() * 2.0f;
+    g_contentHeight = g_rowBottom + Pad() * 2.0f - (g_viewTop - g_scroll);
+    g_clipping = false;
+    const float right = g_panelX + PanelWidth();
+    const float bottom = g_viewTop + g_viewHeight;
     g_layer = &g_panelBack;
     Ui::Rect(g_panelX, g_panelY, right, bottom, kPanelColour);
-    Ui::Rect(g_panelX, g_panelY, right, titleBottom, kTitleColour);
+    Ui::Rect(g_panelX, g_panelY, right, g_viewTop, kTitleColour);
+    if (ScrollRange() > 0.0f) {
+        float x0, x1;
+        ScrollTrack(&x0, &x1);
+        const float thumb = g_viewHeight * g_viewHeight / g_contentHeight;
+        const float top = g_viewTop + (g_viewHeight - thumb) * (g_scroll / ScrollRange());
+        g_layer = &g_panelFront;
+        Ui::Rect(x0, g_viewTop, x1, bottom, kControlColour);
+        Ui::Rect(x0, top, x1, top + thumb, g_draggingScrollbar ? kAccentColour : kFrameColour);
+    }
     g_layer = &g_markers;
     // The panel keeps the mouse to itself: a press on it is not a press anywhere else.
-    if (Hovered(g_panelX, g_panelY, right, bottom)) {
+    if (g_mouseX >= g_panelX && g_mouseX < right && g_mouseY >= g_panelY && g_mouseY < bottom) {
         g_mousePressed = false;
     }
 }
