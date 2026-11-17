@@ -53,7 +53,7 @@ bool g_uncullEntities = false;
 int g_uncullBudget = 512;
 unsigned int g_batchLimitScale = 8;
 float g_keepAroundCamera = 2048.0f;
-float g_drawDistance = 8192.0f;
+float g_drawDistanceScale = 1.0f;
 unsigned int g_cameraDrawListScale = 1;
 int g_effectPaletteMode = 1;
 float g_farPlane = 100000.0f;
@@ -143,7 +143,8 @@ const char* kDefaultIni =
     "; Remix's light pours in through the walls it no longer has. KeepAroundCamera keeps\r\n"
     "; the level drawn within this many world units of the camera whichever way it faces:\r\n"
     "; level geometry, level objects, particles and entities. Only drawing changes; what\r\n"
-    "; is loaded, spawned and simulated stays the engine's decision. 0 is off.\r\n"
+    "; is loaded, spawned and simulated stays the engine's decision. 0 is off. The F4\r\n"
+    "; overlay's culling radius changes it while the game runs.\r\n"
     "KeepAroundCamera=2048\r\n"
     "\r\n"
     "; The engine records each frame's draw work into three fixed arrays -- 512 models, 1024\r\n"
@@ -155,23 +156,20 @@ const char* kDefaultIni =
     "; LoadEntireMap is on. 1 keeps the engine's own sizes. The log says when one fills.\r\n"
     "BatchLimitScale=8\r\n"
     "\r\n"
-    "; What still culls the town after the tests above are widened is the camera's own\r\n"
-    "; draw distance -- 1024 units, the field the game's 'Fog Distance' video option\r\n"
-    "; moves. The engine sizes its frustum corners, side planes, frustum box and cull\r\n"
-    "; box from it, and the 2D X/Z box test that runs between the room and frustum\r\n"
-    "; tests rejects everything outside that box before the frustum override is ever\r\n"
-    "; reached. Raising it lets the engine rebuild all of them itself, so nothing is\r\n"
-    "; hand-forged and gameplay keeps reading a camera merely set to see further.\r\n"
-    ";\r\n"
-    "; This is a floor in world units, not a multiplier: the engine only rewrites the\r\n"
-    "; field when the fog option is set, so scaling it in place would compound every\r\n"
-    "; frame. 0 keeps the engine's own 1024.\r\n"
-    "DrawDistance=8192\r\n"
+    "; What still culls the level after the tests above are widened is the camera's own\r\n"
+    "; draw distance, which the engine takes from the fog distance of the area the camera\r\n"
+    "; is in. The engine sizes its frustum corners, side planes, frustum box and cull box\r\n"
+    "; from it, and the 2D X/Z box test that runs between the room and frustum tests\r\n"
+    "; rejects everything outside that box. DrawDistancePercent scales it, 100 to 400, and\r\n"
+    "; the engine rebuilds all of them from the larger value. 100 is the level as designed;\r\n"
+    "; larger values draw further and cost frame rate steeply in open areas (200 can take\r\n"
+    "; about two thirds of it). The F4 overlay's slider covers 100 to 200 while the game runs.\r\n"
+    "DrawDistancePercent=100\r\n"
     "\r\n"
     "; The engine records each frame's visible objects into a fixed 128-entry list and stops\r\n"
     "; recording when it fills -- an object past it is simply not drawn, with no diagnostic.\r\n"
-    "; That is what bounds DrawDistance: at 8192 units the list peaks around 93 of 128, so a\r\n"
-    "; busier scene crosses it and geometry goes missing. This multiplies it and relocates it.\r\n"
+    "; That is what bounds the draw distance: a busier scene at a larger DrawDistancePercent\r\n"
+    "; crosses it and geometry goes missing. This multiplies it and relocates it.\r\n"
     ";\r\n"
     "; CAUTION: relocating makes it one shared buffer instead of a field inside each camera.\r\n"
     "; Equivalent for a single viewport, WRONG for split screen -- set to 1 for multiplayer.\r\n"
@@ -336,7 +334,11 @@ const char* kDefaultIni =
     "; PlayerLight: a soft light above the camera, coloured by the light the game gives an\r\n"
     "; object standing there, so rooms lit only by the level's large fills do not go black.\r\n"
     "; It travels with the player. PlayerLightReach works like a zone's radius for brightness.\r\n"
+    "; PlayerLightOnlyInTheDark: only while playing (not in a cutscene, a menu or paused),\r\n"
+    "; with level geometry above the camera, and out of reach of every light the proxy sends:\r\n"
+    "; caves and dark interiors. It fades in and out over a second. 0 keeps it on throughout.\r\n"
     "PlayerLight=0\r\n"
+    "PlayerLightOnlyInTheDark=1\r\n"
     "PlayerLightScale=1500\r\n"
     "PlayerLightReach=512\r\n"
     "PlayerLightHeight=40\r\n";
@@ -361,6 +363,50 @@ float ReadAspectRatio() {
         return Config::kOriginalAspect;
     }
     return ratio;
+}
+
+// The settings that change while the game runs: read from the ini whenever it changes, and
+// set directly by the F4 overlay (d3d9.dll) through SouthPark_SetSetting.
+void SetFieldOfView(float fov) {
+    if (!(fov >= 0.5f && fov <= 2.0f)) {
+        fov = 1.0f;
+    }
+    if (fov != g_fieldOfView) {
+        g_fieldOfView = fov;
+        LogLine("    config: FieldOfView %.2f", fov);
+    }
+}
+
+void SetStarrySky(bool starry) {
+    if (starry != g_starrySky) {
+        g_starrySky = starry;
+        LogLine("    config: StarrySky %d", starry ? 1 : 0);
+    }
+}
+
+void SetKeepAroundCamera(float radius) {
+    const int keep = radius < 0.0f ? 0 : (radius > 16384.0f ? 16384 : (int)(radius + 0.5f));
+    if ((float)keep != g_keepAroundCamera) {
+        g_keepAroundCamera = (float)keep;
+        LogLine("    config: KeepAroundCamera %d", keep);
+    }
+}
+
+void SetDrawDistancePercent(float percent) {
+    const int whole = percent < 100.0f ? 100 : (percent > 400.0f ? 400 : (int)(percent + 0.5f));
+    if (whole / 100.0f != g_drawDistanceScale) {
+        g_drawDistanceScale = whole / 100.0f;
+        LogLine("    config: DrawDistancePercent %d", whole);
+    }
+}
+
+void ReadLiveSettings() {
+    char text[32];
+    GetPrivateProfileStringA("Display", "FieldOfView", "1", text, sizeof(text), g_iniPath);
+    SetFieldOfView((float)atof(text));
+    SetStarrySky(ReadBool("Sky", "StarrySky", true));
+    SetKeepAroundCamera((float)GetPrivateProfileIntA("FullMap", "KeepAroundCamera", 2048, g_iniPath));
+    SetDrawDistancePercent((float)GetPrivateProfileIntA("FullMap", "DrawDistancePercent", 100, g_iniPath));
 }
 
 } // namespace
@@ -410,12 +456,6 @@ void Config::Load(void* self) {
         "FullMap", "CameraDrawListScale", 1, g_iniPath);
     if (g_cameraDrawListScale < 1)  g_cameraDrawListScale = 1;
     if (g_cameraDrawListScale > 16) g_cameraDrawListScale = 16;
-    g_keepAroundCamera = (float)GetPrivateProfileIntA("FullMap", "KeepAroundCamera", 2048, g_iniPath);
-    if (g_keepAroundCamera < 0.0f) g_keepAroundCamera = 0.0f;
-    g_drawDistance = (float)GetPrivateProfileIntA("FullMap", "DrawDistance", 8192, g_iniPath);
-    if (g_drawDistance < 0.0f)     g_drawDistance = 0.0f;
-    // These boxes also feed spatial lookups and a near-infinite extent crashes the game.
-    if (g_drawDistance > 65536.0f) g_drawDistance = 65536.0f;
     g_farPlane = (float)GetPrivateProfileIntA("FullMap", "FarPlane", 100000, g_iniPath);
     g_effectPaletteMode = GetPrivateProfileIntA("Textures", "EffectPaletteMode", 1, g_iniPath);
     if (g_effectPaletteMode < 1 || g_effectPaletteMode > 3) g_effectPaletteMode = 1;
@@ -473,7 +513,7 @@ void Config::Load(void* self) {
     g_aspectRatio = ReadAspectRatio();
     g_pauseWhenUnfocused = ReadBool("Display", "PauseWhenUnfocused", true);
     g_limitCutscenes = ReadBool("Display", "LimitCutscenes", false);
-    Config::RefreshLive();
+    ReadLiveSettings();
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
     g_dumpEnvTextures = ReadBool("Debug", "DumpEnvTextures", false);
@@ -500,8 +540,8 @@ void Config::Load(void* self) {
             "UncullBudget=%d BatchLimitScale=%u FarPlane=%.0f",
             g_loadEntireMap, g_disableFrustumTest, g_uncullRooms, g_uncullEntities,
             g_uncullBudget, g_batchLimitScale, g_farPlane);
-    LogLine("    DrawDistance=%.0f CameraDrawListScale=%u KeepAroundCamera=%.0f",
-            g_drawDistance, g_cameraDrawListScale, g_keepAroundCamera);
+    LogLine("    DrawDistancePercent=%.0f CameraDrawListScale=%u KeepAroundCamera=%.0f",
+            g_drawDistanceScale * 100.0f, g_cameraDrawListScale, g_keepAroundCamera);
     LogLine("    EffectPaletteMode=%d", g_effectPaletteMode);
     LogLine("    ApplyConstantColour=%d ResetStatePerFrame=%d",
             g_applyConstantColour, g_resetStatePerFrame);
@@ -537,7 +577,7 @@ bool Config::UncullEntities()             { return g_uncullEntities; }
 int Config::UncullBudget()                { return g_uncullBudget; }
 unsigned int Config::BatchLimitScale()    { return g_batchLimitScale; }
 unsigned int Config::CameraDrawListScale() { return g_cameraDrawListScale; }
-float Config::DrawDistance()              { return g_drawDistance; }
+float Config::DrawDistanceScale()         { return g_drawDistanceScale; }
 float Config::KeepAroundCamera()          { return g_keepAroundCamera; }
 float Config::FarPlane()                  { return g_farPlane; }
 int Config::EffectPaletteMode()           { return g_effectPaletteMode; }
@@ -573,22 +613,24 @@ void Config::RefreshLive() {
         return;
     }
     g_iniWritten = info.ftLastWriteTime;
-    char text[32];
-    GetPrivateProfileStringA("Display", "FieldOfView", "1", text, sizeof(text), g_iniPath);
-    float fov = (float)atof(text);
-    if (!(fov >= 0.5f && fov <= 2.0f)) {
-        fov = 1.0f;
-    }
-    if (fov != g_fieldOfView) {
-        g_fieldOfView = fov;
-        LogLine("    config: FieldOfView %.2f", fov);
-    }
-    const bool starry = ReadBool("Sky", "StarrySky", true);
-    if (starry != g_starrySky) {
-        g_starrySky = starry;
-        LogLine("    config: StarrySky %d", starry ? 1 : 0);
-    }
+    ReadLiveSettings();
 }
+
+bool Config::SetLive(const char* section, const char* key, float value) {
+    if (lstrcmpiA(section, "Display") == 0 && lstrcmpiA(key, "FieldOfView") == 0) {
+        SetFieldOfView(value);
+    } else if (lstrcmpiA(section, "Sky") == 0 && lstrcmpiA(key, "StarrySky") == 0) {
+        SetStarrySky(value != 0.0f);
+    } else if (lstrcmpiA(section, "FullMap") == 0 && lstrcmpiA(key, "KeepAroundCamera") == 0) {
+        SetKeepAroundCamera(value);
+    } else if (lstrcmpiA(section, "FullMap") == 0 && lstrcmpiA(key, "DrawDistancePercent") == 0) {
+        SetDrawDistancePercent(value);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 int Config::LookdevGameWindowX()          { return g_lookdevGameX; }
 int Config::LookdevGameWindowY()          { return g_lookdevGameY; }
 int Config::LookdevGameWindowWidth()      { return g_lookdevGameWidth; }

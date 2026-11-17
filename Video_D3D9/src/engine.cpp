@@ -232,7 +232,9 @@ const ViewBoxTest kViewBoxTests[] = {
       { 0x33A, 0x332, 0x33E, 0x336 } },
 };
 
-float g_keepAroundCamera = 0.0f;   // 0 until the sites are patched
+// [FullMap] KeepAroundCamera, brought up to date every frame once the sites are patched.
+float g_keepAroundCamera = 0.0f;
+bool g_keepAroundCameraPatched = false;
 int g_viewBoxTestsPatched = 0;
 int g_keptEntities = 0;            // entities drawn this frame only because they are near
 int g_keptEntitiesPeak = 0;
@@ -309,51 +311,103 @@ int __cdecl EntityFrustumTest(const void* planes, const void* box) {
 
 // ------------------------------------------------------- the camera's own draw distance
 //
-// This is what still removes the town once the room and frustum tests are widened, and it is
-// neither of them. Between those two tests SP_DrawObjectIfVisible rejects an object whose
-// bounds do not overlap the camera's frustum AABB in X and Z, and that box -- along with the
-// frustum corner points, the side planes and the published cull box -- is sized entirely by
-// one float: the camera's draw distance at camera+0x4e4, 1024 units by default. An object
-// beyond it never reaches the frustum test at all, so almost nothing gets as far as the
-// budgeted override.
+// What still removes the town once the room and frustum tests are widened is neither of them.
+// Between those two tests SP_DrawObjectIfVisible rejects an object whose bounds do not overlap
+// the camera's frustum AABB in X and Z, and that box -- along with the frustum corner points,
+// the side planes and the published cull box -- is sized by one float: the camera's draw
+// distance at camera+0x4e4.
 //
-// So the distance is raised at its source and the engine rebuilds everything spatial from it,
-// rather than the boxes being rewritten after the fact. That matters twice over: the derived
-// volumes stay consistent with each other, and -- because camera+0x4e4 is the field the
-// game's own "Fog Distance" video option moves -- a larger value is a state the engine is
-// built to run in. Gameplay keeps making its decisions from a camera that is merely set to
-// see further, which is why this does not repeat the entity starvation that forcing the room
-// mask caused.
+// That distance is the level's fog distance. FUN_00420a10, called from SP_UpdateCamera every
+// frame, looks up the area the camera is in and eases the field toward that area's fog
+// distance: on entering a new area it copies the current field to camera+0x4e8 as the start
+// (0x00420b2f) and from then on writes start + (target - start) * weight (0x00420da3) on every
+// call. A running cutscene may set its own (0x00421801). The constructor's 1024 holds only
+// until the first area is found.
 //
-// It raises the field to a floor rather than scaling it, because the engine does not rewrite
-// it every frame: on two of the three paths below the field simply keeps what it already
-// holds, so a multiply would compound frame over frame until it saturated whatever ceiling it
-// was given. A floor lands on the same value however many times it runs, and steps aside if
-// the fog option ever asks for more.
+// DrawDistancePercent scales it where those paths meet, before anything is derived, so the
+// engine rebuilds every volume from the larger value itself. The field is scaled in place, so
+// each camera remembers the value it was given: if the field still holds it, the engine has not
+// written a new one and its own value is the one remembered, which keeps a multiply from
+// compounding on any path that leaves the field alone. Before FUN_00420a10 runs the engine's
+// value is put back, so an area change starts its ease from the level's distance rather than
+// from the scaled one.
 //
-// SP_UpdateCamera reaches the value by three paths and they converge at 0x00421807:
+// SP_UpdateCamera's paths converge at 0x00421807:
 //
-//   004217e9  je  0x421807          no fog option -- the field keeps the constructor's 1024
-//   004217fb  jle 0x421807          option <= 0 -- likewise
-//   00421801  fstp [esi+0x4e4]      option applied
+//   004217e9  je  0x421807          no cutscene camera
+//   004217fb  jle 0x421807          the cutscene sets no distance
+//   00421801  fstp [esi+0x4e4]      the cutscene's distance
 //   00421807  fld dword [esp+0x10]  <- all three meet here, before anything is derived
 //
 // esi holds the camera across all of it. The two instructions at the meeting point are
-// relocated into the detour; nothing branches into the ten bytes they occupy, verified by a
-// scan of every rel8 and rel32 branch in the image. The scale is done in SSE because the very
-// next instruction loads the x87 stack, and esp is moved with lea rather than add/sub so the
-// detour leaves the flags alone as well.
+// relocated into the detour; no rel8 or rel32 branch in the image lands in the ten bytes they
+// occupy. The detour saves the flags and every general register around its call, and the call
+// touches no x87 state, because the very next instruction loads the x87 stack.
 const unsigned int kCameraDistanceSite   = 0x00421807;
 const unsigned int kCameraDistanceResume = 0x00421811;
 const unsigned char kCameraDistanceCode[10] = {
     0xD9, 0x44, 0x24, 0x10,                      // fld  dword ptr [esp+0x10]
     0xDC, 0x0D, 0x40, 0x94, 0x4C, 0x00,          // fmul qword ptr [0x4c9440]
 };
+const unsigned int kCameraDistance = 0x4E4;
+const unsigned int kAreaFog = 0x00420A10;                 // FUN_00420a10(camera), __cdecl
+const unsigned int kAreaFogCallSites[] = { 0x00420F7C, 0x00420FFE };   // in SP_UpdateCamera
 
-// Read by the patched code itself, so they are globals rather than captured values.
-float g_drawDistanceFloor   = 0.0f;
+float g_drawDistanceScale = 1.0f;     // this frame's [FullMap] DrawDistancePercent / 100
+float g_drawDistanceEngine = 0.0f;    // the last camera's own distance and what it was given
 float g_drawDistanceApplied = 0.0f;
-bool  g_drawDistancePatched = false;
+float g_drawDistanceEngineMin = 0.0f;
+float g_drawDistanceEngineMax = 0.0f;
+
+struct ScaledCamera {
+    const unsigned char* camera;
+    float engine;     // the engine's own distance
+    float applied;    // what the field was given; -1 while it holds the engine's value
+};
+ScaledCamera g_scaledCameras[8];
+int g_scaledCamerasUsed = 0;
+
+ScaledCamera& ScaledRecord(const unsigned char* camera) {
+    const int count = (int)(sizeof(g_scaledCameras) / sizeof(g_scaledCameras[0]));
+    for (int i = 0; i < count && i < g_scaledCamerasUsed; ++i) {
+        if (g_scaledCameras[i].camera == camera) {
+            return g_scaledCameras[i];
+        }
+    }
+    ScaledCamera& r = g_scaledCameras[g_scaledCamerasUsed++ % count];
+    r.camera = camera;
+    r.engine = 0.0f;
+    r.applied = -1.0f;
+    return r;
+}
+
+float EngineDistance(const ScaledCamera& r, float field) {
+    return field == r.applied ? r.engine : field;
+}
+
+// Called by the detour at 0x00421807 with the camera.
+void __cdecl ScaleCameraDistance(unsigned char* camera) {
+    float* field = (float*)(camera + kCameraDistance);
+    ScaledCamera& r = ScaledRecord(camera);
+    r.engine = EngineDistance(r, *field);
+    r.applied = r.engine * g_drawDistanceScale;
+    *field = r.applied;
+    g_drawDistanceEngine = r.engine;
+    g_drawDistanceApplied = r.applied;
+    if (g_drawDistanceEngineMax == 0.0f || r.engine > g_drawDistanceEngineMax) g_drawDistanceEngineMax = r.engine;
+    if (g_drawDistanceEngineMin == 0.0f || r.engine < g_drawDistanceEngineMin) g_drawDistanceEngineMin = r.engine;
+}
+
+typedef void (__cdecl *AreaFogFn)(unsigned char* camera);
+
+// FUN_00420a10 with the engine's own distance in the field.
+void __cdecl AreaFogFromEngineDistance(unsigned char* camera) {
+    float* field = (float*)(camera + kCameraDistance);
+    ScaledCamera& r = ScaledRecord(camera);
+    *field = EngineDistance(r, *field);
+    r.applied = -1.0f;
+    ((AreaFogFn)kAreaFog)(camera);
+}
 
 // The field of view is the value loaded at the same site, in degrees: the camera eases it
 // toward its target each frame (camera+0x4ec) or takes a cutscene's, then derives the vertical
@@ -478,17 +532,17 @@ void __cdecl OnCameraListsBuilt(unsigned char* camera) {
             if (l.framesFull == 1 || (l.framesFull % 600) == 0) {
                 LogLine("    engine: camera %s list FULL at %d entries -- objects are being "
                         "dropped before any visibility test (%u frames so far). Lower "
-                        "DrawDistance.", l.name, l.cap, l.framesFull);
+                        "DrawDistancePercent.", l.name, l.cap, l.framesFull);
             }
         } else if (count * 4 >= l.cap * 3) {
-            // These caps are the one thing DrawDistance can overrun, and the engine gives no
+            // These caps are the one thing DrawDistancePercent can overrun, and the engine gives no
             // sign when it does -- an object past the cap is simply not drawn. Saying so at
             // three quarters gives a chance to lower the distance before geometry starts
             // going missing, rather than after.
             ++l.framesNearFull;
             if (l.framesNearFull == 1 || (l.framesNearFull % 600) == 0) {
                 LogLine("    engine: camera %s list at %d/%d -- close to the cap, and past it "
-                        "objects are dropped silently. Lower DrawDistance if geometry starts "
+                        "objects are dropped silently. Lower DrawDistancePercent if geometry starts "
                         "vanishing (%u frames so far)",
                         l.name, count, l.cap, l.framesNearFull);
             }
@@ -501,7 +555,7 @@ void __cdecl OnCameraListsBuilt(unsigned char* camera) {
 // The list at camera+0xc88 is the one FUN_0043d690 actually draws, and it is a fixed 128
 // entries: FUN_0043ce30 compares the count at camera+0xe88 against 0x80 and, when it is
 // full, simply does not record the object. Nothing is logged and nothing is drawn -- which is
-// why raising DrawDistance made particular objects vanish rather than making the map deeper.
+// why raising the draw distance can make particular objects vanish rather than the map deeper.
 //
 // The list cannot grow where it is. It runs 0xc88..0xe88 and its own count sits immediately
 // after it, with the next list starting at 0xe8c, so every extra entry would overwrite the
@@ -779,8 +833,8 @@ unsigned char* BuildArgumentTapDetour(unsigned int original, void* callback) {
     return cave;
 }
 
-// The draw-distance floor (0 leaves the engine's distance alone) and the field of view.
-bool InstallCameraDetour(float distance) {
+// The draw distance and the field of view.
+bool InstallCameraDetour() {
     if (!Verify(kCameraDistanceSite, kCameraDistanceCode, sizeof(kCameraDistanceCode))) {
         LogLine("    engine: 0x%08X is not the camera draw-distance code -- not patching",
                 kCameraDistanceSite);
@@ -791,19 +845,14 @@ bool InstallCameraDetour(float distance) {
     if (!cave) {
         return false;
     }
-    g_drawDistanceFloor = distance;
-
     g_write = cave;
-    Emit(0x8D); Emit(0x64); Emit(0x24); Emit(0xF0);            // lea    esp, [esp-16]
-    Emit(0x0F); Emit(0x11); Emit(0x04); Emit(0x24);            // movups [esp], xmm0
-    Emit(0xF3); Emit(0x0F); Emit(0x10); Emit(0x86); EmitDword(0x4E4);   // movss xmm0,[esi+4e4]
-    Emit(0xF3); Emit(0x0F); Emit(0x5F); Emit(0x05);
-    EmitDword((unsigned int)&g_drawDistanceFloor);                      // maxss xmm0,[floor]
-    Emit(0xF3); Emit(0x0F); Emit(0x11); Emit(0x86); EmitDword(0x4E4);   // movss [esi+4e4],xmm0
-    Emit(0xF3); Emit(0x0F); Emit(0x11); Emit(0x05);
-    EmitDword((unsigned int)&g_drawDistanceApplied);                    // movss [applied],xmm0
-    Emit(0x0F); Emit(0x10); Emit(0x04); Emit(0x24);            // movups xmm0, [esp]
-    Emit(0x8D); Emit(0x64); Emit(0x24); Emit(0x10);            // lea    esp, [esp+16]
+    Emit(0x9C);                                                // pushfd
+    Emit(0x60);                                                // pushad
+    Emit(0x56);                                                // push esi  (the camera)
+    EmitCall((unsigned int)&ScaleCameraDistance);
+    Emit(0x83); Emit(0xC4); Emit(0x04);                        // add  esp, 4
+    Emit(0x61);                                                // popad
+    Emit(0x9D);                                                // popfd
     Emit(0xD9); Emit(0x44); Emit(0x24); Emit(0x10);            // fld  dword ptr [esp+0x10]
     Emit(0xD9); Emit(0x15); EmitDword((unsigned int)&g_fovEngine);     // fst  [engine fov]
     Emit(0xD8); Emit(0x0D); EmitDword((unsigned int)&g_fovScale);      // fmul [fov scale]
@@ -822,11 +871,6 @@ bool InstallCameraDetour(float distance) {
         return false;
     }
     g_cameraDetourInstalled = true;
-    g_drawDistancePatched = distance > 0.0f;
-    if (g_drawDistancePatched) {
-        LogLine("    engine: camera draw distance raised to at least %.0f units "
-                "(engine default 1024)", distance);
-    }
     g_cutsceneTestKnown = Verify(kCutsceneTest, kCutsceneTestCode, sizeof(kCutsceneTestCode));
     LogLine("    engine: camera field of view follows [Display] FieldOfView%s",
             g_cutsceneTestKnown ? ", except in cutscenes" : "");
@@ -884,28 +928,26 @@ int RedirectCallSites(const unsigned int* sites, int count, unsigned int target,
 }
 
 // Needs the frustum test bypassed at the drawing sites: it widens the box test in front of
-// it, and the frustum would still turn away everything behind the eye.
+// it, and the frustum would still turn away everything behind the eye. Installed whatever the
+// radius, so the F4 overlay can change it, 0 included, while the game runs: at 0 the widened
+// copy is the cameras' own view boxes, unchanged for a single viewport.
 void InstallKeepAroundCamera() {
-    const float radius = Config::KeepAroundCamera();
-    if (radius <= 0.0f) {
-        return;
-    }
     if (!IsCallTo(kBuildCullBoundsCallSite, kBuildCullBounds)) {
         LogLine("    engine: 0x%08X is not the call to SP_BuildCullBounds -- the level is not "
                 "kept around the camera", kBuildCullBoundsCallSite);
         return;
     }
-    g_keepAroundCamera = radius;
+    g_keepAroundCamera = Config::KeepAroundCamera();
     const int total = (int)(sizeof(kViewBoxTests) / sizeof(kViewBoxTests[0]));
     for (int i = 0; i < total; ++i) {
         if (PatchViewBoxTest(kViewBoxTests[i])) {
             ++g_viewBoxTestsPatched;
         }
     }
-    RedirectCallSites(&kBuildCullBoundsCallSite, 1, kBuildCullBounds,
-                      (unsigned char*)&BuildCullBoundsAroundCamera);
+    g_keepAroundCameraPatched = RedirectCallSites(&kBuildCullBoundsCallSite, 1, kBuildCullBounds,
+                                                  (unsigned char*)&BuildCullBoundsAroundCamera) > 0;
     LogLine("    engine: level kept within %.0f units of the camera at %d/%d drawing tests",
-            radius, g_viewBoxTestsPatched, total);
+            g_keepAroundCamera, g_viewBoxTestsPatched, total);
 }
 
 } // namespace
@@ -918,6 +960,10 @@ void Engine::OnFrame() {
                    *(const int*)(state + 0x28) != 0;
     }
     g_fovScale = cutscene ? 1.0f : Config::FieldOfView();
+    g_drawDistanceScale = Config::DrawDistanceScale();
+    if (g_keepAroundCameraPatched) {
+        g_keepAroundCamera = Config::KeepAroundCamera();
+    }
 }
 
 void Engine::Install() {
@@ -933,10 +979,16 @@ void Engine::Install() {
         }
     }
 
-    // The draw distance is the engine's own "Fog Distance" field, so it is raised on its
-    // own switch rather than behind LoadEntireMap: 0 leaves the engine's 1024 units alone.
-    const float distance = Config::DrawDistance();
-    InstallCameraDetour(distance > 1024.0f ? distance : 0.0f);
+    // The draw distance is the level's fog distance, so it is scaled on its own switch rather
+    // than behind LoadEntireMap: 1 leaves it as the level sets it.
+    g_drawDistanceScale = Config::DrawDistanceScale();
+    if (InstallCameraDetour()) {
+        const int areaSites = RedirectCallSites(kAreaFogCallSites, 2, kAreaFog,
+                                                (unsigned char*)&AreaFogFromEngineDistance);
+        LogLine("    engine: camera draw distance follows [FullMap] DrawDistancePercent (%.0f%% now); "
+                "area fog sees the level's own distance at %d/2 sites", g_drawDistanceScale * 100.0f,
+                areaSites);
+    }
 
     if (!Config::LimitCutscenes()) {
         const unsigned char always = 0xEB;                   // jmp 0x0044473a
@@ -1016,7 +1068,7 @@ void Engine::Install() {
         }
 
         InstallKeepAroundCamera();
-        if (Config::UncullEntities() || g_keepAroundCamera > 0.0f) {
+        if (Config::UncullEntities() || g_keepAroundCameraPatched) {
             g_entitySitePatched = RedirectCallSites(&kFrustumEntityCallSite, 1,
                                                     kFrustumPlaneTest,
                                                     (unsigned char*)&EntityFrustumTest) > 0;
@@ -1045,7 +1097,7 @@ void Engine::LogState() {
             g_frustumSitesPatched, g_entitySitePatched ? "widened" : "untouched",
             g_extraVisiblePeak, g_extraVisibleDenied);
     LogLine("    engine: room visibility widened at %d sites", g_roomTestsWidened);
-    if (g_keepAroundCamera > 0.0f) {
+    if (g_keepAroundCameraPatched) {
         LogLine("    engine: level kept within %.0f units of the camera at %d drawing tests; "
                 "peak %d entities in a frame drawn only for being near",
                 g_keepAroundCamera, g_viewBoxTestsPatched, g_keptEntitiesPeak);
@@ -1062,11 +1114,11 @@ void Engine::LogState() {
         LogLine("    engine: field of view %.1f degrees from the engine, x%.2f in the last frame",
                 g_fovEngine, g_fovScale);
     }
-    if (g_drawDistancePatched) {
-        LogLine("    engine: camera draw distance floor %.0f -> %.0f units in the last "
-                "frame (engine default 1024)", g_drawDistanceFloor, g_drawDistanceApplied);
-    } else {
-        LogLine("    engine: camera draw distance left at the engine's own value");
+    if (g_cameraDetourInstalled) {
+        LogLine("    engine: camera draw distance %.0f%%: the level's own %.0f -> %.0f units in the "
+                "last frame; the level's own ranged %.0f..%.0f this run", g_drawDistanceScale * 100.0f,
+                g_drawDistanceEngine, g_drawDistanceApplied, g_drawDistanceEngineMin,
+                g_drawDistanceEngineMax);
     }
     LogLine("    engine camera visible-object lists (the cap that ends the culling):");
     for (int i = 0; i < (int)(sizeof(g_cameraLists) / sizeof(g_cameraLists[0])); ++i) {
@@ -1074,7 +1126,7 @@ void Engine::LogState() {
         LogLine("      %-12s peak %4d / %4d   full on %u frames, over three quarters on %u%s",
                 l.name, l.peak, l.cap, l.framesFull, l.framesNearFull,
                 l.framesFull ? "   <-- objects dropped here"
-                             : (l.peak * 4 >= l.cap * 3 ? "   <-- close; lower DrawDistance"
+                             : (l.peak * 4 >= l.cap * 3 ? "   <-- close; lower DrawDistancePercent"
                                                         : ""));
     }
     LogLine("    engine draw arrays:");

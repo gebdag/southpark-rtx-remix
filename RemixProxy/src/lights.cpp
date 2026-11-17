@@ -2,6 +2,7 @@
 #include "log.h"
 #include "overlay.h"
 #include "remix.h"
+#include "settings.h"
 #include "zones.h"
 
 #include <math.h>
@@ -70,7 +71,7 @@ unsigned int g_framesWithLights = 0;
 
 // ------------------------------------------------------------------------------ settings
 
-struct Settings {
+struct LightSettings {
     bool enabled = true;
     float radianceScale = 1500.0f;
     float emitterRadius = 6.0f;
@@ -91,6 +92,9 @@ struct Settings {
     // there. It keeps rooms that have only the level's large fills -- no lamp-sized zone to send --
     // from going black, at the cost of a light that travels with the player.
     bool playerLight = false;
+    // Only for dark interiors: while the player is playing, under level geometry and out of
+    // reach of every light sent -- caves, and rooms with nothing else to light them.
+    bool playerLightOnlyInTheDark = true;
     float playerLightScale = 1500.0f;
     float playerLightReach = 512.0f;
     float playerLightHeight = 40.0f;
@@ -107,14 +111,43 @@ struct TestLight {
     float distance = 200.0f;
 } g_test;
 
-float ReadFloat(const char* ini, const char* key, float fallback) {
-    char text[32];
-    GetPrivateProfileStringA("Lights", key, "", text, sizeof(text), ini);
-    return text[0] ? (float)atof(text) : fallback;
-}
+// The [Lights] keys of Video_D3D9.ini, each tied to one setting: a number or a switch.
+struct Key {
+    const char* name;
+    float* number;
+    bool* flag;
+};
 
-bool ReadBool(const char* ini, const char* key, bool fallback) {
-    return GetPrivateProfileIntA("Lights", key, fallback ? 1 : 0, ini) != 0;
+const Key kKeys[] = {
+    {"Enabled", nullptr, &g_settings.enabled},
+    {"RadianceScale", &g_settings.radianceScale, nullptr},
+    {"EmitterRadius", &g_settings.emitterRadius, nullptr},
+    {"ScaleByReach", nullptr, &g_settings.scaleByReach},
+    {"SwapRedBlue", nullptr, &g_settings.swapRedBlue},
+    {"Markers", nullptr, &g_settings.markers},
+    {"KeepFallbackLight", nullptr, &g_settings.keepFallbackLight},
+    {"ZoneLights", nullptr, &g_settings.zoneLights},
+    {"ZoneRadianceScale", &g_settings.zoneRadianceScale, nullptr},
+    {"ZoneReachCap", &g_settings.zoneReachCap, nullptr},
+    {"ZonesInTheOpen", nullptr, &g_settings.zonesInTheOpen},
+    {"PlayerLight", nullptr, &g_settings.playerLight},
+    {"PlayerLightOnlyInTheDark", nullptr, &g_settings.playerLightOnlyInTheDark},
+    {"PlayerLightScale", &g_settings.playerLightScale, nullptr},
+    {"PlayerLightReach", &g_settings.playerLightReach, nullptr},
+    {"PlayerLightHeight", &g_settings.playerLightHeight, nullptr},
+};
+
+void ReadKey(const char* ini, const Key& k) {
+    char text[32];
+    GetPrivateProfileStringA("Lights", k.name, "", text, sizeof(text), ini);
+    if (!text[0]) {
+        return;
+    }
+    if (k.number) {
+        *k.number = (float)atof(text);
+    } else {
+        *k.flag = atoi(text) != 0;
+    }
 }
 
 // ------------------------------------------------------------------------------ camera
@@ -390,6 +423,151 @@ const char* ShapeName(const Zones::Zone& z) {
     }
 }
 
+// ------------------------------------------------------------------------ player light
+//
+// With PlayerLightOnlyInTheDark the light shines only when three things hold: the player is
+// playing (in a level, not paused, no cutscene camera), the renderer finds level geometry above
+// the camera, and the camera is outside the reach of every light this proxy sends. Each test
+// switches on and off at different thresholds, and the light fades in and out, so a doorway or
+// the edge of a lamp's reach does not make it flicker.
+
+// The engine's "in a level" (FUN_00443650: [0x53e3f2] == 0x0d) and "paused" (FUN_00443660:
+// [0x53e40c] != 0) getters, and its cutscene test (FUN_0049bf00: [[0x4e1250] + 0x28]) as built.
+// The fields are read only when all three match.
+const unsigned char kInLevelCode[] = {0x8b, 0x0d, 0xf2, 0xe3, 0x53, 0x00, 0x33, 0xc0, 0x83, 0xf9, 0x0d};
+const unsigned char kPausedCode[] = {0x8b, 0x0d, 0x0c, 0xe4, 0x53, 0x00, 0x33, 0xc0, 0x85, 0xc9};
+const unsigned char kCutsceneCode[] = {0xa1, 0x50, 0x12, 0x4e, 0x00, 0x8b, 0x40, 0x28, 0xc3};
+const unsigned int kGameMode = 0x0053e3f2;
+const unsigned int kGameModeLevel = 0x0d;
+const unsigned int kPaused = 0x0053e40c;
+const unsigned int kCutsceneState = 0x004e1250;
+bool g_gameStateKnown = false;
+
+// Around the camera, like a zone's five points: a roof over 4 of them makes it enclosed, and it
+// stays enclosed until no more than 2 are covered.
+const float kPlayerCoverSpread = 64.0f;
+const int kRoofedAt = 4;
+const int kOpenAt = 2;
+const DWORD kPlayerCoverIntervalMs = 250;
+// Near a light: inside its reach; no longer near: past this much of it.
+const float kLeaveReach = 1.25f;
+const float kPlayerFadeSeconds = 1.0f;
+
+struct PlayerLight {
+    bool playing = true;
+    bool roofed = false;
+    int covered = -1;               // points with a roof at the last answer; -1 before one
+    DWORD nextCoverCheck = 0;
+    bool nearLight = false;
+    float nearest = -1.0f;          // nearest sent light's distance over its reach; -1 for none
+    float fade = 0.0f;              // 0 dark .. 1 full brightness
+    float target = 0.0f;            // what it fades toward in play
+    DWORD lastTick = 0;
+} g_player;
+
+// Why the player is not playing, or nullptr while they are.
+const char* NotPlaying() {
+    if (!g_gameStateKnown) {
+        return nullptr;
+    }
+    if (Read<unsigned int>(kGameMode) != kGameModeLevel) {
+        return "not in a level";
+    }
+    if (Read<unsigned int>(kPaused) != 0) {
+        return "paused";
+    }
+    const unsigned int cutscene = Read<unsigned int>(kCutsceneState);
+    if (cutscene && !IsBadReadPtr((const void*)(cutscene + 0x28), 4) && Read<int>(cutscene + 0x28) != 0) {
+        return "cutscene";
+    }
+    return nullptr;
+}
+
+void UpdateRoof(const float* camera) {
+    const DWORD now = GetTickCount();
+    if ((int)(now - g_player.nextCoverCheck) < 0) {
+        return;
+    }
+    g_player.nextCoverCheck = now + kPlayerCoverIntervalMs;
+    CoverAboveFn ask = CoverAbove();
+    if (!ask) {
+        g_player.roofed = true;      // as with zones: without an answer, assume a roof
+        return;
+    }
+    const float s = kPlayerCoverSpread;
+    const float offsets[kCoverPoints][2] = {{0, 0}, {s, 0}, {-s, 0}, {0, s}, {0, -s}};
+    float points[kCoverPoints][3];
+    for (int i = 0; i < kCoverPoints; ++i) {
+        points[i][0] = camera[0] + offsets[i][0];
+        points[i][1] = camera[1];
+        points[i][2] = camera[2] + offsets[i][1];
+    }
+    const int covered = ask(&points[0][0], kCoverPoints);
+    if (covered < 0) {
+        return;                      // the renderer holds nothing around here yet
+    }
+    g_player.covered = covered;
+    if (covered >= kRoofedAt) {
+        g_player.roofed = true;
+    } else if (covered <= kOpenAt) {
+        g_player.roofed = false;
+    }
+}
+
+// Tracks the nearest light sent this frame, as distance over reach.
+struct NearestLight {
+    const float* camera = nullptr;
+    float nearest = -1.0f;
+    void Consider(const float* position, float reach) {
+        if (!camera || reach <= 0.0f) {
+            return;
+        }
+        const float dx = position[0] - camera[0], dy = position[1] - camera[1], dz = position[2] - camera[2];
+        const float relative = sqrtf(dx * dx + dy * dy + dz * dz) / reach;
+        if (nearest < 0.0f || relative < nearest) {
+            nearest = relative;
+        }
+    }
+};
+
+// How bright the player light is this frame, 0..1.
+float PlayerLightFade(const float* camera, float nearest) {
+    const DWORD now = GetTickCount();
+    float step = (now - g_player.lastTick) / 1000.0f / kPlayerFadeSeconds;
+    g_player.lastTick = now;
+    if (!g_settings.playerLightOnlyInTheDark) {
+        g_player.fade = 1.0f;
+        return g_player.fade;
+    }
+    const char* notPlaying = NotPlaying();
+    const bool playing = !notPlaying;
+    if (playing != g_player.playing) {
+        g_player.playing = playing;
+        g_player.target = -1.0f;     // logged again once back in play
+        Log("lights: player light: %s", playing ? "in play" : notPlaying);
+    }
+    if (!playing || !camera) {
+        g_player.fade = 0.0f;        // a cutscene or a menu cuts it at once
+        return g_player.fade;
+    }
+    UpdateRoof(camera);
+    g_player.nearest = nearest;
+    g_player.nearLight = nearest >= 0.0f && nearest < (g_player.nearLight ? kLeaveReach : 1.0f);
+    const float target = g_player.roofed && !g_player.nearLight ? 1.0f : 0.0f;
+    if (target != g_player.target) {
+        g_player.target = target;
+        Log("lights: player light: %s -- roof over %d of %d points, nearest light %.2f x its reach",
+            target > 0.0f ? "on" : "off", g_player.covered, kCoverPoints, g_player.nearest);
+    }
+    step = step > 1.0f ? 1.0f : step;
+    g_player.fade += g_player.fade < target ? step : -step;
+    g_player.fade = g_player.fade < 0.0f ? 0.0f : (g_player.fade > 1.0f ? 1.0f : g_player.fade);
+    if (fabsf(g_player.fade - target) < step) {
+        g_player.fade = target;
+    }
+    return g_player.fade;
+}
+
 void Rgb(const unsigned char* c, float* out) {
     out[0] = (g_settings.swapRedBlue ? c[2] : c[0]) / 255.0f;
     out[1] = c[1] / 255.0f;
@@ -407,21 +585,9 @@ D3DCOLOR Colour(const unsigned char* c) {
 // =============================================================================== Lights
 
 void Lights::Init(const char* ini) {
-    g_settings.enabled = ReadBool(ini, "Enabled", g_settings.enabled);
-    g_settings.radianceScale = ReadFloat(ini, "RadianceScale", g_settings.radianceScale);
-    g_settings.emitterRadius = ReadFloat(ini, "EmitterRadius", g_settings.emitterRadius);
-    g_settings.scaleByReach = ReadBool(ini, "ScaleByReach", g_settings.scaleByReach);
-    g_settings.swapRedBlue = ReadBool(ini, "SwapRedBlue", g_settings.swapRedBlue);
-    g_settings.markers = ReadBool(ini, "Markers", g_settings.markers);
-    g_settings.keepFallbackLight = ReadBool(ini, "KeepFallbackLight", g_settings.keepFallbackLight);
-    g_settings.zoneLights = ReadBool(ini, "ZoneLights", g_settings.zoneLights);
-    g_settings.zoneRadianceScale = ReadFloat(ini, "ZoneRadianceScale", g_settings.zoneRadianceScale);
-    g_settings.zoneReachCap = ReadFloat(ini, "ZoneReachCap", g_settings.zoneReachCap);
-    g_settings.zonesInTheOpen = ReadBool(ini, "ZonesInTheOpen", g_settings.zonesInTheOpen);
-    g_settings.playerLight = ReadBool(ini, "PlayerLight", g_settings.playerLight);
-    g_settings.playerLightScale = ReadFloat(ini, "PlayerLightScale", g_settings.playerLightScale);
-    g_settings.playerLightReach = ReadFloat(ini, "PlayerLightReach", g_settings.playerLightReach);
-    g_settings.playerLightHeight = ReadFloat(ini, "PlayerLightHeight", g_settings.playerLightHeight);
+    for (const Key& k : kKeys) {
+        ReadKey(ini, k);
+    }
 
     g_gameSupported = Matches(0x00426970, kUploadPrologue, sizeof(kUploadPrologue)) &&
                       Matches(0x0043f470, kLookupPrologue, sizeof(kLookupPrologue));
@@ -429,6 +595,13 @@ void Lights::Init(const char* ini) {
         g_gameSupported ? "South Park light pool found" : "not the expected SouthPark.exe -- game lights off",
         g_settings.radianceScale, g_settings.emitterRadius, g_settings.keepFallbackLight ? "kept on" : "Remix default");
     Log("lights: %s", Zones::Install() ? "level light zones hooked" : "not the expected SouthPark.exe -- zone lights off");
+    g_gameStateKnown = Matches(0x00443650, kInLevelCode, sizeof(kInLevelCode)) &&
+                       Matches(0x00443660, kPausedCode, sizeof(kPausedCode)) &&
+                       Matches(0x0049bf00, kCutsceneCode, sizeof(kCutsceneCode));
+    Log("lights: player light %s%s", g_settings.playerLight ? "on" : "off",
+        !g_settings.playerLightOnlyInTheDark ? ", always"
+        : g_gameStateKnown                   ? ", only in the dark"
+                                             : ", only in the dark (gameplay state not found: assumed playing)");
 }
 
 void Lights::OnSetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* m) {
@@ -461,12 +634,40 @@ void Lights::OnConnected() {
     ApplyFallbackLight();
 }
 
+int Lights::Save() {
+    int written = 0;
+    for (const Key& k : kKeys) {
+        char text[32];
+        if (k.number) {
+            _snprintf(text, sizeof(text), "%g", *k.number);
+        } else {
+            _snprintf(text, sizeof(text), "%d", *k.flag ? 1 : 0);
+        }
+        text[sizeof(text) - 1] = 0;
+        written += Settings::WriteKey("Lights", k.name, text) ? 1 : 0;
+    }
+    return written;
+}
+
+void Lights::ResetToDefaults() {
+    const bool fallbackChanged = g_settings.keepFallbackLight != LightSettings().keepFallbackLight;
+    g_settings = LightSettings();
+    if (fallbackChanged && Remix::Connected()) {
+        ApplyFallbackLight();
+    }
+}
+
 void Lights::SubmitFrame() {
     const auto& api = Remix::Api();
     for (auto handle : g_handles) {
         api.DestroyLight(handle);
     }
     g_handles.clear();
+
+    float camera[3], forward[3];
+    const bool haveCamera = Camera(camera, forward);
+    NearestLight nearest;
+    nearest.camera = haveCamera ? camera : nullptr;
 
     if (g_settings.enabled) {
         for (const auto& l : g_live) {
@@ -476,6 +677,7 @@ void Lights::SubmitFrame() {
             Rgb(l.def.rgba, rgb);
             SubmitLight(Hash(name), l.position, rgb,
                         Brightness(l.intensity, (float)l.def.reach, g_settings.radianceScale));
+            nearest.Consider(l.position, (float)l.def.reach);
         }
     }
     if (g_settings.zoneLights) {
@@ -488,24 +690,26 @@ void Lights::SubmitFrame() {
             ZoneRgb(z, rgb);
             SubmitLight(ZoneHash(z), z.centre, rgb, ZoneBrightness(z),
                         z.shape == Zones::Cone ? z.axis : nullptr);
-        }
-    }
-    if (g_settings.playerLight) {
-        const Zones::PointLight engine = Zones::LightAtProbe();
-        float camera[3], forward[3];
-        if (engine.valid && Camera(camera, forward)) {
-            camera[1] += g_settings.playerLightHeight;
-            float rgb[3];
-            for (int c = 0; c < 3; ++c) {
-                rgb[c] = (engine.ambient[c] + engine.directional[c]) / 255.0f;
-            }
-            SubmitLight(Hash("sp_player_light"), camera, rgb,
-                        Brightness(1.0f, g_settings.playerLightReach, g_settings.playerLightScale));
+            nearest.Consider(z.centre, z.reach < g_settings.zoneReachCap ? z.reach : g_settings.zoneReachCap);
         }
     }
     if (g_test.enabled) {
         SubmitLight(Hash("sp_test_light"), g_test.position, g_test.colour,
                     Brightness(g_test.intensity, g_test.reach, g_settings.radianceScale));
+        nearest.Consider(g_test.position, g_test.reach);
+    }
+    if (g_settings.playerLight) {
+        const float fade = PlayerLightFade(nearest.camera, nearest.nearest);
+        const Zones::PointLight engine = Zones::LightAtProbe();
+        if (fade > 0.0f && engine.valid && haveCamera) {
+            float position[3] = {camera[0], camera[1] + g_settings.playerLightHeight, camera[2]};
+            float rgb[3];
+            for (int c = 0; c < 3; ++c) {
+                rgb[c] = (engine.ambient[c] + engine.directional[c]) / 255.0f;
+            }
+            SubmitLight(Hash("sp_player_light"), position, rgb,
+                        fade * Brightness(1.0f, g_settings.playerLightReach, g_settings.playerLightScale));
+        }
     }
 }
 
@@ -644,6 +848,17 @@ void Lights::DrawPanel() {
 
     Ui::Heading("Player light");
     Ui::Checkbox("Light above the camera, coloured by the game's light there", &g_settings.playerLight);
+    Ui::Checkbox("Only in the dark: in play, under a roof, out of every light's reach",
+                 &g_settings.playerLightOnlyInTheDark);
+    if (g_settings.playerLight && g_settings.playerLightOnlyInTheDark) {
+        char roof[24], nearest[32];
+        _snprintf(roof, sizeof(roof), g_player.covered < 0 ? "not asked yet" : "%d of %d points",
+                  g_player.covered, kCoverPoints);
+        _snprintf(nearest, sizeof(nearest), g_player.nearest >= 0.0f ? "%.2f x its reach" : "none sent",
+                  g_player.nearest);
+        Ui::LabelDim("Now %3.0f%%: %s; roof %s (%s); nearest light %s", g_player.fade * 100.0f,
+                     g_player.playing ? "playing" : "not playing", g_player.roofed ? "yes" : "no", roof, nearest);
+    }
     Ui::Slider("Player light scale", &g_settings.playerLightScale, 10.0f, 100000.0f, "%.0f", true);
     Ui::Slider("Player light reach", &g_settings.playerLightReach, 50.0f, 4096.0f, "%.0f units", true);
     Ui::Slider("Height above the camera", &g_settings.playerLightHeight, 0.0f, 200.0f, "%.0f units");

@@ -18,6 +18,12 @@ void OnSetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* matrix);
 void OnBeginScene();
 // Once the Remix API is connected.
 void OnConnected();
+
+// Writes the panel's [Lights] values to Video_D3D9.ini; returns how many keys changed in the
+// file. Panel changes apply at once and reach the file only through this.
+int Save();
+// Puts every [Lights] value back to its default, applied at once and saved only by Save.
+void ResetToDefaults();
 // Inside the bridge's BeginScene: replaces last frame's Remix lights with this frame's.
 void SubmitFrame();
 

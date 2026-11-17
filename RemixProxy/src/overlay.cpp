@@ -513,6 +513,28 @@ void Draw(IDirect3DDevice9* device) {
     saved->Release();
 }
 
+// Panel changes apply at once; Video_D3D9.ini is written only from here.
+char g_saveStatus[96] = "Changes apply at once. Save writes them to Video_D3D9.ini.";
+
+void DrawSaveRow() {
+    if (Ui::Button("Save to Video_D3D9.ini")) {
+        const int written = Settings::Save() + Lights::Save();
+        _snprintf(g_saveStatus, sizeof(g_saveStatus), "Saved: %d %s changed in Video_D3D9.ini.", written,
+                  written == 1 ? "key" : "keys");
+        g_saveStatus[sizeof(g_saveStatus) - 1] = 0;
+        Log("overlay: saved, %d keys changed in the ini", written);
+    }
+    Ui::SameLine();
+    if (Ui::Button("Reset to defaults")) {
+        Settings::ResetToDefaults();
+        Lights::ResetToDefaults();
+        lstrcpynA(g_saveStatus, "Defaults applied, not saved. Save writes them to Video_D3D9.ini.",
+                  sizeof(g_saveStatus));
+        Log("overlay: settings reset to defaults");
+    }
+    Ui::LabelDim("%s", g_saveStatus);
+}
+
 } // namespace
 
 // =============================================================================== Overlay
@@ -563,6 +585,7 @@ void Overlay::Render(IDirect3DDevice9* device) {
     Lights::DrawMarkers(g_backBufferWidth, g_backBufferHeight);
     if (g_open) {
         BeginPanel();
+        DrawSaveRow();
         Settings::DrawPanel();
         Lights::DrawPanel();
         EndPanel();

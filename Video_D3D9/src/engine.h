@@ -29,7 +29,8 @@ bool CameraFollowsDisplayAspect();
 void SetDisplayAspect(float aspect);
 
 // Once a frame: brings the camera's field of view to [Display] FieldOfView, except in
-// cutscenes, which keep the framing they were made with.
+// cutscenes, which keep the framing they were made with, and the radius drawn around the
+// camera to [FullMap] KeepAroundCamera.
 void OnFrame();
 
 // Sends one of the engine's API calls to `replacement` instead. The unpacked executable calls

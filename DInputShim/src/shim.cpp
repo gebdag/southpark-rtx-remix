@@ -922,6 +922,13 @@ extern "C" HRESULT WINAPI DirectInputCreateEx(HINSTANCE inst, DWORD version, con
     return hr;
 }
 
+// The F4 overlay's live pad settings (d3d9.dll calls it; the renderer exports the same
+// function for its keys). 1 when the key is one of them.
+extern "C" __declspec(dllexport) int __cdecl SouthPark_SetSetting(const char* section, const char* key,
+                                                                  float value) {
+    return section && key && Pad::SetSetting(section, key, value) ? 1 : 0;
+}
+
 extern "C" HRESULT WINAPI DllCanUnloadNow(void) {
     NoArgHrFn fn = (NoArgHrFn)Real("DllCanUnloadNow");
     return fn ? fn() : S_FALSE;

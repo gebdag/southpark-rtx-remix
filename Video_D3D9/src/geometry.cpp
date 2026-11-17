@@ -517,6 +517,7 @@ const unsigned int kCostFrames = 600;
 const unsigned int kCostSampleEvery = 10;
 bool g_costSampled = false;   // this frame is timed
 double g_ticksPerMs = 0.0;
+double g_costPeriodStart = 0.0;   // when the frames the next line covers began, ms
 
 double NowMs() {
     LARGE_INTEGER t;
@@ -2224,12 +2225,18 @@ void Geometry::EndFrame() {
     if (g_costSampled) {
         ++g_cost.frames;
     }
+    if (g_costPeriodStart == 0.0) {
+        g_costPeriodStart = NowMs();
+    }
     if (g_cost.frames == kCostFrames / kCostSampleEvery) {
         const double f = (double)g_cost.frames;
+        const double now = NowMs();
         LogLine("    batch path per frame: %.0f flushes; state %.2f ms, normals %.2f ms, decals %.2f "
-                "ms, draw calls %.2f ms", g_cost.flushes / f, g_cost.state / f, g_cost.normals / f,
-                g_cost.decals / f, g_cost.draw / f);
+                "ms, draw calls %.2f ms; %.1f fps", g_cost.flushes / f, g_cost.state / f,
+                g_cost.normals / f, g_cost.decals / f, g_cost.draw / f,
+                kCostFrames * 1000.0 / (now - g_costPeriodStart));
         g_cost = {};
+        g_costPeriodStart = now;
     }
     if (g_dumpingFrame) {
         g_dumpingFrame = false;

@@ -12,25 +12,43 @@ struct Setting {
     const char* section;
     const char* key;
     float value;
+    float fallback;  // the default of the module that reads it
     float minimum;
     float maximum;
-    bool dirty;      // changed on the panel, not yet written
-    bool onOff;      // a checkbox, written as 0 or 1
+    bool dirty;      // changed on the panel, not yet handed to its module
+    bool whole;      // written as a whole number: a checkbox's 0 or 1, or a count of units
 };
 
-// Defaults match the modules that read them.
-Setting g_turn = {"Input", "PadTurnSensitivity", 0.6f, 0.1f, 1.0f, false, false};
-Setting g_look = {"Input", "PadLookSensitivity", 1.0f, 0.3f, 1.0f, false, false};
-Setting g_fov = {"Display", "FieldOfView", 1.0f, 0.7f, 1.6f, false, false};
-Setting g_stars = {"Sky", "StarrySky", 1.0f, 0.0f, 1.0f, false, true};
-Setting* const g_settings[] = {&g_turn, &g_look, &g_fov, &g_stars};
+Setting g_turn = {"Input", "PadTurnSensitivity", 0.6f, 0.6f, 0.1f, 1.0f, false, false};
+Setting g_look = {"Input", "PadLookSensitivity", 1.0f, 1.0f, 0.3f, 1.0f, false, false};
+Setting g_fov = {"Display", "FieldOfView", 1.0f, 1.0f, 0.7f, 1.6f, false, false};
+// The renderer reads it as an integer and takes up to 16384.
+Setting g_keepAround = {"FullMap", "KeepAroundCamera", 2048.0f, 2048.0f, 0.0f, 16384.0f, false, true};
+// The level's own draw distance, in percent. The ini may go to 400; the slider stops at 200.
+Setting g_drawPercent = {"FullMap", "DrawDistancePercent", 100.0f, 100.0f, 100.0f, 400.0f, false, true};
+const float kDrawPercentSliderMaximum = 200.0f;
+Setting g_stars = {"Sky", "StarrySky", 1.0f, 1.0f, 0.0f, 1.0f, false, true};
+Setting* const g_settings[] = {&g_turn, &g_look, &g_fov, &g_keepAround, &g_drawPercent, &g_stars};
 
 char g_ini[MAX_PATH];
-DWORD g_nextWrite = 0;
-// A drag changes the value every frame; the file is written at most this often.
-const DWORD kWriteIntervalMs = 250;
-
 float g_projection11 = 0.0f;
+
+// SouthPark_SetSetting(section, key, value), exported by the renderer (Video_D3D.dll) and the
+// input shim (dinput.dll): each takes its own keys and returns 0 for the rest.
+typedef int (__cdecl *SetSettingFn)(const char* section, const char* key, float value);
+const char* const kModules[] = {"Video_D3D.dll", "dinput.dll"};
+
+bool Apply(const Setting& s) {
+    bool taken = false;
+    for (const char* module : kModules) {
+        HMODULE handle = GetModuleHandleA(module);
+        SetSettingFn set = handle ? (SetSettingFn)GetProcAddress(handle, "SouthPark_SetSetting") : nullptr;
+        if (set && set(s.section, s.key, s.value)) {
+            taken = true;
+        }
+    }
+    return taken;
+}
 
 void Read(Setting& s) {
     char text[32];
@@ -43,13 +61,6 @@ void Read(Setting& s) {
     }
 }
 
-void Write(const Setting& s) {
-    char text[32];
-    _snprintf(text, sizeof(text), s.onOff ? "%.0f" : "%.2f", s.value);
-    text[sizeof(text) - 1] = 0;
-    WritePrivateProfileStringA(s.section, s.key, text, g_ini);
-}
-
 } // namespace
 
 void Settings::Init(const char* iniPath) {
@@ -57,8 +68,9 @@ void Settings::Init(const char* iniPath) {
     for (Setting* s : g_settings) {
         Read(*s);
     }
-    Log("settings: pad turn %.2f, pad look %.2f, field of view x%.2f, starry sky %.0f", g_turn.value,
-        g_look.value, g_fov.value, g_stars.value);
+    Log("settings: pad turn %.2f, pad look %.2f, field of view x%.2f, culling radius %.0f, draw distance "
+        "%.0f%%, starry sky %.0f",
+        g_turn.value, g_look.value, g_fov.value, g_keepAround.value, g_drawPercent.value, g_stars.value);
 }
 
 void Settings::OnSetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* m) {
@@ -68,17 +80,42 @@ void Settings::OnSetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* m) {
     }
 }
 
-// Only what the panel changed is written: the others may have been edited in the file since.
 void Settings::Update() {
-    if ((int)(GetTickCount() - g_nextWrite) < 0) {
-        return;
-    }
     for (Setting* s : g_settings) {
         if (s->dirty) {
-            Write(*s);
+            if (!Apply(*s)) {
+                Log("settings: no module took [%s] %s -- it applies after Save and a restart", s->section, s->key);
+            }
             s->dirty = false;
-            g_nextWrite = GetTickCount() + kWriteIntervalMs;
         }
+    }
+}
+
+bool Settings::WriteKey(const char* section, const char* key, const char* text) {
+    char current[64];
+    GetPrivateProfileStringA(section, key, "\x01", current, sizeof(current), g_ini);
+    if (lstrcmpA(current, text) == 0) {
+        return false;
+    }
+    WritePrivateProfileStringA(section, key, text, g_ini);
+    return true;
+}
+
+int Settings::Save() {
+    int written = 0;
+    for (const Setting* s : g_settings) {
+        char text[32];
+        _snprintf(text, sizeof(text), s->whole ? "%.0f" : "%.2f", s->value);
+        text[sizeof(text) - 1] = 0;
+        written += WriteKey(s->section, s->key, text) ? 1 : 0;
+    }
+    return written;
+}
+
+void Settings::ResetToDefaults() {
+    for (Setting* s : g_settings) {
+        s->value = s->fallback;
+        s->dirty = true;
     }
 }
 
@@ -87,6 +124,16 @@ void Settings::DrawPanel() {
     g_turn.dirty |= Ui::Slider("Pad turn sensitivity", &g_turn.value, g_turn.minimum, g_turn.maximum, "%.2f");
     g_look.dirty |= Ui::Slider("Pad look sensitivity", &g_look.value, g_look.minimum, g_look.maximum, "%.2f");
     g_fov.dirty |= Ui::Slider("Field of view", &g_fov.value, g_fov.minimum, g_fov.maximum, "x%.2f");
+    // KeepAroundCamera: the level is drawn within this radius whichever way the camera faces.
+    g_keepAround.dirty |= Ui::Slider("Culling radius (drawn behind the camera too)", &g_keepAround.value,
+                                     g_keepAround.minimum, g_keepAround.maximum, "%.0f units");
+    // DrawDistancePercent: how far ahead the level is drawn, against its own distance. A value
+    // above the slider's end, set in the ini, shows as a full bar and stays until dragged.
+    if (Ui::Slider("Draw distance (of the level's own)", &g_drawPercent.value, g_drawPercent.minimum,
+                   kDrawPercentSliderMaximum, "%.0f%%")) {
+        g_drawPercent.value = floorf(g_drawPercent.value + 0.5f);
+        g_drawPercent.dirty = true;
+    }
     bool starry = g_stars.value != 0.0f;
     if (Ui::Checkbox("Starry sky: the intro's and menus' star cards become the sky", &starry)) {
         g_stars.value = starry ? 1.0f : 0.0f;
@@ -94,8 +141,6 @@ void Settings::DrawPanel() {
     }
     if (g_projection11 != 0.0f) {
         const float degrees = 2.0f * atanf(1.0f / fabsf(g_projection11)) * 57.29578f;
-        Ui::LabelDim("Field of view now: %.0f degrees across. Saved to Video_D3D9.ini as you go.", degrees);
-    } else {
-        Ui::LabelDim("Saved to Video_D3D9.ini as you go.");
+        Ui::LabelDim("Field of view now: %.0f degrees across.", degrees);
     }
 }

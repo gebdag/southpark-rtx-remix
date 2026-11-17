@@ -344,11 +344,14 @@ float g_lookSensitivity = 1.0f;
 FILETIME g_iniWritten = {};
 DWORD g_iniNextCheck = 0;
 
+float ValidSensitivity(float value, float fallback) {
+    return (value >= 0.05f && value <= 1.0f) ? value : fallback;
+}
+
 float ReadSensitivity(const char* key, float fallback) {
     char text[32];
     GetPrivateProfileStringA("Input", key, "", text, sizeof(text), g_iniPath);
-    const float value = text[0] ? (float)atof(text) : fallback;
-    return (value >= 0.05f && value <= 1.0f) ? value : fallback;
+    return ValidSensitivity(text[0] ? (float)atof(text) : fallback, fallback);
 }
 
 void RefreshSettings() {
@@ -840,6 +843,20 @@ void PatchGame() {
 }
 
 } // namespace
+
+bool Pad::SetSetting(const char* section, const char* key, float value) {
+    if (lstrcmpiA(section, "Input") != 0) {
+        return false;
+    }
+    float* sensitivity = lstrcmpiA(key, "PadTurnSensitivity") == 0   ? &g_turnSensitivity
+                         : lstrcmpiA(key, "PadLookSensitivity") == 0 ? &g_lookSensitivity
+                                                                      : nullptr;
+    if (!sensitivity) {
+        return false;
+    }
+    *sensitivity = ValidSensitivity(value, *sensitivity);
+    return true;
+}
 
 void Pad::Install(DirectInputCreateAFn realCreate, BlockedFn inputBlocked, LogFn log, const char* iniPath) {
     if (g_installed) {

@@ -53,29 +53,25 @@ int UncullBudget();
 // its bound, which is what a whole map needs once the frustum test is off.
 unsigned int BatchLimitScale();
 
-// Floor under the camera's own draw distance (camera+0x4e4, 1024 units by default, and the
-// field the "Fog Distance" video option moves), in world units. That distance sizes the
-// frustum corner points, the side planes, the frustum AABB the engine's 2D X/Z test compares
-// against, and the cull box it publishes -- so it, not the frustum test, is what still
-// removes the town once the room and frustum tests are widened.
-//
-// A floor rather than a multiplier because the engine does not rewrite the field every frame:
-// when the fog option is absent it keeps whatever is already there, so scaling it in place
-// would compound frame over frame. Raising it to a fixed distance gives the same answer
-// however many times it is applied, and steps aside if the option ever asks for more.
-// 0 keeps the engine's own value.
-float DrawDistance();
+// [FullMap] DrawDistancePercent, as a multiplier (1 to 4): scales the camera's draw distance
+// (camera+0x4e4), which the engine sets from the fog distance of the area the camera is in.
+// That distance sizes the frustum corner points, the side planes, the frustum AABB the
+// engine's 2D X/Z test compares against, and the cull box it publishes -- so it, not the
+// frustum test, is what still removes the town once the room and frustum tests are widened.
+// 1 (100%) is the level as designed. Set while the game runs (the F4 overlay, 100 to 200%).
+float DrawDistanceScale();
 
 // Radius around the camera, in world units, inside which the level is drawn whichever way
 // the camera faces. The engine's 2D X/Z box test compares objects against a box around the
 // view cone, and the cone starts at the eye, so without this nothing behind the camera is
 // drawn at all. Drawing only; loading, spawning and simulation are untouched. 0 is off.
+// Re-read while the game runs (the F4 overlay's culling radius).
 float KeepAroundCamera();
 
 // Multiplier on the camera's drawn-object list, the fixed 128-entry array the engine
 // records each frame's visible objects into and overruns silently -- an object past it is
-// simply not drawn. This is what bounds DrawDistance: at 8192 units the list peaks around
-// 93 of 128, so a busier scene crosses it and geometry starts going missing.
+// simply not drawn. This is what bounds the draw distance: a busy scene at a large draw
+// distance fills it and geometry goes missing.
 //
 // Raising it relocates the list, which makes it a single shared buffer rather than a field
 // inside each camera. That is equivalent for one viewport and WRONG for split screen, so
@@ -210,9 +206,14 @@ bool LimitCutscenes();
 // [Display] FieldOfView: a multiple of the engine's own field of view (1 = as shipped).
 float FieldOfView();
 
-// Re-reads the settings that may change while the game runs -- the F4 overlay (d3d9.dll)
-// writes them to the ini -- when the file has changed. Cheap to call every frame.
+// Re-reads the settings that may change while the game runs when the ini has changed. Cheap
+// to call every frame.
 void RefreshLive();
+
+// Sets one of those settings without touching the file: the F4 overlay (d3d9.dll) applies its
+// changes this way and writes the ini only when asked to save. False for a key that is not
+// one of them.
+bool SetLive(const char* section, const char* key, float value);
 
 // ----------------------------------------------------------------------------- debug
 
