@@ -65,6 +65,8 @@ bool DecodeFailed(int index);
 // Whether a set is one of the sky textures named in the ini. The sky is ordinary world
 // geometry to the engine, so the only thing distinguishing it is the name in chunk 3.
 bool IsSkySet(int index);
+// Whether a set is one of [Sky] StarTextureNames: the game's star-field cards.
+bool IsStarSet(int index);
 
 // Drops every decoded frame but keeps the blobs, so the next draw decodes afresh. The engine
 // asks for this through GFXDLL_FlushTextureCache, which the original honours by jumping into

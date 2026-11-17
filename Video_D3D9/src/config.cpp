@@ -11,6 +11,8 @@ namespace {
 char g_iniPath[MAX_PATH];
 char g_baseDir[MAX_PATH];
 char g_skyNames[512];
+char g_starNames[512];
+bool g_starrySky = true;
 int g_screenshotFrame = 0;
 int g_screenshotInterval = 0;
 int g_lookdevCaptureKey = 0x78;   // VK_F9
@@ -258,6 +260,14 @@ const char* kDefaultIni =
     "; exactly as the game shades them: the cloud layers, and the intro's star cards.\r\n"
     "SkyTextureNames=Dawn,Day,Nite\r\n"
     "\r\n"
+    "; The intro and the main menu put their stars on a flat wall of cards in front of the\r\n"
+    "; camera; past its edges is the black background, and a path tracer lights the cards like\r\n"
+    "; any wall. StarrySky=1 draws none of them and gives the sky box their texture, so the\r\n"
+    "; stars surround the scene. The F4 overlay switches it while the game runs.\r\n"
+    "; StarTextureNames: the sets that are such a star field, by name prefix.\r\n"
+    "StarrySky=1\r\n"
+    "StarTextureNames=STARS01\r\n"
+    "\r\n"
     "[Normals]\r\n"
     "; Pre-lit geometry -- most of the world -- carries vertex colours instead of normals, so\r\n"
     "; its normals are computed from its triangles. Faces meeting at less than this angle, in\r\n"
@@ -451,6 +461,8 @@ void Config::Load(void* self) {
     Config::RefreshLive();
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
+    GetPrivateProfileStringA("Sky", "StarTextureNames", "STARS01",
+                             g_starNames, sizeof(g_starNames), g_iniPath);
 
     LogLine("=== config: %s", g_iniPath);
     LogLine("    Display Mode=%s Window=%dx%d at %d,%d AspectRatio=%.4f%s PauseWhenUnfocused=%d",
@@ -486,6 +498,8 @@ void Config::Load(void* self) {
 bool Config::DisableTriangleSkipMask()    { return g_disableTriangleSkipMask; }
 bool Config::DisableOffscreenQuadReject() { return g_disableOffscreenQuadReject; }
 bool Config::UseEngineBackgroundColour()  { return g_useEngineBackgroundColour; }
+bool Config::StarrySky()                 { return g_starrySky; }
+const char* Config::StarTextureNames()   { return g_starNames; }
 const char* Config::SkyTextureNames()     { return g_skyNames; }
 bool Config::LogEveryCall()               { return g_logEveryCall; }
 bool Config::LoadEntireMap()              { return g_loadEntireMap; }
@@ -540,6 +554,11 @@ void Config::RefreshLive() {
     if (fov != g_fieldOfView) {
         g_fieldOfView = fov;
         LogLine("    config: FieldOfView %.2f", fov);
+    }
+    const bool starry = ReadBool("Sky", "StarrySky", true);
+    if (starry != g_starrySky) {
+        g_starrySky = starry;
+        LogLine("    config: StarrySky %d", starry ? 1 : 0);
     }
 }
 int Config::LookdevGameWindowX()          { return g_lookdevGameX; }

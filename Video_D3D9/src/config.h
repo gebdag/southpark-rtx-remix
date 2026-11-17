@@ -137,6 +137,12 @@ bool UseEngineBackgroundColour();
 // Sky batches are drawn at the far plane, which RTX Remix takes as its sky layer.
 const char* SkyTextureNames();
 
+// [Sky] StarrySky: the game's star-field cards (StarTextureNames, the intro's and the main
+// menu's wall of star tiles) are not drawn; the sky box wears their texture instead. Re-read
+// while the game runs.
+bool StarrySky();
+const char* StarTextureNames();
+
 // Draw a large box around the camera in the background colour, at the far plane, first in
 // the frame. The game has no skydome -- it leaves the cleared frame showing -- and Remix
 // needs a sky there.

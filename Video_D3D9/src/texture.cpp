@@ -42,6 +42,7 @@ unsigned short g_lastDecodeTransparentPercent = 0;
 unsigned int g_lastDecodeMeanColour = 0;
 int   g_decodeFailures = 0;
 bool  g_isSky[kMaxSets];
+bool  g_isStars[kMaxSets];
 int   g_count = 0;
 int   g_paletteLogged = 0;
 
@@ -366,12 +367,11 @@ static const char* SetName(const void* blob) {
     return "";
 }
 
-// The sky list is a comma-separated set of name prefixes, so "Day" covers Day1 and Day2.
-static bool NameIsSky(const char* name) {
+// A name list is a comma-separated set of name prefixes, so "Day" covers Day1 and Day2.
+static bool NameInList(const char* name, const char* list) {
     if (!name || !*name) {
         return false;
     }
-    const char* list = Config::SkyTextureNames();
     while (*list) {
         while (*list == ',' || *list == ' ') {
             ++list;
@@ -397,10 +397,14 @@ void Texture::FinishEnumeration() {
     int valid = 0;
     int skies = 0;
     for (int i = 0; i < g_count; ++i) {
-        if (g_sets[i] && NameIsSky(SetName(g_sets[i]))) {
+        if (g_sets[i] && NameInList(SetName(g_sets[i]), Config::SkyTextureNames())) {
             g_isSky[i] = true;
             ++skies;
             LogLine("    sky texture set %d: %s", i, SetName(g_sets[i]));
+        }
+        if (g_sets[i] && NameInList(SetName(g_sets[i]), Config::StarTextureNames())) {
+            g_isStars[i] = true;
+            LogLine("    star-field texture set %d: %s", i, SetName(g_sets[i]));
         }
     }
     LogLine("    %d sky sets matched \"%s\"", skies, Config::SkyTextureNames());
@@ -844,6 +848,10 @@ bool Texture::IsSkySet(int index) {
     return index >= 0 && index < g_count && g_isSky[index];
 }
 
+bool Texture::IsStarSet(int index) {
+    return index >= 0 && index < g_count && g_isStars[index];
+}
+
 void Texture::FlushDecoded() {
     int released = 0;
     for (int i = 0; i < g_count; ++i) {
@@ -875,6 +883,7 @@ void Texture::ReleaseAll() {
         }
         g_decodeFailed[i] = false;
         g_isSky[i] = false;
+        g_isStars[i] = false;
     }
     g_count = 0;
 }

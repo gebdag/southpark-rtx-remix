@@ -1308,6 +1308,16 @@ void DumpBatch(int vertexCount, bool textured, bool culled, bool sky, bool decal
 // sky detection looks for.
 
 bool g_skyboxDrawn = false;      // once per frame
+
+// The star field. The intro and the main menu put their stars on a flat wall of cards
+// (STARS01, 308-unit tiles in one plane in front of the camera), with the black background past
+// its edges. With StarrySky those cards are not drawn and the sky box wears their texture,
+// tiled so a star is about the size it was on the cards: a face of the box, 90 degrees
+// across, repeats it 15 times. The box is drawn before the frame's world, so it follows the
+// previous frame's cards.
+int g_starSetThisFrame = -1;
+int g_starSetLastFrame = -1;
+const float kStarRepeatsPerFace = 15.0f;
 // g_view and g_proj are written only when a view matrix arrives and deliberately persist
 // across frames, so this tracks whether one has *ever* arrived. Clearing it per frame would
 // drop the sky on any frame that reuses the previous camera without resending it.
@@ -1364,29 +1374,39 @@ bool DrawSkybox() {
     const unsigned int rgb = Config::SkyboxColour() >= 0
                            ? (unsigned int)Config::SkyboxColour()
                            : (Device::ClearColour() & 0x00ffffffu);
-    const D3DCOLOR colour = (D3DCOLOR)(0xff000000u | rgb);
+    IDirect3DTexture9* stars = (Config::StarrySky() && g_starSetLastFrame >= 0)
+                             ? Texture::GetTexture(g_starSetLastFrame, 0, 0) : 0;
+    // Under stars the box is the texture itself: the star texture is drawn on black.
+    const D3DCOLOR colour = stars ? D3DCOLOR_ARGB(255, 255, 255, 255) : (D3DCOLOR)(0xff000000u | rgb);
 
-    WorldVertex v[8];
-    for (int i = 0; i < 8; ++i) {
-        v[i].x = eye[0] + ((i & 1) ? h : -h);
-        v[i].y = eye[1] + ((i & 2) ? h : -h);
-        v[i].z = eye[2] + ((i & 4) ? h : -h);
-        // Normals point back at the camera: the viewer is inside the box, so the faces that
-        // matter are the inward ones.
-        const float nx = (i & 1) ? -1.0f : 1.0f;
-        const float ny = (i & 2) ? -1.0f : 1.0f;
-        const float nz = (i & 4) ? -1.0f : 1.0f;
-        const float inv = 0.57735027f;
-        v[i].nx = nx * inv; v[i].ny = ny * inv; v[i].nz = nz * inv;
-        v[i].diffuse = colour;
-        v[i].u = 0.0f;
-        v[i].v = 0.0f;
+    // Four corners a face, so each face can carry its own texture coordinates. Normals point
+    // back at the camera: the viewer is inside the box, so the inward faces are the ones seen.
+    WorldVertex v[24];
+    unsigned short indices[36];
+    for (int face = 0; face < 6; ++face) {
+        const int axis = face / 2;                  // x, y, z
+        const float side = (face & 1) ? h : -h;
+        const int a = (axis + 1) % 3, b = (axis + 2) % 3;
+        for (int k = 0; k < 4; ++k) {
+            WorldVertex& w = v[face * 4 + k];
+            float p[3];
+            p[axis] = side;
+            p[a] = (k & 1) ? h : -h;
+            p[b] = (k & 2) ? h : -h;
+            w.x = eye[0] + p[0]; w.y = eye[1] + p[1]; w.z = eye[2] + p[2];
+            float n[3] = {0.0f, 0.0f, 0.0f};
+            n[axis] = (face & 1) ? -1.0f : 1.0f;
+            w.nx = n[0]; w.ny = n[1]; w.nz = n[2];
+            w.diffuse = colour;
+            w.u = (k & 1) ? kStarRepeatsPerFace : 0.0f;
+            w.v = (k & 2) ? kStarRepeatsPerFace : 0.0f;
+        }
+        const unsigned short base = (unsigned short)(face * 4);
+        const unsigned short quad[6] = {0, 1, 3, 0, 3, 2};
+        for (int k = 0; k < 6; ++k) {
+            indices[face * 6 + k] = (unsigned short)(base + quad[k]);
+        }
     }
-    static const unsigned short kBoxIndices[36] = {
-        0,1,3, 0,3,2,   4,6,7, 4,7,5,     // -z, +z
-        0,4,5, 0,5,1,   2,3,7, 2,7,6,     // -y, +y
-        0,2,6, 0,6,4,   1,5,7, 1,7,3,     // -x, +x
-    };
 
     D3DMATRIX identity;
     Identity(identity);
@@ -1394,7 +1414,9 @@ bool DrawSkybox() {
     dev->SetTransform(D3DTS_VIEW, &g_view);
     dev->SetTransform(D3DTS_PROJECTION, &g_proj);
 
-    dev->SetTexture(0, 0);
+    dev->SetTexture(0, stars);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
     dev->SetFVF(kWorldFVF);
     // At the far plane, where Remix takes it as sky; first in the frame, so it fills every
     // pixel, and writing no depth, so everything after it draws over it.
@@ -1409,14 +1431,15 @@ bool DrawSkybox() {
     dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
     // Seen from the inside, so winding is not worth reasoning about.
     dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, stars ? D3DTOP_SELECTARG2 : D3DTOP_SELECTARG1);
     dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TEXTURE);
     dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
     dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
     dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
     dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
 
-    const bool drawn = Device::DrawTriangles(v, sizeof(WorldVertex), 8, kBoxIndices, 36);
+    const bool drawn = Device::DrawTriangles(v, sizeof(WorldVertex), 24, indices, 36);
     if (!drawn && g_skyboxLogged < 4) {
         ++g_skyboxLogged;
         LogLine("    skybox draw failed");
@@ -1502,6 +1525,12 @@ void Flush() {
     // has to go through this, or a suppressed bind still steers the depth mode and the census.
     const bool modeTextured = ModeBindsTexture();
     const int activeTexture = modeTextured ? g_currentTexture : -1;
+    if (Config::StarrySky() && Texture::IsStarSet(activeTexture)) {
+        // A star-field card: the sky box shows the stars instead.
+        g_starSetThisFrame = activeTexture;
+        g_indexCount = 0;
+        return;
+    }
     if (!modeTextured && g_currentTexture >= 0) {
         ++g_modeSuppressedBinds;
     }
@@ -2118,6 +2147,8 @@ void Geometry::BeginFrame() {
 
 void Geometry::EndFrame() {
     Flush();
+    g_starSetLastFrame = g_starSetThisFrame;
+    g_starSetThisFrame = -1;
     if (g_costSampled) {
         ++g_cost.frames;
     }

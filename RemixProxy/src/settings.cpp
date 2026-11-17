@@ -15,13 +15,15 @@ struct Setting {
     float minimum;
     float maximum;
     bool dirty;      // changed on the panel, not yet written
+    bool onOff;      // a checkbox, written as 0 or 1
 };
 
 // Defaults match the modules that read them.
-Setting g_turn = {"Input", "PadTurnSensitivity", 0.6f, 0.1f, 1.0f, false};
-Setting g_look = {"Input", "PadLookSensitivity", 1.0f, 0.3f, 1.0f, false};
-Setting g_fov = {"Display", "FieldOfView", 1.0f, 0.7f, 1.6f, false};
-Setting* const g_settings[] = {&g_turn, &g_look, &g_fov};
+Setting g_turn = {"Input", "PadTurnSensitivity", 0.6f, 0.1f, 1.0f, false, false};
+Setting g_look = {"Input", "PadLookSensitivity", 1.0f, 0.3f, 1.0f, false, false};
+Setting g_fov = {"Display", "FieldOfView", 1.0f, 0.7f, 1.6f, false, false};
+Setting g_stars = {"Sky", "StarrySky", 1.0f, 0.0f, 1.0f, false, true};
+Setting* const g_settings[] = {&g_turn, &g_look, &g_fov, &g_stars};
 
 char g_ini[MAX_PATH];
 DWORD g_nextWrite = 0;
@@ -43,7 +45,7 @@ void Read(Setting& s) {
 
 void Write(const Setting& s) {
     char text[32];
-    _snprintf(text, sizeof(text), "%.2f", s.value);
+    _snprintf(text, sizeof(text), s.onOff ? "%.0f" : "%.2f", s.value);
     text[sizeof(text) - 1] = 0;
     WritePrivateProfileStringA(s.section, s.key, text, g_ini);
 }
@@ -55,8 +57,8 @@ void Settings::Init(const char* iniPath) {
     for (Setting* s : g_settings) {
         Read(*s);
     }
-    Log("settings: pad turn %.2f, pad look %.2f, field of view x%.2f", g_turn.value, g_look.value,
-        g_fov.value);
+    Log("settings: pad turn %.2f, pad look %.2f, field of view x%.2f, starry sky %.0f", g_turn.value,
+        g_look.value, g_fov.value, g_stars.value);
 }
 
 void Settings::OnSetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* m) {
@@ -85,6 +87,11 @@ void Settings::DrawPanel() {
     g_turn.dirty |= Ui::Slider("Pad turn sensitivity", &g_turn.value, g_turn.minimum, g_turn.maximum, "%.2f");
     g_look.dirty |= Ui::Slider("Pad look sensitivity", &g_look.value, g_look.minimum, g_look.maximum, "%.2f");
     g_fov.dirty |= Ui::Slider("Field of view", &g_fov.value, g_fov.minimum, g_fov.maximum, "x%.2f");
+    bool starry = g_stars.value != 0.0f;
+    if (Ui::Checkbox("Starry sky: the intro's and menus' star cards become the sky", &starry)) {
+        g_stars.value = starry ? 1.0f : 0.0f;
+        g_stars.dirty = true;
+    }
     if (g_projection11 != 0.0f) {
         const float degrees = 2.0f * atanf(1.0f / fabsf(g_projection11)) * 57.29578f;
         Ui::LabelDim("Field of view now: %.0f degrees across. Saved to Video_D3D9.ini as you go.", degrees);
