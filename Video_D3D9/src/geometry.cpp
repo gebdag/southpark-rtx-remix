@@ -274,6 +274,8 @@ bool ModeBindsTexture() {
 // Batches whose selected set the mode suppressed: binds that would otherwise tint walls with
 // another set's texels and cut them out with its mask.
 unsigned int g_modeSuppressedBinds = 0;
+// Batches not drawn because their constant alpha is 0 (see Flush).
+unsigned int g_zeroAlphaBatches = 0;
 
 // The render mode, as opcode 0xb9 delivers it. The original reads four things out of it:
 //
@@ -1564,6 +1566,23 @@ void Flush() {
         g_indexCount = 0;
         return;
     }
+    if (Texture::IsHiddenSet(activeTexture)) {
+        g_indexCount = 0;
+        return;
+    }
+    // A batch whose combiner gives it a constant alpha of 0 draws nothing in the original:
+    // every mode but 0x28 turns the alpha test on (ALPHAREF 0, GREATER, at 0x100058c2), the
+    // vertex stage writes the constant alpha in place of each vertex's own (0x100083ab), and
+    // the texture stage multiplies it by the texel's (MODULATEALPHA). So it is not drawn here
+    // either. On plain D3D9 the alpha test would discard it anyway, but RTX Remix does not
+    // honour a zero vertex alpha the same way: the Acclaim logo's black, alpha-0 overlays
+    // (combiner mode 0x13, prim 00000000) would cover its letters whenever a blended draw, the
+    // comet's trail, is in the frame.
+    if (ConstantAlphaForBatch() == 0) {
+        ++g_zeroAlphaBatches;
+        g_indexCount = 0;
+        return;
+    }
     if (!modeTextured && g_currentTexture >= 0) {
         ++g_modeSuppressedBinds;
     }
@@ -2618,6 +2637,7 @@ void Geometry::LogTextureStats() {
     }
     LogLine("    binds suppressed by the combiner mode (flat modes 0x12-0x15, 0x17, 0x19, "
             "0x1c): %u", g_modeSuppressedBinds);
+    LogLine("    batches skipped for a constant alpha of 0: %u", g_zeroAlphaBatches);
     LogLine("    UNTEXTURED batches by (mode, constant, blend) -- this is where the houses are:");
     for (int i = 0; i < g_untexturedKindCount; ++i) {
         const UntexturedKind& k = g_untexturedKinds[i];

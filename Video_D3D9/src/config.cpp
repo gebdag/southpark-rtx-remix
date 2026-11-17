@@ -17,6 +17,7 @@ bool g_dumpEnvTextures = false;
 bool g_environmentMapsAsMetal = true;
 char g_chromeNames[512];
 char g_dumpTextureNames[512];
+char g_hideTextureNames[512];
 int g_screenshotFrame = 0;
 int g_screenshotInterval = 0;
 int g_lookdevCaptureKey = 0x78;   // VK_F9
@@ -279,7 +280,7 @@ const char* kDefaultIni =
     "; (rtx-remix\\mods\\SouthParkMaterials) makes metallic, so RTX Remix reflects the real scene.\r\n"
     "EnvironmentMapsAsMetal=1\r\n"
     "; Sets that are reflection images painted on with ordinary coordinates -- the Acclaim logo's\r\n"
-    "; chrome -- drawn the same way, by name prefix.\r\n"
+    "; chrome -- drawn the same way, by name prefix, in their own tint and polished to a mirror.\r\n"
     "ChromeTextureNames=RYCHROME,ALCHROME,YLWCHRM\r\n"
     "\r\n"
     "[Normals]\r\n"
@@ -481,6 +482,8 @@ void Config::Load(void* self) {
                              g_chromeNames, sizeof(g_chromeNames), g_iniPath);
     GetPrivateProfileStringA("Debug", "DumpTextureNames", "", g_dumpTextureNames,
                              sizeof(g_dumpTextureNames), g_iniPath);
+    GetPrivateProfileStringA("Debug", "HideTextureNames", "", g_hideTextureNames,
+                             sizeof(g_hideTextureNames), g_iniPath);
     GetPrivateProfileStringA("Sky", "StarTextureNames", "STARS01",
                              g_starNames, sizeof(g_starNames), g_iniPath);
 
@@ -523,6 +526,7 @@ bool Config::DumpEnvTextures()           { return g_dumpEnvTextures; }
 bool Config::EnvironmentMapsAsMetal()    { return g_environmentMapsAsMetal; }
 const char* Config::ChromeTextureNames() { return g_chromeNames; }
 const char* Config::DumpTextureNames()   { return g_dumpTextureNames; }
+const char* Config::HideTextureNames()   { return g_hideTextureNames; }
 const char* Config::StarTextureNames()   { return g_starNames; }
 const char* Config::SkyTextureNames()     { return g_skyNames; }
 bool Config::LogEveryCall()               { return g_logEveryCall; }

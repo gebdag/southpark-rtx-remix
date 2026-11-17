@@ -40,6 +40,7 @@ SetCache g_cache[kMaxSets];
 // Flat swatches for environment-mapped surfaces (Texture::MetalSwatch), one per colour.
 struct Swatch {
     unsigned int colour;
+    int size;
     IDirect3DTexture9* tex;
 };
 Swatch g_swatches[64];
@@ -52,7 +53,7 @@ struct SwatchUse {
 };
 SwatchUse g_swatchUses[256];
 int g_swatchUseCount = 0;
-IDirect3DTexture9* CreateSwatch(unsigned int texel);
+IDirect3DTexture9* CreateSwatch(unsigned int texel, int size);
 bool  g_decodeFailed[kMaxSets];
 int   g_decodeFailuresLogged = 0;
 // Filled by the decoder and consumed by the caller that cached the variant.
@@ -63,6 +64,7 @@ bool  g_isSky[kMaxSets];
 bool  g_isStars[kMaxSets];
 bool  g_isDumped[kMaxSets];
 bool  g_isChrome[kMaxSets];
+bool  g_isHidden[kMaxSets];
 int   g_count = 0;
 int   g_paletteLogged = 0;
 
@@ -424,6 +426,10 @@ void Texture::FinishEnumeration() {
         }
         g_isDumped[i] = g_sets[i] && NameInList(SetName(g_sets[i]), Config::DumpTextureNames());
         g_isChrome[i] = g_sets[i] && NameInList(SetName(g_sets[i]), Config::ChromeTextureNames());
+        g_isHidden[i] = g_sets[i] && NameInList(SetName(g_sets[i]), Config::HideTextureNames());
+        if (g_isHidden[i]) {
+            LogLine("    hidden texture set %d: %s", i, SetName(g_sets[i]));
+        }
         if (g_sets[i] && NameInList(SetName(g_sets[i]), Config::StarTextureNames())) {
             g_isStars[i] = true;
             LogLine("    star-field texture set %d: %s", i, SetName(g_sets[i]));
@@ -906,6 +912,10 @@ bool Texture::IsChromeSet(int index) {
     return index >= 0 && index < g_count && g_isChrome[index];
 }
 
+bool Texture::IsHiddenSet(int index) {
+    return index >= 0 && index < g_count && g_isHidden[index];
+}
+
 bool Texture::IsDumpedSet(int index) {
     return index >= 0 && index < g_count && g_isDumped[index];
 }
@@ -949,6 +959,7 @@ void Texture::ReleaseAll() {
         g_isStars[i] = false;
         g_isDumped[i] = false;
         g_isChrome[i] = false;
+        g_isHidden[i] = false;
     }
     g_count = 0;
 }
@@ -1029,19 +1040,23 @@ IDirect3DTexture9* Texture::MetalSwatch(int index, int subA, int subB, unsigned 
     }
     const unsigned int texel = 0xff000000u | rounded;
     *colour = rounded;
+    // Chrome gets a swatch of its own size, so the mod can tell it from other metal of the same
+    // colour: the hash covers every texel, and a smaller swatch has fewer.
+    const int size = IsChromeSet(index) ? kChromeSwatchSize : kMetalSwatchSize;
     IDirect3DTexture9* tex = 0;
     for (int i = 0; i < g_swatchCount && !tex; ++i) {
-        if (g_swatches[i].colour == texel) {
+        if (g_swatches[i].colour == texel && g_swatches[i].size == size) {
             tex = g_swatches[i].tex;
         }
     }
     if (!tex) {
-        tex = CreateSwatch(texel);
+        tex = CreateSwatch(texel, size);
         if (!tex) {
             return 0;
         }
-        LogLine("    metal swatch %06X (image mean %06X) for set %d \"%s\" (frame/palette %d,%d)",
-                rounded, mean, index, Name(index), pixSub, palSub);
+        LogLine("    %s swatch %06X (image mean %06X) for set %d \"%s\" (frame/palette %d,%d)",
+                size == kChromeSwatchSize ? "chrome" : "metal", rounded, mean, index,
+                Name(index), pixSub, palSub);
     }
     if (g_swatchUseCount < (int)(sizeof(g_swatchUses) / sizeof(g_swatchUses[0]))) {
         g_swatchUses[g_swatchUseCount++] = {index, pixSub, palSub, rounded, tex};
@@ -1051,14 +1066,13 @@ IDirect3DTexture9* Texture::MetalSwatch(int index, int subA, int subB, unsigned 
 
 namespace {
 
-IDirect3DTexture9* CreateSwatch(unsigned int texel) {
+IDirect3DTexture9* CreateSwatch(unsigned int texel, int size) {
     IDirect3DDevice9* dev = Device::Get();
     if (!dev || g_swatchCount == (int)(sizeof(g_swatches) / sizeof(g_swatches[0]))) {
         return 0;
     }
     IDirect3DTexture9* tex = 0;
-    if (FAILED(dev->CreateTexture(Texture::kMetalSwatchSize, Texture::kMetalSwatchSize, 1, 0, D3DFMT_A8R8G8B8,
-                                  D3DPOOL_MANAGED, &tex, 0))) {
+    if (FAILED(dev->CreateTexture(size, size, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, 0))) {
         return 0;
     }
     D3DLOCKED_RECT lr;
@@ -1066,14 +1080,14 @@ IDirect3DTexture9* CreateSwatch(unsigned int texel) {
         tex->Release();
         return 0;
     }
-    for (int y = 0; y < Texture::kMetalSwatchSize; ++y) {
+    for (int y = 0; y < size; ++y) {
         unsigned int* row = (unsigned int*)((unsigned char*)lr.pBits + (size_t)y * lr.Pitch);
-        for (int x = 0; x < Texture::kMetalSwatchSize; ++x) {
+        for (int x = 0; x < size; ++x) {
             row[x] = texel;
         }
     }
     tex->UnlockRect(0);
-    g_swatches[g_swatchCount++] = {texel, tex};
+    g_swatches[g_swatchCount++] = {texel, size, tex};
     return tex;
 }
 

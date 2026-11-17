@@ -67,6 +67,8 @@ bool DecodeFailed(int index);
 bool IsSkySet(int index);
 // Whether a set is one of [Sky] StarTextureNames: the game's star-field cards.
 bool IsStarSet(int index);
+// Whether a set is one of [Debug] HideTextureNames.
+bool IsHiddenSet(int index);
 // Whether a set is one of [Debug] DumpTextureNames.
 bool IsDumpedSet(int index);
 // Whether a set is one of [Materials] ChromeTextureNames.
@@ -74,10 +76,12 @@ bool IsChromeSet(int index);
 
 // A flat swatch in the mean colour of the variant (subA, subB) of a set, rounded to 16 levels a
 // channel: what an environment-mapped surface is drawn with when the reflection is left to RTX
-// Remix. Swatches are kMetalSwatchSize square, opaque, and shared by colour; a Remix material
-// override is keyed by a swatch's hash (XXH3-64 of its texels), and with 4096 possible colours
-// the mod covers all of them (the SouthParkMaterials mod).
+// Remix. Swatches are kMetalSwatchSize square -- kChromeSwatchSize for the chrome sets, which the
+// mod polishes to a mirror -- opaque, and shared by colour; a Remix material override is keyed by
+// a swatch's hash (XXH3-64 of its texels), and with 4096 possible colours a size the mod covers
+// all of them (the SouthParkMaterials mod).
 const int kMetalSwatchSize = 16;
+const int kChromeSwatchSize = 8;
 IDirect3DTexture9* MetalSwatch(int index, int subA, int subB, unsigned int* colour);
 
 // Drops every decoded frame but keeps the blobs, so the next draw decodes afresh. The engine

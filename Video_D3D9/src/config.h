@@ -154,6 +154,9 @@ const char* ChromeTextureNames();
 // the sets named in DumpTextureNames (name prefixes), to <game>\env_textures// (Texture::DumpTexels), once per run.
 bool DumpEnvTextures();
 const char* DumpTextureNames();
+// [Debug] HideTextureNames: sets (name prefixes) whose batches are not drawn at all, to see
+// what a frame looks like without them. Empty by default.
+const char* HideTextureNames();
 const char* StarTextureNames();
 
 // Draw a large box around the camera in the background colour, at the far plane, first in
