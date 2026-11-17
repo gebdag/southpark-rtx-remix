@@ -34,6 +34,7 @@
 
 #include "cdaudio.h"
 #include "game_build.h"
+#include "loadslots.h"
 #include "pad.h"
 #include "rawmouse.h"
 
@@ -962,6 +963,7 @@ extern "C" HRESULT WINAPI DirectInputCreateA(HINSTANCE inst, DWORD version, void
     if (SUCCEEDED(hr) && out && *out) {
         PatchFactory(*out);
         // The game's code is decrypted by now, and it is about to enumerate joysticks.
+        LoadSlots::Install(g_gameFolder, &Log);
         if (g_controller) {
             Pad::Install(g_realCreateA, &InputBlocked, &Log, g_iniPath);
         }
