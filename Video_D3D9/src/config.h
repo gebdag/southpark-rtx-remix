@@ -176,6 +176,13 @@ float AspectRatio();
 // keeps running behind other windows.
 bool PauseWhenUnfocused();
 
+// [Display] FieldOfView: a multiple of the engine's own field of view (1 = as shipped).
+float FieldOfView();
+
+// Re-reads the settings that may change while the game runs -- the F4 overlay (d3d9.dll)
+// writes them to the ini -- when the file has changed. Cheap to call every frame.
+void RefreshLive();
+
 // ----------------------------------------------------------------------------- debug
 
 // Frame number at which to start writing screenshots automatically, or 0 for none, and how

@@ -1,6 +1,7 @@
 #include "overlay.h"
 #include "lights.h"
 #include "log.h"
+#include "settings.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -319,7 +320,7 @@ void BeginPanel() {
     g_contentX = g_panelX + Pad() * 2.0f;
     g_contentRight = g_contentX + kPanelChars * g_cellWidth;
     const float titleBottom = g_panelY + g_cellHeight + Pad() * 2.0f;
-    Ui::Text(g_contentX, g_panelY + Pad(), kTextColour, "South Park - Remix lights");
+    Ui::Text(g_contentX, g_panelY + Pad(), kTextColour, "South Park");
     const char* hint = "F4 / Esc closes";
     Ui::Text(g_contentRight - (float)strlen(hint) * g_cellWidth, g_panelY + Pad(), kDimColour, hint);
     g_rowTop = g_rowBottom = titleBottom;
@@ -443,6 +444,7 @@ void Overlay::Render(IDirect3DDevice9* device) {
     Lights::DrawMarkers(g_backBufferWidth, g_backBufferHeight);
     if (g_open) {
         BeginPanel();
+        Settings::DrawPanel();
         Lights::DrawPanel();
         EndPanel();
     }

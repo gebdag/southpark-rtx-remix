@@ -28,6 +28,10 @@ bool CameraFollowsDisplayAspect();
 // frame on; ignored while CameraFollowsDisplayAspect() is false.
 void SetDisplayAspect(float aspect);
 
+// Once a frame: brings the camera's field of view to [Display] FieldOfView, except in
+// cutscenes, which keep the framing they were made with.
+void OnFrame();
+
 // Sends one of the engine's API calls to `replacement` instead. The unpacked executable calls
 // every API through the copy protection's dispatcher (`call [0x0156D218]`), which picks the
 // real function from the return address, so its import table cannot be redirected; the call

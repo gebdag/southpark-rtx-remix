@@ -29,6 +29,9 @@ int g_displayHeight = 960;
 int g_displayX = -1;
 int g_displayY = -1;
 float g_aspectRatio = Config::kOriginalAspect;
+float g_fieldOfView = 1.0f;
+FILETIME g_iniWritten = {};
+DWORD g_iniNextCheck = 0;
 bool g_pauseWhenUnfocused = true;
 
 bool g_disableTriangleSkipMask = false;
@@ -76,6 +79,9 @@ const char* kDefaultIni =
     "AspectRatio=4:3\r\n"
     "; The game pauses itself while its window is not in front. 0 keeps it running.\r\n"
     "PauseWhenUnfocused=1\r\n"
+    "; Field of view, as a multiple of the game's own: 1 is as shipped, 1.2 a fifth wider.\r\n"
+    "; Cutscenes keep their own framing. The F4 overlay changes it while the game runs.\r\n"
+    "FieldOfView=1.00\r\n"
     "\r\n"
     "[Culling]\r\n"
     "; Ignore the per-triangle skip bitmask (display-list opcodes 0xa8 / 0xa7): 1 draws the\r\n"
@@ -183,6 +189,11 @@ const char* kDefaultIni =
     "; stick turn and look, RT fire, A jump, Start pause. 0 leaves the game's own joystick\r\n"
     "; handling alone.\r\n"
     "Controller=1\r\n"
+    "; How far the right stick turns and looks, as a fraction of the N64 game's full range\r\n"
+    "; (turning at 1 is 576 degrees a second; the game squares the stick, so the centre stays\r\n"
+    "; gentle either way). The F4 overlay changes both while the game runs.\r\n"
+    "PadTurnSensitivity=0.60\r\n"
+    "PadLookSensitivity=1.00\r\n"
     "\r\n"
     "[Textures]\r\n"
     "; How to read a format-3 palette entry. Format 3 is the effect atlas -- blood, smoke,\r\n"
@@ -417,6 +428,7 @@ void Config::Load(void* self) {
     g_displayY = GetPrivateProfileIntA("Display", "WindowY", -1, g_iniPath);
     g_aspectRatio = ReadAspectRatio();
     g_pauseWhenUnfocused = ReadBool("Display", "PauseWhenUnfocused", true);
+    Config::RefreshLive();
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
 
@@ -483,6 +495,31 @@ int Config::DisplayWindowX()              { return g_displayX; }
 int Config::DisplayWindowY()              { return g_displayY; }
 float Config::AspectRatio()               { return g_aspectRatio; }
 bool Config::PauseWhenUnfocused()         { return g_pauseWhenUnfocused; }
+float Config::FieldOfView()               { return g_fieldOfView; }
+
+void Config::RefreshLive() {
+    const DWORD now = GetTickCount();
+    if ((int)(now - g_iniNextCheck) < 0) {
+        return;
+    }
+    g_iniNextCheck = now + 500;
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    if (!GetFileAttributesExA(g_iniPath, GetFileExInfoStandard, &info) ||
+        CompareFileTime(&info.ftLastWriteTime, &g_iniWritten) == 0) {
+        return;
+    }
+    g_iniWritten = info.ftLastWriteTime;
+    char text[32];
+    GetPrivateProfileStringA("Display", "FieldOfView", "1", text, sizeof(text), g_iniPath);
+    float fov = (float)atof(text);
+    if (!(fov >= 0.5f && fov <= 2.0f)) {
+        fov = 1.0f;
+    }
+    if (fov != g_fieldOfView) {
+        g_fieldOfView = fov;
+        LogLine("    config: FieldOfView %.2f", fov);
+    }
+}
 int Config::LookdevGameWindowX()          { return g_lookdevGameX; }
 int Config::LookdevGameWindowY()          { return g_lookdevGameY; }
 int Config::LookdevGameWindowWidth()      { return g_lookdevGameWidth; }

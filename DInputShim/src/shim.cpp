@@ -886,7 +886,7 @@ extern "C" HRESULT WINAPI DirectInputCreateA(HINSTANCE inst, DWORD version, void
         PatchFactory(*out);
         // The game's code is decrypted by now, and it is about to enumerate joysticks.
         if (g_controller) {
-            Pad::Install(g_realCreateA, &InputBlocked, &Log);
+            Pad::Install(g_realCreateA, &InputBlocked, &Log, g_iniPath);
         }
     }
     return hr;

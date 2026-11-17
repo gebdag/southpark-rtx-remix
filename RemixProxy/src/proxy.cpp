@@ -10,6 +10,7 @@
 #include "log.h"
 #include "overlay.h"
 #include "remix.h"
+#include "settings.h"
 
 #include <windows.h>
 #include <d3d9.h>
@@ -114,6 +115,7 @@ HRESULT STDMETHODCALLTYPE HookedBeginScene(IDirect3DDevice9* device) {
 }
 
 HRESULT STDMETHODCALLTYPE HookedEndScene(IDirect3DDevice9* device) {
+    Settings::Update();
     Overlay::Render(device);
     return g_endScene(device);
 }
@@ -121,6 +123,7 @@ HRESULT STDMETHODCALLTYPE HookedEndScene(IDirect3DDevice9* device) {
 HRESULT STDMETHODCALLTYPE HookedSetTransform(IDirect3DDevice9* device, D3DTRANSFORMSTATETYPE state,
                                              const D3DMATRIX* matrix) {
     Lights::OnSetTransform(state, matrix);
+    Settings::OnSetTransform(state, matrix);
     return g_setTransform(device, state, matrix);
 }
 
@@ -197,6 +200,7 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
         _snprintf(ini, sizeof(ini), "%sVideo_D3D9.ini", g_directory);
         ini[sizeof(ini) - 1] = 0;
         Lights::Init(ini);
+        Settings::Init(ini);
     }
     return TRUE;
 }

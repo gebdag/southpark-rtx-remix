@@ -29,7 +29,9 @@ typedef HRESULT (WINAPI* DirectInputCreateAFn)(HINSTANCE, DWORD, void**, void*);
 
 // Once, when the game creates DirectInput: patches the executable and remembers how to read
 // pads. `inputBlocked` says when the game must see a centred pad (menus, focus elsewhere).
-void Install(DirectInputCreateAFn realCreate, BlockedFn inputBlocked, LogFn log);
+// `iniPath` holds [Input] PadTurnSensitivity and PadLookSensitivity, re-read whenever the file
+// changes: the F4 overlay (d3d9.dll) writes them while the game runs.
+void Install(DirectInputCreateAFn realCreate, BlockedFn inputBlocked, LogFn log, const char* iniPath);
 bool Installed();
 
 // True for the factory and device the pad layer created for its own reading. They share

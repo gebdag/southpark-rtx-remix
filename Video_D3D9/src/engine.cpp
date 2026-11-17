@@ -239,6 +239,20 @@ float g_drawDistanceFloor   = 0.0f;
 float g_drawDistanceApplied = 0.0f;
 bool  g_drawDistancePatched = false;
 
+// The field of view is the value loaded at the same site, in degrees: the camera eases it
+// toward its target each frame (camera+0x4ec) or takes a cutscene's, then derives the vertical
+// angle, the projection and the frustum corners from it. Scaling it there widens the picture
+// and the culling together. The engine's own value is kept for the log.
+float g_fovScale  = 1.0f;
+float g_fovEngine = 0.0f;
+bool  g_cameraDetourInstalled = false;
+
+// FUN_0049bf00, "is a cutscene camera running": return [[0x4e1250] + 0x28].
+const unsigned int kCutsceneTest = 0x0049bf00;
+const unsigned char kCutsceneTestCode[9] = {0xA1, 0x50, 0x12, 0x4E, 0x00, 0x8B, 0x40, 0x28, 0xC3};
+const unsigned int kCutsceneState = 0x004e1250;
+bool g_cutsceneTestKnown = false;
+
 // ------------------------------------------------------------------- camera aspect ratio
 //
 // SP_UpdateCamera holds a horizontal field of view and derives everything else from the
@@ -627,7 +641,8 @@ unsigned char* BuildArgumentTapDetour(unsigned int original, void* callback) {
     return cave;
 }
 
-bool InstallDrawDistanceFloor(float distance) {
+// The draw-distance floor (0 leaves the engine's distance alone) and the field of view.
+bool InstallCameraDetour(float distance) {
     if (!Verify(kCameraDistanceSite, kCameraDistanceCode, sizeof(kCameraDistanceCode))) {
         LogLine("    engine: 0x%08X is not the camera draw-distance code -- not patching",
                 kCameraDistanceSite);
@@ -651,8 +666,11 @@ bool InstallDrawDistanceFloor(float distance) {
     EmitDword((unsigned int)&g_drawDistanceApplied);                    // movss [applied],xmm0
     Emit(0x0F); Emit(0x10); Emit(0x04); Emit(0x24);            // movups xmm0, [esp]
     Emit(0x8D); Emit(0x64); Emit(0x24); Emit(0x10);            // lea    esp, [esp+16]
-    for (int i = 0; i < (int)sizeof(kCameraDistanceCode); ++i) {
-        Emit(kCameraDistanceCode[i]);                          // the relocated originals
+    Emit(0xD9); Emit(0x44); Emit(0x24); Emit(0x10);            // fld  dword ptr [esp+0x10]
+    Emit(0xD9); Emit(0x15); EmitDword((unsigned int)&g_fovEngine);     // fst  [engine fov]
+    Emit(0xD8); Emit(0x0D); EmitDword((unsigned int)&g_fovScale);      // fmul [fov scale]
+    for (int i = 4; i < (int)sizeof(kCameraDistanceCode); ++i) {
+        Emit(kCameraDistanceCode[i]);                          // fmul qword ptr [0x4c9440]
     }
     Emit(0xE9);
     EmitDword(kCameraDistanceResume - ((unsigned int)g_write + 4));
@@ -665,9 +683,15 @@ bool InstallDrawDistanceFloor(float distance) {
     if (!Overwrite(kCameraDistanceSite, patch, sizeof(patch))) {
         return false;
     }
-    g_drawDistancePatched = true;
-    LogLine("    engine: camera draw distance raised to at least %.0f units "
-            "(engine default 1024)", distance);
+    g_cameraDetourInstalled = true;
+    g_drawDistancePatched = distance > 0.0f;
+    if (g_drawDistancePatched) {
+        LogLine("    engine: camera draw distance raised to at least %.0f units "
+                "(engine default 1024)", distance);
+    }
+    g_cutsceneTestKnown = Verify(kCutsceneTest, kCutsceneTestCode, sizeof(kCutsceneTestCode));
+    LogLine("    engine: camera field of view follows [Display] FieldOfView%s",
+            g_cutsceneTestKnown ? ", except in cutscenes" : "");
     return true;
 }
 
@@ -723,6 +747,16 @@ int RedirectCallSites(const unsigned int* sites, int count, unsigned int target,
 
 } // namespace
 
+void Engine::OnFrame() {
+    bool cutscene = false;
+    if (g_cutsceneTestKnown) {
+        const unsigned int state = *(const unsigned int*)kCutsceneState;
+        cutscene = state && !IsBadReadPtr((const void*)(state + 0x28), 4) &&
+                   *(const int*)(state + 0x28) != 0;
+    }
+    g_fovScale = cutscene ? 1.0f : Config::FieldOfView();
+}
+
 void Engine::Install() {
     // The draw arrays are raised regardless of LoadEntireMap. They are an engine limitation,
     // not a consequence of showing more of the map: the stock sizes saturate on their own in
@@ -739,9 +773,7 @@ void Engine::Install() {
     // The draw distance is the engine's own "Fog Distance" field, so it is raised on its
     // own switch rather than behind LoadEntireMap: 0 leaves the engine's 1024 units alone.
     const float distance = Config::DrawDistance();
-    if (distance > 1024.0f) {
-        InstallDrawDistanceFloor(distance);
-    }
+    InstallCameraDetour(distance > 1024.0f ? distance : 0.0f);
 
     // The lookdev tee draws the same camera through the original renderer, whose picture is
     // 4:3 whatever ours is, so the camera keeps the engine's shape there.
@@ -843,6 +875,10 @@ void Engine::LogState() {
                 (g_cachePeak * 10 >= g_cacheSlots * 9)
                     ? "   <-- saturated; late-arriving objects could not register"
                     : "");
+    }
+    if (g_cameraDetourInstalled) {
+        LogLine("    engine: field of view %.1f degrees from the engine, x%.2f in the last frame",
+                g_fovEngine, g_fovScale);
     }
     if (g_drawDistancePatched) {
         LogLine("    engine: camera draw distance floor %.0f -> %.0f units in the last "

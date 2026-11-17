@@ -507,6 +507,8 @@ GFXAPI void GFXDLL_BeginScene(void) {
     EnsureRoutes();
     LogCall("GFXDLL_BeginScene");
     Lookdev::OnBeginScene();
+    Config::RefreshLive();
+    Engine::OnFrame();
     MaybeDumpFrame();
     if (Device::BeginFrame()) {
         Geometry::BeginFrame();

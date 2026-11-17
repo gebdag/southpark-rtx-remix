@@ -3,6 +3,7 @@
 
 #include <dinput.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 namespace {
@@ -287,10 +288,47 @@ void SendEscape(bool down) {
     PostMessageA(g_window, down ? WM_KEYDOWN : WM_KEYUP, VK_ESCAPE, flags | (LPARAM)(scan << 16));
 }
 
+// Turn and look go to the N64 game's own stick handling (FUN_00425d50, FUN_00425410 scheme 0,
+// FUN_00417130), which squares the stick for a gentle centre: turning is a rate, 576 degrees a
+// second at the N64's full +-80; looking is a position, -90..90 degrees, that springs back to
+// level when the stick is let go. The sensitivities scale the stick before the game sees it, so
+// full deflection reaches that fraction of the N64's range: turning at 0.6 tops out near 210
+// degrees a second, the game squaring the rest.
+const char* g_iniPath = 0;
+float g_turnSensitivity = 0.6f;
+float g_lookSensitivity = 1.0f;
+FILETIME g_iniWritten = {};
+DWORD g_iniNextCheck = 0;
+
+float ReadSensitivity(const char* key, float fallback) {
+    char text[32];
+    GetPrivateProfileStringA("Input", key, "", text, sizeof(text), g_iniPath);
+    const float value = text[0] ? (float)atof(text) : fallback;
+    return (value >= 0.05f && value <= 1.0f) ? value : fallback;
+}
+
+void RefreshSettings() {
+    const DWORD now = GetTickCount();
+    if (!g_iniPath || (int)(now - g_iniNextCheck) < 0) {
+        return;
+    }
+    g_iniNextCheck = now + 500;
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    if (!GetFileAttributesExA(g_iniPath, GetFileExInfoStandard, &info) ||
+        CompareFileTime(&info.ftLastWriteTime, &g_iniWritten) == 0) {
+        return;
+    }
+    g_iniWritten = info.ftLastWriteTime;
+    g_turnSensitivity = ReadSensitivity("PadTurnSensitivity", 0.6f);
+    g_lookSensitivity = ReadSensitivity("PadLookSensitivity", 1.0f);
+    LOG("pad: turn sensitivity %.2f, look sensitivity %.2f", g_turnSensitivity, g_lookSensitivity);
+}
+
 // XInput first, then DirectInput. The game polls its joystick only in play and some menus, and
 // Start reaches it through the keyboard, so the keyboard read refreshes the pad too.
 void ReadPad() {
     g_lastRead = GetTickCount();
+    RefreshSettings();
     PadState s;
     g_haveState = ReadXInput(s) || ReadDirectInput(s);
     if (g_haveState) {
@@ -308,13 +346,6 @@ void ReadPad() {
 
 // The game maps 0..65535 to about +-80 with a dead gap at 0x8000..0x8064; rest sits in it.
 const LONG kCentre = 0x8032;
-
-// Turn and look go to the N64 game's own stick handling (FUN_00425d50, FUN_00425410 scheme 0,
-// FUN_00417130), which squares the stick for a gentle centre: turning is a rate, 576 degrees a
-// second at the N64's full +-80; looking is a position, -90..90 degrees, that springs back to
-// level when the stick is let go. A full modern stick is easier to hold at the edge than the
-// N64's, so turning stops at 85% of the N64 range (about 415 degrees a second).
-const float kTurnRange = 0.85f;
 
 LONG ToGameAxis(float v) {
     const float clamped = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
@@ -355,8 +386,8 @@ void FillGameState(DIJOYSTATE& j) {
     const PadState& s = g_state;
     // Axis slots once patched (see PatchGame): walk Y, turn 1 -> Z, look 8 -> Rx, strafe 32 -> Rz.
     j.lY = ToGameAxis(-s.ly);              // walk: up is the low end, forward
-    j.lZ = ToGameAxis(s.rx * kTurnRange);  // turn: the N64 stick's X
-    j.lRx = ToGameAxis(-s.ry);             // look: the N64 stick's Y
+    j.lZ = ToGameAxis(s.rx * g_turnSensitivity);    // turn: the N64 stick's X
+    j.lRx = ToGameAxis(-s.ry * g_lookSensitivity);  // look: the N64 stick's Y
     j.lRz = ToGameAxis(s.lx);              // strafe
     j.rgdwPOV[0] = HatValue(s);
     const bool pressed[kButtonCount] = {s.a, s.b, s.x, s.y, s.lb, s.rb, s.lt > kTriggerPressed,
@@ -749,7 +780,7 @@ void PatchGame() {
 
 } // namespace
 
-void Pad::Install(DirectInputCreateAFn realCreate, BlockedFn inputBlocked, LogFn log) {
+void Pad::Install(DirectInputCreateAFn realCreate, BlockedFn inputBlocked, LogFn log, const char* iniPath) {
     if (g_installed) {
         return;
     }
@@ -757,6 +788,7 @@ void Pad::Install(DirectInputCreateAFn realCreate, BlockedFn inputBlocked, LogFn
     g_realCreate = realCreate;
     g_inputBlocked = inputBlocked;
     g_log = log;
+    g_iniPath = iniPath;
     PatchGame();
 }
 
