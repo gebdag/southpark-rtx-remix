@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -83,6 +84,9 @@ struct Settings {
     // side the way the game's does. The level-wide fills, up to 12,000 units across, would be
     // suns that way, so the reach counted for brightness stops here.
     float zoneReachCap = 2048.0f;
+    // Outdoors the sun and the sky light the scene; the zones over open ground were fills for
+    // the original's vertex lighting, and as lights they add a second, coloured sun.
+    bool zonesInTheOpen = false;
     // A soft light above the camera, coloured by the light the engine gives an object standing
     // there. It keeps rooms that have only the level's large fills -- no lamp-sized zone to send --
     // from going black, at the cost of a light that travels with the player.
@@ -279,6 +283,84 @@ bool ZoneIsLight(const Zones::Zone& z) {
     return !z.subtractive && z.shape != Zones::Box;
 }
 
+// ------------------------------------------------------------------ zones in the open
+//
+// A zone is in the open when no level geometry is above it. The renderer (Video_D3D.dll) keeps
+// the level's recent triangles for its normals and answers that for a few points
+// (SouthPark_CoverAbove: how many have geometry above them, or -1 when it holds nothing around
+// any). Five points are asked -- the centre and four around it -- so a beam or a sign over one
+// point does not make a street a room. A roof does not go away, so a zone once found covered
+// stays covered; an open one is asked again now and then, in case its roof had not been drawn
+// yet. Until a zone has an answer it is not sent, so open fills do not flash on as a level
+// loads. Without the renderer's answer every zone is sent.
+typedef int (__cdecl *CoverAboveFn)(const float* points, int count);
+CoverAboveFn g_coverAbove = nullptr;
+bool g_coverLooked = false;
+
+enum Cover { CoverUnknown, CoverOpen, CoverRoofed };
+struct ZoneCover {
+    Cover state = CoverUnknown;
+    unsigned int nextCheck = 0;
+};
+std::unordered_map<unsigned long long, ZoneCover> g_zoneCover;
+const int kCoverChecksPerFrame = 4;      // each is one pass over the renderer's triangles
+const unsigned int kRecheckFrames = 120;
+const int kCoverPoints = 5;
+const int kCoverNeeded = 3;              // points with geometry above that make a zone covered
+
+CoverAboveFn CoverAbove() {
+    if (!g_coverLooked) {
+        g_coverLooked = true;
+        if (HMODULE renderer = GetModuleHandleA("Video_D3D.dll")) {
+            g_coverAbove = (CoverAboveFn)GetProcAddress(renderer, "SouthPark_CoverAbove");
+        }
+        Log("lights: %s", g_coverAbove ? "the renderer tells which zones are in the open"
+                                       : "no cover answers from the renderer -- every zone is sent");
+    }
+    return g_coverAbove;
+}
+
+Cover ZoneCoverOf(unsigned long long hash, const Zones::Zone& z, int& checksLeft) {
+    ZoneCover& c = g_zoneCover[hash];
+    CoverAboveFn ask = CoverAbove();
+    if (!ask || c.state == CoverRoofed || g_frames < c.nextCheck || checksLeft == 0) {
+        return ask ? c.state : CoverRoofed;
+    }
+    --checksLeft;
+    float spread = z.reach * 0.25f;
+    spread = spread < 16.0f ? 16.0f : (spread > 128.0f ? 128.0f : spread);
+    const float offsets[kCoverPoints][2] = {{0, 0}, {spread, 0}, {-spread, 0}, {0, spread}, {0, -spread}};
+    float points[kCoverPoints][3];
+    for (int i = 0; i < kCoverPoints; ++i) {
+        points[i][0] = z.centre[0] + offsets[i][0];
+        points[i][1] = z.centre[1];
+        points[i][2] = z.centre[2] + offsets[i][1];
+    }
+    const int covered = ask(&points[0][0], kCoverPoints);
+    if (covered >= 0) {
+        c.state = covered >= kCoverNeeded ? CoverRoofed : CoverOpen;
+    }
+    c.nextCheck = g_frames + kRecheckFrames;
+    return c.state;
+}
+
+unsigned long long ZoneHash(const Zones::Zone& z) {
+    // Named by where it is: which section a zone came from changes as the camera moves.
+    char name[64];
+    _snprintf(name, sizeof(name), "sp_zone_%d_%d_%d_%d", (int)z.centre[0], (int)z.centre[1],
+              (int)z.centre[2], (int)z.radius);
+    return Hash(name);
+}
+
+// Whether a zone light is sent this frame, asking about its cover while checks are left.
+bool ZoneSent(const Zones::Zone& z, int& checksLeft) {
+    if (!ZoneIsLight(z)) {
+        return false;
+    }
+    const Cover cover = ZoneCoverOf(ZoneHash(z), z, checksLeft);
+    return g_settings.zonesInTheOpen ? true : cover == CoverRoofed;
+}
+
 float ZoneBrightness(const Zones::Zone& z) {
     const float reach = z.reach < g_settings.zoneReachCap ? z.reach : g_settings.zoneReachCap;
     return Brightness(1.0f, reach, g_settings.zoneRadianceScale);
@@ -335,6 +417,7 @@ void Lights::Init(const char* ini) {
     g_settings.zoneLights = ReadBool(ini, "ZoneLights", g_settings.zoneLights);
     g_settings.zoneRadianceScale = ReadFloat(ini, "ZoneRadianceScale", g_settings.zoneRadianceScale);
     g_settings.zoneReachCap = ReadFloat(ini, "ZoneReachCap", g_settings.zoneReachCap);
+    g_settings.zonesInTheOpen = ReadBool(ini, "ZonesInTheOpen", g_settings.zonesInTheOpen);
     g_settings.playerLight = ReadBool(ini, "PlayerLight", g_settings.playerLight);
     g_settings.playerLightScale = ReadFloat(ini, "PlayerLightScale", g_settings.playerLightScale);
     g_settings.playerLightReach = ReadFloat(ini, "PlayerLightReach", g_settings.playerLightReach);
@@ -396,17 +479,14 @@ void Lights::SubmitFrame() {
         }
     }
     if (g_settings.zoneLights) {
+        int checksLeft = kCoverChecksPerFrame;
         for (const auto& z : g_zones) {
-            if (!ZoneIsLight(z)) {
+            if (!ZoneSent(z, checksLeft)) {
                 continue;
             }
-            // Named by where it is: which section a zone came from changes as the camera moves.
-            char name[64];
-            _snprintf(name, sizeof(name), "sp_zone_%d_%d_%d_%d", (int)z.centre[0], (int)z.centre[1],
-                      (int)z.centre[2], (int)z.radius);
             float rgb[3];
             ZoneRgb(z, rgb);
-            SubmitLight(Hash(name), z.centre, rgb, ZoneBrightness(z),
+            SubmitLight(ZoneHash(z), z.centre, rgb, ZoneBrightness(z),
                         z.shape == Zones::Cone ? z.axis : nullptr);
         }
     }
@@ -513,38 +593,53 @@ void Lights::DrawPanel() {
     Ui::Checkbox("Send sphere and cone zones to Remix", &g_settings.zoneLights);
     Ui::Slider("Zone radiance scale", &g_settings.zoneRadianceScale, 10.0f, 100000.0f, "%.0f", true);
     Ui::Slider("Zone reach cap", &g_settings.zoneReachCap, 256.0f, 16384.0f, "%.0f units", true);
+    Ui::Checkbox("Also zones in the open (the sun and sky light those)", &g_settings.zonesInTheOpen);
     if (g_zones.empty()) {
         Ui::LabelDim("None in this level, or the game has zone lighting off.");
     } else {
-        // A level registers up to a hundred zones; the panel lists the nearest lights.
+        // A level registers up to a hundred zones; the panel lists the nearest, dimming those
+        // not sent.
         const size_t kListed = 24;
-        std::vector<std::pair<float, size_t>> sent;
-        int notSent = 0;
+        std::vector<std::pair<float, size_t>> lights;
+        int notLights = 0, sent = 0, open = 0, unchecked = 0;
         for (size_t i = 0; i < g_zones.size(); ++i) {
             const Zones::Zone& z = g_zones[i];
             if (!ZoneIsLight(z)) {
-                ++notSent;
+                ++notLights;
                 continue;
+            }
+            const Cover cover = CoverAbove() ? g_zoneCover[ZoneHash(z)].state : CoverRoofed;
+            if (g_settings.zonesInTheOpen || cover == CoverRoofed) {
+                ++sent;
+            } else if (cover == CoverOpen) {
+                ++open;
+            } else {
+                ++unchecked;
             }
             float distance = 0.0f;
             if (haveCamera) {
                 const float dx = z.centre[0] - camera[0], dy = z.centre[1] - camera[1], dz = z.centre[2] - camera[2];
                 distance = sqrtf(dx * dx + dy * dy + dz * dz);
             }
-            sent.push_back({distance, i});
+            lights.push_back({distance, i});
         }
-        std::sort(sent.begin(), sent.end());
-        Ui::LabelDim("      zone shape   colour          ambient   reach   centre                  distance");
-        for (size_t k = 0; k < sent.size() && k < kListed; ++k) {
-            const Zones::Zone& z = g_zones[sent[k].second];
+        std::sort(lights.begin(), lights.end());
+        Ui::LabelDim("      zone shape   colour          ambient   reach   centre                  distance  above");
+        for (size_t k = 0; k < lights.size() && k < kListed; ++k) {
+            const Zones::Zone& z = g_zones[lights[k].second];
+            const Cover cover = CoverAbove() ? g_zoneCover[ZoneHash(z)].state : CoverRoofed;
+            const char* above = cover == CoverRoofed ? "roof" : cover == CoverOpen ? "open" : "?";
+            const bool isSent = g_settings.zonesInTheOpen || cover == CoverRoofed;
             Ui::Swatch(ZoneColour(z));
             Ui::SameLine();
-            Ui::Label("%4d %-6s %4.0f %4.0f %4.0f  %8.2f %7.0f   %6.0f %6.0f %6.0f   %8.0f%s", (int)sent[k].second,
-                      ShapeName(z), z.colour[0], z.colour[1], z.colour[2], z.ambientShare, z.reach, z.centre[0],
-                      z.centre[1], z.centre[2], sent[k].first, z.flickers ? "  flicker" : "");
+            (isSent ? Ui::Label : Ui::LabelDim)(
+                "%4d %-6s %4.0f %4.0f %4.0f  %8.2f %7.0f   %6.0f %6.0f %6.0f   %8.0f  %-4s%s",
+                (int)lights[k].second, ShapeName(z), z.colour[0], z.colour[1], z.colour[2],
+                z.ambientShare, z.reach, z.centre[0], z.centre[1], z.centre[2], lights[k].first, above,
+                z.flickers ? "  flicker" : "");
         }
-        Ui::LabelDim("%d sent%s; %d not sent: boxes or subtractive.", (int)sent.size(),
-                     sent.size() > kListed ? ", the nearest listed" : "", notSent);
+        Ui::LabelDim("%d sent; %d in the open and %d not yet checked, not sent; %d boxes or subtractive.",
+                     sent, open, unchecked, notLights);
     }
 
     Ui::Heading("Player light");
