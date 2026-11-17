@@ -182,6 +182,9 @@ float AspectRatio();
 // keeps running behind other windows.
 bool PauseWhenUnfocused();
 
+// [Display] LimitCutscenes: keep the engine's sleep in cutscene frames (off by default).
+bool LimitCutscenes();
+
 // [Display] FieldOfView: a multiple of the engine's own field of view (1 = as shipped).
 float FieldOfView();
 

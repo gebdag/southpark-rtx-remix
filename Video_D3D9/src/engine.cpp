@@ -369,6 +369,18 @@ const unsigned char kCutsceneTestCode[9] = {0xA1, 0x50, 0x12, 0x4E, 0x00, 0x8B, 
 const unsigned int kCutsceneState = 0x004e1250;
 bool g_cutsceneTestKnown = false;
 
+// ------------------------------------------------------------- the cutscene sleep
+//
+// At the end of each frame (0x00444701) the engine sleeps while a cutscene camera runs and its
+// running frame-rate estimate (0x004d4d90, ten frames of 1000 / elapsed) is above 20:
+// Sleep(1000 * (0.05 - 1 / estimate)). The estimate counts the sleep itself, so it settles
+// near 2000 / (50 + work) -- about 38 fps -- and the company logos and the intro, which are
+// cutscenes, run there however fast the machine is. Cutscenes advance by real time (the step
+// at 0x0044469d is elapsed milliseconds x 15 / 1000, up to four steps), so skipping the sleep
+// gives more frames of the same cutscene, not a faster one.
+const unsigned int kCutsceneSleepBranch = 0x00444701;
+const unsigned char kCutsceneSleepCode[2] = {0x74, 0x37};   // je 0x0044473a (skip the sleep)
+
 // ------------------------------------------------------------------- camera aspect ratio
 //
 // SP_UpdateCamera holds a horizontal field of view and derives everything else from the
@@ -919,6 +931,17 @@ void Engine::Install() {
     // own switch rather than behind LoadEntireMap: 0 leaves the engine's 1024 units alone.
     const float distance = Config::DrawDistance();
     InstallCameraDetour(distance > 1024.0f ? distance : 0.0f);
+
+    if (!Config::LimitCutscenes()) {
+        const unsigned char always = 0xEB;                   // jmp 0x0044473a
+        if (Verify(kCutsceneSleepBranch, kCutsceneSleepCode, sizeof(kCutsceneSleepCode)) &&
+            Overwrite(kCutsceneSleepBranch, &always, 1)) {
+            LogLine("    engine: cutscenes run unthrottled (LimitCutscenes=0)");
+        } else {
+            LogLine("    engine: 0x%08X is not the cutscene sleep -- cutscenes keep the engine's "
+                    "limit", kCutsceneSleepBranch);
+        }
+    }
 
     // The lookdev tee draws the same camera through the original renderer, whose picture is
     // 4:3 whatever ours is, so the camera keeps the engine's shape there.

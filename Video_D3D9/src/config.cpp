@@ -33,6 +33,7 @@ float g_fieldOfView = 1.0f;
 FILETIME g_iniWritten = {};
 DWORD g_iniNextCheck = 0;
 bool g_pauseWhenUnfocused = true;
+bool g_limitCutscenes = false;
 
 bool g_disableTriangleSkipMask = false;
 bool g_disableOffscreenQuadReject = false;
@@ -80,6 +81,10 @@ const char* kDefaultIni =
     "AspectRatio=4:3\r\n"
     "; The game pauses itself while its window is not in front. 0 keeps it running.\r\n"
     "PauseWhenUnfocused=1\r\n"
+    "; The engine sleeps in every cutscene frame (the logos and the intro too), which holds\r\n"
+    "; them near 38 fps however fast the machine is. Cutscenes advance by real time either\r\n"
+    "; way. 0 lifts that sleep; 1 keeps it.\r\n"
+    "LimitCutscenes=0\r\n"
     "; Field of view, as a multiple of the game's own: 1 is as shipped, 1.2 a fifth wider.\r\n"
     "; Cutscenes keep their own framing. The F4 overlay changes it while the game runs.\r\n"
     "FieldOfView=1.00\r\n"
@@ -439,6 +444,7 @@ void Config::Load(void* self) {
     g_displayY = GetPrivateProfileIntA("Display", "WindowY", -1, g_iniPath);
     g_aspectRatio = ReadAspectRatio();
     g_pauseWhenUnfocused = ReadBool("Display", "PauseWhenUnfocused", true);
+    g_limitCutscenes = ReadBool("Display", "LimitCutscenes", false);
     Config::RefreshLive();
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
@@ -507,6 +513,7 @@ int Config::DisplayWindowX()              { return g_displayX; }
 int Config::DisplayWindowY()              { return g_displayY; }
 float Config::AspectRatio()               { return g_aspectRatio; }
 bool Config::PauseWhenUnfocused()         { return g_pauseWhenUnfocused; }
+bool Config::LimitCutscenes()             { return g_limitCutscenes; }
 float Config::FieldOfView()               { return g_fieldOfView; }
 
 void Config::RefreshLive() {
