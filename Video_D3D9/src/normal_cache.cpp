@@ -16,8 +16,8 @@ const unsigned int kForgetAfter = 120;
 const unsigned int kSweepEvery = 60;
 
 struct Face {
-    float normal[3];        // area-weighted
     float unit[3];
+    float angle[3];         // at each corner, radians
     unsigned long long corners[3];
     unsigned int lastSeen;
     bool live;
@@ -52,6 +52,51 @@ unsigned long long FaceKey(const unsigned long long* c) {
         h = (h ^ c[(first + i) % 3]) * 1099511628211ull;
     }
     return h;
+}
+
+float Length(const float* v) {
+    return sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+float Dot(const float* a, const float* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+// The angle at `at` between the edges to `b` and `c`.
+float Angle(const float* at, const float* b, const float* c) {
+    const float u[3] = {b[0] - at[0], b[1] - at[1], b[2] - at[2]};
+    const float v[3] = {c[0] - at[0], c[1] - at[1], c[2] - at[2]};
+    const float lengths = Length(u) * Length(v);
+    if (!(lengths > 1e-20f)) {
+        return 0.0f;
+    }
+    float cosine = Dot(u, v) / lengths;
+    cosine = cosine < -1.0f ? -1.0f : (cosine > 1.0f ? 1.0f : cosine);
+    return acosf(cosine);
+}
+
+// Two faces around one corner share an edge there when they have another corner in common.
+bool ShareEdge(const Face& f, const Face& g, unsigned long long corner) {
+    for (unsigned long long a : f.corners) {
+        if (a == corner) {
+            continue;
+        }
+        for (unsigned long long b : g.corners) {
+            if (a == b) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+float AngleAt(const Face& f, unsigned long long corner) {
+    for (int k = 0; k < 3; ++k) {
+        if (f.corners[k] == corner) {
+            return f.angle[k];
+        }
+    }
+    return 0.0f;
 }
 
 void Unlink(int index) {
@@ -108,15 +153,18 @@ void NormalCache::AddFace(const float* a, const float* b, const float* c) {
     }
     const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
     const float e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-    f.normal[0] = e1[1] * e2[2] - e1[2] * e2[1];
-    f.normal[1] = e1[2] * e2[0] - e1[0] * e2[2];
-    f.normal[2] = e1[0] * e2[1] - e1[1] * e2[0];
-    const float length = sqrtf(f.normal[0] * f.normal[0] + f.normal[1] * f.normal[1] + f.normal[2] * f.normal[2]);
+    const float normal[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
+                             e1[0] * e2[1] - e1[1] * e2[0]};
+    const float length = Length(normal);
     if (!(length > 1e-10f)) {
         return;
     }
     for (int k = 0; k < 3; ++k) {
-        f.unit[k] = f.normal[k] / length;
+        f.unit[k] = normal[k] / length;
+    }
+    const float* p[3] = {a, b, c};
+    for (int k = 0; k < 3; ++k) {
+        f.angle[k] = Angle(p[k], p[(k + 1) % 3], p[(k + 2) % 3]);
     }
     f.lastSeen = g_frame;
     f.live = true;
@@ -136,23 +184,54 @@ void NormalCache::AddFace(const float* a, const float* b, const float* c) {
     }
 }
 
-void NormalCache::CornerNormal(const float* position, const float* own, float creaseCos, float* out) {
-    out[0] = out[1] = out[2] = 0.0f;
-    auto it = g_facesAt.find(CornerKey(position));
-    if (it != g_facesAt.end()) {
-        for (int index : it->second) {
-            const Face& f = g_faces[index];
-            if (f.unit[0] * own[0] + f.unit[1] * own[1] + f.unit[2] * own[2] >= creaseCos) {
-                out[0] += f.normal[0];
-                out[1] += f.normal[1];
-                out[2] += f.normal[2];
+void NormalCache::CornerNormal(const float* a, const float* b, const float* c, int corner,
+                               float creaseCos, float* out) {
+    unsigned long long corners[3] = {CornerKey(a), CornerKey(b), CornerKey(c)};
+    auto own = g_faceByKey.find(FaceKey(corners));
+    auto fan = g_facesAt.find(corners[corner]);
+    if (own == g_faceByKey.end() || fan == g_facesAt.end()) {
+        const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+        const float e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+        out[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        out[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        out[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        return;
+    }
+    const unsigned long long point = corners[corner];
+    const std::vector<int>& around = fan->second;
+
+    // A walk over the faces around the point, stepping only across smooth edges.
+    const int kMaxFan = 64;
+    int reached[kMaxFan];
+    int count = 0;
+    reached[count++] = own->second;
+    float sum[3] = {};
+    for (int next = 0; next < count; ++next) {
+        const Face& f = g_faces[reached[next]];
+        const float w = AngleAt(f, point);
+        sum[0] += f.unit[0] * w;
+        sum[1] += f.unit[1] * w;
+        sum[2] += f.unit[2] * w;
+        for (int index : around) {
+            if (count == kMaxFan) {
+                break;
+            }
+            bool seen = false;
+            for (int i = 0; i < count && !seen; ++i) {
+                seen = reached[i] == index;
+            }
+            const Face& g = g_faces[index];
+            if (!seen && Dot(f.unit, g.unit) >= creaseCos && ShareEdge(f, g, point)) {
+                reached[count++] = index;
             }
         }
     }
-    const float length = sqrtf(out[0] * out[0] + out[1] * out[1] + out[2] * out[2]);
-    if (length > 1e-10f) {
-        out[0] /= length; out[1] /= length; out[2] /= length;
+
+    const float* unit = g_faces[own->second].unit;
+    const float length = Length(sum);
+    if (length > 1e-10f && Dot(sum, unit) >= creaseCos * length) {
+        out[0] = sum[0] / length; out[1] = sum[1] / length; out[2] = sum[2] / length;
     } else {
-        out[0] = own[0]; out[1] = own[1]; out[2] = own[2];
+        out[0] = unit[0]; out[1] = unit[1]; out[2] = unit[2];
     }
 }

@@ -44,6 +44,7 @@ bool g_uncullRooms = true;
 bool g_uncullEntities = false;
 int g_uncullBudget = 512;
 unsigned int g_batchLimitScale = 8;
+float g_keepAroundCamera = 2048.0f;
 float g_drawDistance = 8192.0f;
 unsigned int g_cameraDrawListScale = 1;
 int g_effectPaletteMode = 1;
@@ -117,13 +118,21 @@ const char* kDefaultIni =
     "; the six drawing sites do. That path also registers each entity through a resource\r\n"
     "; cache, and reporting the whole level visible every frame stops enemies spawning and\r\n"
     "; breaks the player's weapon. Hence the budget below.\r\n"
-    "UncullEntities=1\r\n"
+    "UncullEntities=0\r\n"
     "\r\n"
     "; How many objects the engine's own test rejects may be shown anyway, per frame. 0 is\r\n"
     "; unlimited, which has the problems above. Raise it until the town looks right and\r\n"
     "; lower it if entities misbehave; the log reports the peak actually used, so if the\r\n"
     "; town needs only a few hundred there is headroom to spare.\r\n"
     "UncullBudget=512\r\n"
+    "\r\n"
+    "; The engine draws only what lies in a box around the view cone, and that box starts\r\n"
+    "; at the camera: one step forward and everything just behind the player is gone, and\r\n"
+    "; Remix's light pours in through the walls it no longer has. KeepAroundCamera keeps\r\n"
+    "; the level drawn within this many world units of the camera whichever way it faces:\r\n"
+    "; level geometry, level objects, particles and entities. Only drawing changes; what\r\n"
+    "; is loaded, spawned and simulated stays the engine's decision. 0 is off.\r\n"
+    "KeepAroundCamera=2048\r\n"
     "\r\n"
     "; The engine records each frame's draw work into three fixed arrays -- 512 models, 1024\r\n"
     "; mesh instances, 512 material batches -- and stops recording, without any diagnostic,\r\n"
@@ -368,6 +377,8 @@ void Config::Load(void* self) {
         "FullMap", "CameraDrawListScale", 1, g_iniPath);
     if (g_cameraDrawListScale < 1)  g_cameraDrawListScale = 1;
     if (g_cameraDrawListScale > 16) g_cameraDrawListScale = 16;
+    g_keepAroundCamera = (float)GetPrivateProfileIntA("FullMap", "KeepAroundCamera", 2048, g_iniPath);
+    if (g_keepAroundCamera < 0.0f) g_keepAroundCamera = 0.0f;
     g_drawDistance = (float)GetPrivateProfileIntA("FullMap", "DrawDistance", 8192, g_iniPath);
     if (g_drawDistance < 0.0f)     g_drawDistance = 0.0f;
     // These boxes also feed spatial lookups and a near-infinite extent crashes the game.
@@ -445,8 +456,8 @@ void Config::Load(void* self) {
             "UncullBudget=%d BatchLimitScale=%u FarPlane=%.0f",
             g_loadEntireMap, g_disableFrustumTest, g_uncullRooms, g_uncullEntities,
             g_uncullBudget, g_batchLimitScale, g_farPlane);
-    LogLine("    DrawDistance=%.0f CameraDrawListScale=%u",
-            g_drawDistance, g_cameraDrawListScale);
+    LogLine("    DrawDistance=%.0f CameraDrawListScale=%u KeepAroundCamera=%.0f",
+            g_drawDistance, g_cameraDrawListScale, g_keepAroundCamera);
     LogLine("    EffectPaletteMode=%d", g_effectPaletteMode);
     LogLine("    ApplyConstantColour=%d ResetStatePerFrame=%d",
             g_applyConstantColour, g_resetStatePerFrame);
@@ -476,6 +487,7 @@ int Config::UncullBudget()                { return g_uncullBudget; }
 unsigned int Config::BatchLimitScale()    { return g_batchLimitScale; }
 unsigned int Config::CameraDrawListScale() { return g_cameraDrawListScale; }
 float Config::DrawDistance()              { return g_drawDistance; }
+float Config::KeepAroundCamera()          { return g_keepAroundCamera; }
 float Config::FarPlane()                  { return g_farPlane; }
 int Config::EffectPaletteMode()           { return g_effectPaletteMode; }
 bool Config::ApplyConstantColour()        { return g_applyConstantColour; }

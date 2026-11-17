@@ -176,11 +176,127 @@ void SampleResourceCache() {
     }
 }
 
+// ------------------------------------------------------- the level around the camera
+//
+// Every drawing path compares grid sections, objects and entities against a 2D box in X and
+// Z around the camera's view volume (camera+0x332: min X, min Z, max X, max Z). The volume's
+// apex is the eye, so the box never reaches behind it: what the player has just walked past
+// is not drawn, and the path tracer lights the room through the gap. Loading is not the
+// cause -- sections stream by a box centred on the eye (camera+0x342), so they are there,
+// only not drawn.
+//
+// The tests stay; the box they read grows. SP_BuildCullBounds also writes the union of the
+// cameras' view boxes to 0x005005f0, a copy nothing else in the engine reads. After it runs,
+// that copy is widened to a square of KeepAroundCamera around each eye, and the drawing
+// sites read it in place of the camera field: each is the same fld/fcomp with an absolute
+// address instead of [reg+disp32], the same length, so nothing else in the code moves.
+// Gameplay decides from the published cull box at 0x00500640 (activation, despawning,
+// particle lifetime), which is left alone.
+const unsigned int kBuildCullBounds         = 0x00423020;  // SP_BuildCullBounds(set), __cdecl
+const unsigned int kBuildCullBoundsCallSite = 0x0044477C;  // once a frame, SP_RenderFrame
+const unsigned int kViewBoxCopy  = 0x005005F0;   // min X, min Z, max X, max Z
+const unsigned int kCameraList   = 0x20;         // in the camera set: first drawn camera
+const unsigned int kCameraNext   = 0x04;
+const unsigned int kCameraEyeX   = 0x266;        // the eye, world space
+const unsigned int kCameraEyeZ   = 0x26E;
+const unsigned int kCameraPlanes = 0x2D2;        // what every frustum-test caller passes
+const unsigned int kCameraViewBox = 0x332;
+
+// The four reads of the camera's view box at one test, in the order the code makes them.
+struct ViewBoxTest {
+    const char* name;
+    unsigned char opcode;          // D8 fcomp, D9 fld
+    unsigned char modrm;           // [reg+disp32]
+    unsigned int sites[4];
+    unsigned int fields[4];
+};
+
+const ViewBoxTest kViewBoxTests[] = {
+    // FUN_00440f50: a whole grid section is skipped when its cell misses the box.
+    { "level sections",   0xD8, 0x9F, { 0x004410B2, 0x004410C5, 0x004410D9, 0x004410ED },
+      { 0x332, 0x33A, 0x336, 0x33E } },
+    { "level geometry",   0xD9, 0x87, { 0x0044116D, 0x00441184, 0x00441194, 0x004411A4 },
+      { 0x33A, 0x332, 0x33E, 0x336 } },
+    { "placed instances", 0xD9, 0x87, { 0x004412C4, 0x004412D7, 0x004412E6, 0x004412F6 },
+      { 0x33A, 0x332, 0x33E, 0x336 } },
+    // FUN_00443230, the level's object list.
+    { "level objects",    0xD9, 0x87, { 0x0044324D, 0x0044326A, 0x00443281, 0x00443298 },
+      { 0x33A, 0x332, 0x33E, 0x336 } },
+    // FUN_0043c080. The hidden side skips only the emitter's draw matrix; its light is
+    // registered either way.
+    { "particle emitters", 0xD9, 0x85, { 0x0043C20A, 0x0043C21F, 0x0043C234, 0x0043C249 },
+      { 0x33A, 0x332, 0x33E, 0x336 } },
+    // FUN_00450630, the entity path (the town's houses among them). The frustum test that
+    // follows it is answered by EntityFrustumTest.
+    { "entities",         0xD9, 0x83, { 0x004506CA, 0x004506E3, 0x004506F6, 0x00450709 },
+      { 0x33A, 0x332, 0x33E, 0x336 } },
+};
+
+float g_keepAroundCamera = 0.0f;   // 0 until the sites are patched
+int g_viewBoxTestsPatched = 0;
+int g_keptEntities = 0;            // entities drawn this frame only because they are near
+int g_keptEntitiesPeak = 0;
+
+typedef void (__cdecl *BuildCullBoundsFn)(unsigned char*);
+
+void __cdecl BuildCullBoundsAroundCamera(unsigned char* set) {
+    ((BuildCullBoundsFn)kBuildCullBounds)(set);
+    float* box = (float*)kViewBoxCopy;
+    const float r = g_keepAroundCamera;
+    for (const unsigned char* camera = *(unsigned char**)(set + kCameraList); camera;
+         camera = *(unsigned char**)(camera + kCameraNext)) {
+        const float x = *(const float*)(camera + kCameraEyeX);
+        const float z = *(const float*)(camera + kCameraEyeZ);
+        if (x - r < box[0]) box[0] = x - r;
+        if (z - r < box[1]) box[1] = z - r;
+        if (x + r > box[2]) box[2] = x + r;
+        if (z + r > box[3]) box[3] = z + r;
+    }
+}
+
+// `box` is the entity's bounds: min X, min Y, min Z, max X, max Y, max Z.
+bool NearCamera(const void* planes, const float* box) {
+    const unsigned char* camera = (const unsigned char*)planes - kCameraPlanes;
+    const float x = *(const float*)(camera + kCameraEyeX);
+    const float z = *(const float*)(camera + kCameraEyeZ);
+    const float r = g_keepAroundCamera;
+    return box[0] < x + r && box[3] > x - r && box[2] < z + r && box[5] > z - r;
+}
+
+bool PatchViewBoxTest(const ViewBoxTest& t) {
+    for (int i = 0; i < 4; ++i) {
+        unsigned char expected[6] = { t.opcode, t.modrm };
+        memcpy(expected + 2, &t.fields[i], 4);
+        if (!Verify(t.sites[i], expected, sizeof(expected))) {
+            LogLine("    engine: 0x%08X is not the expected view-box read (%s) -- that test "
+                    "keeps the engine's box", t.sites[i], t.name);
+            return false;
+        }
+    }
+    for (int i = 0; i < 4; ++i) {
+        unsigned char patch[6] = { t.opcode, (unsigned char)((t.modrm & 0x38) | 0x05) };
+        const unsigned int address = kViewBoxCopy + (t.fields[i] - kCameraViewBox);
+        memcpy(patch + 2, &address, 4);
+        Overwrite(t.sites[i], patch, sizeof(patch));
+    }
+    return true;
+}
+
 typedef int (__cdecl *FrustumTestFn)(const void*, const void*);
 
-int __cdecl BudgetedFrustumTest(const void* planes, const void* box) {
+// The frustum test at the entity site. The engine's answer stands; an entity it rejects is
+// still drawn when it lies within KeepAroundCamera of the eye, and, with UncullEntities on,
+// while the frame's budget lasts.
+int __cdecl EntityFrustumTest(const void* planes, const void* box) {
     if (((FrustumTestFn)kFrustumPlaneTest)(planes, box)) {
         return 1;
+    }
+    if (g_keepAroundCamera > 0.0f && NearCamera(planes, (const float*)box)) {
+        ++g_keptEntities;
+        return 1;
+    }
+    if (!Config::UncullEntities()) {
+        return 0;
     }
     const int budget = Config::UncullBudget();
     if (budget > 0 && g_extraVisible >= budget) {
@@ -511,6 +627,10 @@ void __cdecl OnDrawListsReady() {
         g_extraVisiblePeak = g_extraVisible;
     }
     g_extraVisible = 0;
+    if (g_keptEntities > g_keptEntitiesPeak) {
+        g_keptEntitiesPeak = g_keptEntities;
+    }
+    g_keptEntities = 0;
     if ((++g_frameTick % 120) == 0) {
         SampleResourceCache();
     }
@@ -745,6 +865,31 @@ int RedirectCallSites(const unsigned int* sites, int count, unsigned int target,
     return patched;
 }
 
+// Needs the frustum test bypassed at the drawing sites: it widens the box test in front of
+// it, and the frustum would still turn away everything behind the eye.
+void InstallKeepAroundCamera() {
+    const float radius = Config::KeepAroundCamera();
+    if (radius <= 0.0f) {
+        return;
+    }
+    if (!IsCallTo(kBuildCullBoundsCallSite, kBuildCullBounds)) {
+        LogLine("    engine: 0x%08X is not the call to SP_BuildCullBounds -- the level is not "
+                "kept around the camera", kBuildCullBoundsCallSite);
+        return;
+    }
+    g_keepAroundCamera = radius;
+    const int total = (int)(sizeof(kViewBoxTests) / sizeof(kViewBoxTests[0]));
+    for (int i = 0; i < total; ++i) {
+        if (PatchViewBoxTest(kViewBoxTests[i])) {
+            ++g_viewBoxTestsPatched;
+        }
+    }
+    RedirectCallSites(&kBuildCullBoundsCallSite, 1, kBuildCullBounds,
+                      (unsigned char*)&BuildCullBoundsAroundCamera);
+    LogLine("    engine: level kept within %.0f units of the camera at %d/%d drawing tests",
+            radius, g_viewBoxTestsPatched, total);
+}
+
 } // namespace
 
 void Engine::OnFrame() {
@@ -841,10 +986,13 @@ void Engine::Install() {
                     (int)(sizeof(kRoomTests) / sizeof(kRoomTests[0])));
         }
 
-        if (Config::UncullEntities()) {
+        InstallKeepAroundCamera();
+        if (Config::UncullEntities() || g_keepAroundCamera > 0.0f) {
             g_entitySitePatched = RedirectCallSites(&kFrustumEntityCallSite, 1,
                                                     kFrustumPlaneTest,
-                                                    (unsigned char*)&BudgetedFrustumTest) > 0;
+                                                    (unsigned char*)&EntityFrustumTest) > 0;
+        }
+        if (Config::UncullEntities()) {
             LogLine("    engine: entity visibility %s, budget %d objects per frame",
                     g_entitySitePatched ? "widened" : "UNCHANGED", Config::UncullBudget());
         }
@@ -868,6 +1016,11 @@ void Engine::LogState() {
             g_frustumSitesPatched, g_entitySitePatched ? "widened" : "untouched",
             g_extraVisiblePeak, g_extraVisibleDenied);
     LogLine("    engine: room visibility widened at %d sites", g_roomTestsWidened);
+    if (g_keepAroundCamera > 0.0f) {
+        LogLine("    engine: level kept within %.0f units of the camera at %d drawing tests; "
+                "peak %d entities in a frame drawn only for being near",
+                g_keepAroundCamera, g_viewBoxTestsPatched, g_keptEntitiesPeak);
+    }
     SampleResourceCache();
     if (g_cacheSlots) {
         LogLine("    engine: entity resource cache peak %u / %u slots%s",

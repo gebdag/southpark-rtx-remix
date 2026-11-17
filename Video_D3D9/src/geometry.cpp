@@ -473,6 +473,10 @@ unsigned int g_blendedFlushes = 0;
 bool g_dumpArmed = false;
 bool g_dumpingFrame = false;
 int  g_dumpBatch = 0;
+// The dumped frame's world triangles with the normals this renderer gave them, as
+// <base>frame_dump.obj: one group per batch, named by its number in the log.
+FILE* g_dumpObj = 0;
+int g_dumpObjVertices = 0;
 
 // Operands above 0x00ffffff are segment-relative. The engine installs the bases through
 // opcode 0xbc, sub-command 6, before any list references them.
@@ -874,19 +878,17 @@ void LogMatrix(const char* label, const D3DMATRIX& m) {
 //
 // Most of the world is pre-lit: its vertices carry a colour where lit geometry carries a
 // normal, because the original never lights it. A path tracer lights everything, and needs a
-// normal for that, so one is computed from the triangles. Each corner takes the area-weighted
-// normals of the faces that meet at its point and lie within [Normals] SmoothingAngle of its
-// own face, so a mountain shades smoothly and a house's corner stays hard; a slot whose corners
-// disagree becomes one vertex per normal. The faces around a point are gathered across draws
-// (NormalCache): one draw holds a handful of triangles, often with its own copy of each corner.
+// normal for that, so one is computed from the triangles. An edge whose faces meet at more
+// than [Normals] SmoothingAngle is sharp; each corner averages the faces it reaches around its
+// point without crossing a sharp edge, weighted by their angles there, so a mountain shades
+// smoothly and a house's corner stays hard; a slot whose corners disagree becomes one vertex
+// per normal. The faces around a point are gathered across draws (NormalCache): one draw holds
+// a handful of triangles, often with its own copy of each corner.
 //
 // The normal follows each triangle's own winding, so a card whose two triangles are wound
 // opposite ways -- the intro's star cards are -- gets a normal that agrees with each triangle's
 // geometry instead of one that points out of one and into the other.
 
-const int kMaxBatchTriangles = kMaxIndices / 3;
-float g_faceNormal[kMaxBatchTriangles][3];   // area-weighted
-float g_faceUnit[kMaxBatchTriangles][3];
 int g_slotFirstVariant[kMaxVertices];         // compacted vertices made from each slot, chained
 int g_variantNext[kMaxIndices];
 
@@ -916,23 +918,6 @@ void FaceNormal(const WorldVertex& a, const WorldVertex& b, const WorldVertex& c
     Cross(e1, e2, out);
 }
 
-void ComputeFaceNormals(int vertexCount) {
-    for (int t = 0; t < g_indexCount / 3; ++t) {
-        const int a = g_indices[t * 3], b = g_indices[t * 3 + 1], c = g_indices[t * 3 + 2];
-        float* n = g_faceNormal[t];
-        if (a >= vertexCount || b >= vertexCount || c >= vertexCount) {
-            n[0] = n[1] = n[2] = 0.0f;
-        } else {
-            FaceNormal(g_vertices[a], g_vertices[b], g_vertices[c], n);
-        }
-        float* u = g_faceUnit[t];
-        u[0] = n[0]; u[1] = n[1]; u[2] = n[2];
-        if (!Normalise(u)) {
-            u[0] = u[1] = u[2] = 0.0f;
-        }
-    }
-}
-
 // Records the batch's pre-lit faces, so its corners -- and those of every later draw -- are
 // smoothed over them.
 void RecordPrelitFaces(int vertexCount) {
@@ -948,8 +933,9 @@ void RecordPrelitFaces(int vertexCount) {
 
 // The smoothed normal of corner `corner` (an index position).
 void CornerNormal(int corner, float creaseCos, float* out) {
-    const float* own = g_faceUnit[corner / 3];
-    NormalCache::CornerNormal(&g_vertices[g_indices[corner]].x, own, creaseCos, out);
+    const int first = corner - corner % 3;
+    NormalCache::CornerNormal(&g_vertices[g_indices[first]].x, &g_vertices[g_indices[first + 1]].x,
+                              &g_vertices[g_indices[first + 2]].x, corner % 3, creaseCos, out);
     if (!Normalise(out)) {
         out[0] = 0.0f; out[1] = 1.0f; out[2] = 0.0f;
     }
@@ -964,7 +950,6 @@ bool SameNormal(const WorldVertex& v, const float* n) {
 int CompactBatch(int vertexCount) {
     // A small slack keeps faces that are parallel up to rounding together at 0 degrees.
     const float creaseCos = cosf(Config::SmoothingAngle() * 3.14159265f / 180.0f) - 1e-4f;
-    ComputeFaceNormals(vertexCount);
     RecordPrelitFaces(vertexCount);
     for (int v = 0; v < vertexCount; ++v) {
         g_slotFirstVariant[v] = -1;
@@ -1817,6 +1802,23 @@ void DumpBatch(int vertexCount, bool textured, bool culled, bool sky, bool decal
         }
     }
 
+    if (g_dumpObj) {
+        fprintf(g_dumpObj, "g batch%d%s%s\n", g_dumpBatch, culled ? "_cull" : "",
+                (g_renderFlags & kFlagLighting) ? "_lit" : "");
+        for (int i = 0; i < vertexCount; ++i) {
+            const WorldVertex& v = g_compactVertices[i];
+            fprintf(g_dumpObj, "v %.4f %.4f %.4f\nvn %.5f %.5f %.5f\n", v.x, v.y, v.z, v.nx, v.ny,
+                    v.nz);
+        }
+        for (int i = 0; i + 2 < g_indexCount; i += 3) {
+            const int a = g_dumpObjVertices + g_compactIndices[i] + 1;
+            const int b = g_dumpObjVertices + g_compactIndices[i + 1] + 1;
+            const int c = g_dumpObjVertices + g_compactIndices[i + 2] + 1;
+            fprintf(g_dumpObj, "f %d//%d %d//%d %d//%d\n", a, a, b, b, c, c);
+        }
+        g_dumpObjVertices += vertexCount;
+    }
+
     const unsigned int constant = ConstantColourForBatch();
     LogLine("      #%-4d %s", g_dumpBatch, texture);
     LogLine("            rendermode=0x%08x%s%s%s%s", g_renderMode,
@@ -1908,7 +1910,12 @@ void Geometry::BeginFrame() {
         g_dumpArmed = false;
         g_dumpingFrame = true;
         g_dumpBatch = 0;
-        LogLine("    ==== FRAME DUMP ====");
+        char path[MAX_PATH];
+        _snprintf(path, sizeof(path), "%sframe_dump.obj", Config::BaseDir());
+        path[sizeof(path) - 1] = 0;
+        g_dumpObj = fopen(path, "w");
+        g_dumpObjVertices = 0;
+        LogLine("    ==== FRAME DUMP ==== (triangles in %s)", path);
         const float* v = &g_view._11;
         LogLine("      camera fwd(%.3f, %.3f, %.3f) t(%.1f, %.1f, %.1f)",
                 v[2], v[6], v[10], v[12], v[13], v[14]);
@@ -1952,6 +1959,10 @@ void Geometry::EndFrame() {
     Flush();
     if (g_dumpingFrame) {
         g_dumpingFrame = false;
+        if (g_dumpObj) {
+            fclose(g_dumpObj);
+            g_dumpObj = 0;
+        }
         LogLine("    ==== END FRAME DUMP: %d batches ====", g_dumpBatch);
     }
 }

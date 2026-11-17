@@ -66,6 +66,12 @@ unsigned int BatchLimitScale();
 // 0 keeps the engine's own value.
 float DrawDistance();
 
+// Radius around the camera, in world units, inside which the level is drawn whichever way
+// the camera faces. The engine's 2D X/Z box test compares objects against a box around the
+// view cone, and the cone starts at the eye, so without this nothing behind the camera is
+// drawn at all. Drawing only; loading, spawning and simulation are untouched. 0 is off.
+float KeepAroundCamera();
+
 // Multiplier on the camera's drawn-object list, the fixed 128-entry array the engine
 // records each frame's visible objects into and overruns silently -- an object past it is
 // simply not drawn. This is what bounds DrawDistance: at 8192 units the list peaks around
