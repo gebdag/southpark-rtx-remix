@@ -67,6 +67,8 @@ bool DecodeFailed(int index);
 bool IsSkySet(int index);
 // Whether a set is one of [Sky] StarTextureNames: the game's star-field cards.
 bool IsStarSet(int index);
+// Whether a set is one of [Debug] DumpTextureNames.
+bool IsDumpedSet(int index);
 
 // Drops every decoded frame but keeps the blobs, so the next draw decodes afresh. The engine
 // asks for this through GFXDLL_FlushTextureCache, which the original honours by jumping into
@@ -77,5 +79,10 @@ void ReleaseAll();
 
 // Writes a whole set blob to disk for offline analysis.
 void DumpSet(int index, const char* path);
+
+// Writes the texels of the variant a (subA, subB) selection resolves to, as uploaded, to
+// <folder><set>_<frame>_<palette>_<w>x<h>_<name>.bgra. RTX Remix names a texture by XXH3-64 of
+// exactly these bytes, which is what a material override in a Remix mod is keyed by.
+bool DumpTexels(int index, int subA, int subB, const char* folder);
 
 } // namespace Texture

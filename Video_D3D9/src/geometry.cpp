@@ -418,12 +418,45 @@ struct SetDraws {
     unsigned int flushes;
     unsigned int tris;
     unsigned int flushesWithoutTexture;
+    // Batches drawn with the engine's environment-map texture coordinates (render flag
+    // 0x40000): the game's chrome, a reflection image wrapped by the surface normal.
+    unsigned int envFlushes;
     // The tint the batch carried, kept so the census can separate a texture that decoded to
     // the wrong colour from one that decoded correctly and was then tinted wrongly.
     unsigned int lastConstant;
     int lastMode;
 };
 SetDraws g_setDraws[kCensusSets];
+
+// Each environment-mapped variant's texels, written once a run with [Debug] DumpEnvTextures:
+// the input for keying Remix material overrides (Texture::DumpTexels).
+const unsigned int kFlagEnvironmentMap = 0x40000;
+struct DumpedVariant {
+    int set, subA, subB;
+};
+DumpedVariant g_dumpedEnv[256];
+int g_dumpedEnvCount = 0;
+
+void DumpEnvTexture(int set) {
+    if (!Config::DumpEnvTextures()) {
+        return;
+    }
+    for (int i = 0; i < g_dumpedEnvCount; ++i) {
+        const DumpedVariant& d = g_dumpedEnv[i];
+        if (d.set == set && d.subA == g_currentSubA && d.subB == g_currentSubB) {
+            return;
+        }
+    }
+    if (g_dumpedEnvCount == (int)(sizeof(g_dumpedEnv) / sizeof(g_dumpedEnv[0]))) {
+        return;
+    }
+    g_dumpedEnv[g_dumpedEnvCount++] = {set, g_currentSubA, g_currentSubB};
+    char folder[MAX_PATH];
+    _snprintf(folder, sizeof(folder), "%senv_textures\\", Config::BaseDir());
+    folder[sizeof(folder) - 1] = 0;
+    CreateDirectoryA(folder, 0);
+    Texture::DumpTexels(set, g_currentSubA, g_currentSubB, folder);
+}
 // House walls carry no texture and white vertices, so they never appear in the per-set
 // census -- every one of them lands in the untextured bucket below. To see what actually
 // decides their colour, each distinct (combiner mode, constant colour, blend) triple an
@@ -1584,6 +1617,16 @@ void Flush() {
         d.tris += (unsigned int)(g_indexCount / 3);
         if (!tex) {
             ++d.flushesWithoutTexture;
+        }
+        if (g_renderFlags & kFlagEnvironmentMap) {
+            if (d.envFlushes == 0) {
+                LogLine("    environment-mapped: set %d \"%s\" (frame/palette %d,%d)", activeTexture,
+                        Texture::Name(activeTexture), g_currentSubA, g_currentSubB);
+            }
+            ++d.envFlushes;
+            DumpEnvTexture(activeTexture);
+        } else if (Texture::IsDumpedSet(activeTexture)) {
+            DumpEnvTexture(activeTexture);
         }
     } else {
         ++g_noSelectFlushes;

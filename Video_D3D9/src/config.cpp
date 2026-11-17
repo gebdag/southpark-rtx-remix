@@ -13,6 +13,8 @@ char g_baseDir[MAX_PATH];
 char g_skyNames[512];
 char g_starNames[512];
 bool g_starrySky = true;
+bool g_dumpEnvTextures = false;
+char g_dumpTextureNames[512];
 int g_screenshotFrame = 0;
 int g_screenshotInterval = 0;
 int g_lookdevCaptureKey = 0x78;   // VK_F9
@@ -461,6 +463,9 @@ void Config::Load(void* self) {
     Config::RefreshLive();
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
+    g_dumpEnvTextures = ReadBool("Debug", "DumpEnvTextures", false);
+    GetPrivateProfileStringA("Debug", "DumpTextureNames", "", g_dumpTextureNames,
+                             sizeof(g_dumpTextureNames), g_iniPath);
     GetPrivateProfileStringA("Sky", "StarTextureNames", "STARS01",
                              g_starNames, sizeof(g_starNames), g_iniPath);
 
@@ -499,6 +504,8 @@ bool Config::DisableTriangleSkipMask()    { return g_disableTriangleSkipMask; }
 bool Config::DisableOffscreenQuadReject() { return g_disableOffscreenQuadReject; }
 bool Config::UseEngineBackgroundColour()  { return g_useEngineBackgroundColour; }
 bool Config::StarrySky()                 { return g_starrySky; }
+bool Config::DumpEnvTextures()           { return g_dumpEnvTextures; }
+const char* Config::DumpTextureNames()   { return g_dumpTextureNames; }
 const char* Config::StarTextureNames()   { return g_starNames; }
 const char* Config::SkyTextureNames()     { return g_skyNames; }
 bool Config::LogEveryCall()               { return g_logEveryCall; }

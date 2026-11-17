@@ -141,6 +141,11 @@ const char* SkyTextureNames();
 // menu's wall of star tiles) are not drawn; the sky box wears their texture instead. Re-read
 // while the game runs.
 bool StarrySky();
+
+// [Debug] DumpEnvTextures: write each texture variant drawn environment-mapped, and each of
+// the sets named in DumpTextureNames (name prefixes), to <game>\env_textures// (Texture::DumpTexels), once per run.
+bool DumpEnvTextures();
+const char* DumpTextureNames();
 const char* StarTextureNames();
 
 // Draw a large box around the camera in the background colour, at the far plane, first in

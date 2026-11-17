@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <d3d9.h>
+#include <vector>
 #include "device.h"
 
 namespace {
@@ -43,6 +44,7 @@ unsigned int g_lastDecodeMeanColour = 0;
 int   g_decodeFailures = 0;
 bool  g_isSky[kMaxSets];
 bool  g_isStars[kMaxSets];
+bool  g_isDumped[kMaxSets];
 int   g_count = 0;
 int   g_paletteLogged = 0;
 
@@ -402,6 +404,7 @@ void Texture::FinishEnumeration() {
             ++skies;
             LogLine("    sky texture set %d: %s", i, SetName(g_sets[i]));
         }
+        g_isDumped[i] = g_sets[i] && NameInList(SetName(g_sets[i]), Config::DumpTextureNames());
         if (g_sets[i] && NameInList(SetName(g_sets[i]), Config::StarTextureNames())) {
             g_isStars[i] = true;
             LogLine("    star-field texture set %d: %s", i, SetName(g_sets[i]));
@@ -496,12 +499,14 @@ int ClampIndex(int wanted, unsigned int available) {
     return wanted;
 }
 
-IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
-    IDirect3DDevice9* dev = Device::Get();
+// One frame/palette variant of a set as 32-bit A8R8G8B8 texels, row after row: exactly what is
+// uploaded, and so what RTX Remix hashes to name the texture.
+bool DecodeTexels(int index, int pixSub, int palSub, std::vector<unsigned int>& texels,
+                  int* width, int* height) {
     const unsigned char* base = (const unsigned char*)g_sets[index];
     const unsigned int size = BlobSize(base);
-    if (!dev || size == 0) {
-        return 0;
+    if (size == 0) {
+        return false;
     }
 
     unsigned int hdrSize = 0, pixChunkSize = 0, palChunkSize = 0;
@@ -509,7 +514,7 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
     const unsigned char* pixChunk = ChunkAt(base, size, 1, &pixChunkSize);
     const unsigned char* palChunk = ChunkAt(base, size, 2, &palChunkSize);
     if (!hdr || hdrSize < 4 || !pixChunk) {
-        return 0;
+        return false;
     }
 
     const int w = hdr[2] ? hdr[2] : 256;
@@ -519,7 +524,7 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
     const unsigned char* pixelData =
         SubChunk(pixChunk, (unsigned int)pixSub, pixChunkSize, &pixSize);
     if (!pixelData) {
-        return 0;
+        return false;
     }
     // Formats 2, 4, 5 and 6 carry no palette at all -- their chunk 2 is a nested blob with a
     // count of zero. The original reflects this: FUN_1000cf90 only fetches a palette when its
@@ -537,19 +542,12 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
         bpp = 4;
     } else {
         LogLine("    texture %d: payload too small (%u for %ux%u)", index, pixSize, w, h);
-        return 0;
+        return false;
     }
 
-    IDirect3DTexture9* tex = 0;
-    if (FAILED(dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, 0))) {
-        return 0;
-    }
-
-    D3DLOCKED_RECT lr;
-    if (FAILED(tex->LockRect(0, &lr, 0, 0))) {
-        tex->Release();
-        return 0;
-    }
+    texels.resize((size_t)w * h);
+    *width = w;
+    *height = h;
     unsigned int clearTexels = 0;
     unsigned int sumR = 0, sumG = 0, sumB = 0, opaqueTexels = 0;
 
@@ -557,7 +555,7 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
     const unsigned int palEntries = palette ? palSize / 2 : 0;
     const int effectMode = EffectPaletteMode(hdr[0]);
     for (int y = 0; y < h; ++y) {
-        unsigned int* dst = (unsigned int*)((unsigned char*)lr.pBits + (size_t)y * lr.Pitch);
+        unsigned int* dst = &texels[(size_t)y * w];
         for (int x = 0; x < w; ++x) {
             unsigned int idx;
             if (bpp == 4) {
@@ -588,13 +586,57 @@ IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
             }
         }
     }
-    tex->UnlockRect(0);
     g_lastDecodeTransparentPercent =
         pixels ? (unsigned short)((clearTexels * 100) / pixels) : 0;
     g_lastDecodeMeanColour = opaqueTexels
         ? (((sumR / opaqueTexels) << 16) | ((sumG / opaqueTexels) << 8) | (sumB / opaqueTexels))
         : 0u;
+    return true;
+}
+
+IDirect3DTexture9* Decode(int index, int pixSub, int palSub) {
+    IDirect3DDevice9* dev = Device::Get();
+    std::vector<unsigned int> texels;
+    int w = 0, h = 0;
+    if (!dev || !DecodeTexels(index, pixSub, palSub, texels, &w, &h)) {
+        return 0;
+    }
+    IDirect3DTexture9* tex = 0;
+    if (FAILED(dev->CreateTexture(w, h, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &tex, 0))) {
+        return 0;
+    }
+    D3DLOCKED_RECT lr;
+    if (FAILED(tex->LockRect(0, &lr, 0, 0))) {
+        tex->Release();
+        return 0;
+    }
+    for (int y = 0; y < h; ++y) {
+        memcpy((unsigned char*)lr.pBits + (size_t)y * lr.Pitch, &texels[(size_t)y * w],
+               (size_t)w * 4);
+    }
+    tex->UnlockRect(0);
     return tex;
+}
+
+// The frame and palette sub-chunks a (subA, subB) selection resolves to; false when the set
+// cannot be read.
+bool ResolveVariant(int index, int subA, int subB, int* pixSub, int* palSub) {
+    if (index < 0 || index >= g_count || !g_sets[index]) {
+        return false;
+    }
+    const unsigned char* base = (const unsigned char*)g_sets[index];
+    const unsigned int size = BlobSize(base);
+    unsigned int hdrSize = 0, pixChunkSize = 0, palChunkSize = 0;
+    const unsigned char* hdr = ChunkAt(base, size, 0, &hdrSize);
+    const unsigned char* pixChunk = ChunkAt(base, size, 1, &pixChunkSize);
+    const unsigned char* palChunk = ChunkAt(base, size, 2, &palChunkSize);
+    if (!hdr || hdrSize < 1 || !pixChunk) {
+        return false;
+    }
+    ResolveSubChunks(hdr[0], subA, subB, pixSub, palSub);
+    *pixSub = ResolveImageSubChunk(*pixSub, subA, subB, SubChunkCount(pixChunk, pixChunkSize));
+    *palSub = ClampIndex(*palSub, SubChunkCount(palChunk, palChunkSize));
+    return true;
 }
 
 } // namespace
@@ -603,22 +645,11 @@ IDirect3DTexture9* Texture::GetTexture(int index, int subA, int subB) {
     if (index < 0 || index >= g_count || !g_sets[index] || g_decodeFailed[index]) {
         return 0;
     }
-
-    const unsigned char* base = (const unsigned char*)g_sets[index];
-    const unsigned int size = BlobSize(base);
-    unsigned int hdrSize = 0, pixChunkSize = 0, palChunkSize = 0;
-    const unsigned char* hdr = ChunkAt(base, size, 0, &hdrSize);
-    const unsigned char* pixChunk = ChunkAt(base, size, 1, &pixChunkSize);
-    const unsigned char* palChunk = ChunkAt(base, size, 2, &palChunkSize);
-    if (!hdr || hdrSize < 1 || !pixChunk) {
+    int pixSub = 0, palSub = 0;
+    if (!ResolveVariant(index, subA, subB, &pixSub, &palSub)) {
         g_decodeFailed[index] = true;
         return 0;
     }
-
-    int pixSub = 0, palSub = 0;
-    ResolveSubChunks(hdr[0], subA, subB, &pixSub, &palSub);
-    pixSub = ResolveImageSubChunk(pixSub, subA, subB, SubChunkCount(pixChunk, pixChunkSize));
-    palSub = ClampIndex(palSub, SubChunkCount(palChunk, palChunkSize));
 
     SetCache& cache = g_cache[index];
     for (int i = 0; i < cache.n; ++i) {
@@ -852,6 +883,10 @@ bool Texture::IsStarSet(int index) {
     return index >= 0 && index < g_count && g_isStars[index];
 }
 
+bool Texture::IsDumpedSet(int index) {
+    return index >= 0 && index < g_count && g_isDumped[index];
+}
+
 void Texture::FlushDecoded() {
     int released = 0;
     for (int i = 0; i < g_count; ++i) {
@@ -884,6 +919,36 @@ void Texture::ReleaseAll() {
         g_decodeFailed[i] = false;
         g_isSky[i] = false;
         g_isStars[i] = false;
+        g_isDumped[i] = false;
     }
     g_count = 0;
+}
+
+bool Texture::DumpTexels(int index, int subA, int subB, const char* folder) {
+    int pixSub = 0, palSub = 0;
+    if (!ResolveVariant(index, subA, subB, &pixSub, &palSub)) {
+        return false;
+    }
+    std::vector<unsigned int> texels;
+    int w = 0, h = 0;
+    if (!DecodeTexels(index, pixSub, palSub, texels, &w, &h)) {
+        return false;
+    }
+    char name[64];
+    lstrcpynA(name, Name(index), sizeof(name));
+    for (char* c = name; *c; ++c) {
+        if (*c == '*' || *c == '?' || *c == '/' || *c == '\\' || *c == ':' || *c == ' ') {
+            *c = '_';
+        }
+    }
+    char path[MAX_PATH];
+    _snprintf(path, sizeof(path), "%s%d_%d_%d_%dx%d_%s.bgra", folder, index, pixSub, palSub, w, h, name);
+    path[sizeof(path) - 1] = 0;
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        return false;
+    }
+    fwrite(texels.data(), 4, texels.size(), f);
+    fclose(f);
+    return true;
 }
