@@ -35,8 +35,9 @@ bool IsHost();
 bool IsTee();
 bool UsePlainD3D9();
 
-// In the host: true for its first frame only, when SP_LOOKDEV_DUMP is set, so a captured
-// frame can be logged draw by draw, as F10 does in the game.
+// In the host: true for one frame only, when SP_LOOKDEV_DUMP is set, so a captured frame can be
+// logged draw by draw, as F10 does in the game. The first frame, or the one SP_LOOKDEV_DUMP_AT
+// counts to.
 bool TakeDumpRequest();
 
 // Name of the log beside the DLL for this mode.

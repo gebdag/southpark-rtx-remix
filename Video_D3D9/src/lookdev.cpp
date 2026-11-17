@@ -7,6 +7,7 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -53,6 +54,7 @@ enum Mode {
 Mode g_mode = ModeOff;
 bool g_plain = false;
 bool g_dumpRequest = false;
+int g_dumpCountdown = 0;    // host frames to let pass before the dump
 
 const unsigned int kMagic = 0x50435053;   // "SPCP"
 const unsigned int kVersion = 2;
@@ -394,6 +396,9 @@ void Lookdev::DetectMode() {
     }
     g_trackState = g_mode == ModeGame;
     g_dumpRequest = g_mode == ModeHost && EnvFlag("SP_LOOKDEV_DUMP");
+    char at[16];
+    const DWORD n = GetEnvironmentVariableA("SP_LOOKDEV_DUMP_AT", at, sizeof(at));
+    g_dumpCountdown = n > 0 && n < sizeof(at) ? atoi(at) : 0;
 }
 
 void Lookdev::TrackCommand(unsigned int word0, unsigned int word1) {
@@ -425,9 +430,15 @@ bool Lookdev::IsTee()        { return g_mode == ModeGame; }
 bool Lookdev::UsePlainD3D9() { return g_plain; }
 
 bool Lookdev::TakeDumpRequest() {
-    const bool requested = g_dumpRequest;
+    if (!g_dumpRequest) {
+        return false;
+    }
+    if (g_dumpCountdown > 0) {
+        --g_dumpCountdown;
+        return false;
+    }
     g_dumpRequest = false;
-    return requested;
+    return true;
 }
 
 const char* Lookdev::LogFileName() {
