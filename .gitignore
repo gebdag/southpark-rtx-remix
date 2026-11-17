@@ -27,3 +27,12 @@ SouthPark_code.exe
 lookdev/bin/
 lookdev/obj/
 __pycache__/
+
+# Research and capture files
+index.db*
+kb.h
+kb_engine.h
+findings*.md
+*.spcap
+*.dds
+*.map
