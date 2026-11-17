@@ -28,6 +28,11 @@ bool CameraFollowsDisplayAspect();
 // frame on; ignored while CameraFollowsDisplayAspect() is false.
 void SetDisplayAspect(float aspect);
 
+// [Display] HudAtSides: where the 2D quad being drawn goes on a picture wider than 4:3. -1 the
+// picture's left edge, 1 its right edge, 0 the centred 4:3 frame -- everything but the in-game
+// HUD's side elements. `caller` is the engine's return address from GFXDLL_DrawQuadPCX.
+int HudSide(unsigned int caller);
+
 // Once a frame: brings the camera's field of view to [Display] FieldOfView, except in
 // cutscenes, which keep the framing they were made with, and the radius drawn around the
 // camera to [FullMap] KeepAroundCamera.

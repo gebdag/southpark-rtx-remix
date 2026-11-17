@@ -28,6 +28,8 @@
 #include "normal_cache.h"
 #include "config.h"
 
+#include <intrin.h>
+
 #include <stdio.h>
 
 #include <windows.h>
@@ -190,10 +192,11 @@ void Ours_DrawPCX(void) {
     LogCall("GFXDLL_DrawPCX");
 }
 
+// Reached by a jump from the export, so its return address is the engine's call site.
 void Ours_DrawQuadPCX(int handle, const float* positions, const float* colours,
                       const float* uvs) {
     LogCall("GFXDLL_DrawQuadPCX");
-    Pcx::DrawQuad(handle, positions, colours, uvs);
+    Pcx::DrawQuad(handle, positions, colours, uvs, (unsigned int)_ReturnAddress());
 }
 
 void Ours_BlitPCXToPCX(void) {

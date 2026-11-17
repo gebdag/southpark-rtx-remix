@@ -28,7 +28,8 @@ Setting g_keepAround = {"FullMap", "KeepAroundCamera", 2048.0f, 2048.0f, 0.0f, 1
 Setting g_drawPercent = {"FullMap", "DrawDistancePercent", 100.0f, 100.0f, 100.0f, 400.0f, false, true};
 const float kDrawPercentSliderMaximum = 200.0f;
 Setting g_stars = {"Sky", "StarrySky", 1.0f, 1.0f, 0.0f, 1.0f, false, true};
-Setting* const g_settings[] = {&g_turn, &g_look, &g_fov, &g_keepAround, &g_drawPercent, &g_stars};
+Setting g_hudSides = {"Display", "HudAtSides", 1.0f, 1.0f, 0.0f, 1.0f, false, true};
+Setting* const g_settings[] = {&g_turn, &g_look, &g_fov, &g_keepAround, &g_drawPercent, &g_stars, &g_hudSides};
 
 char g_ini[MAX_PATH];
 float g_projection11 = 0.0f;
@@ -133,6 +134,11 @@ void Settings::DrawPanel() {
                    kDrawPercentSliderMaximum, "%.0f%%")) {
         g_drawPercent.value = floorf(g_drawPercent.value + 0.5f);
         g_drawPercent.dirty = true;
+    }
+    bool sides = g_hudSides.value != 0.0f;
+    if (Ui::Checkbox("HUD at the sides of a wide picture (crosshair and menus stay centred)", &sides)) {
+        g_hudSides.value = sides ? 1.0f : 0.0f;
+        g_hudSides.dirty = true;
     }
     bool starry = g_stars.value != 0.0f;
     if (Ui::Checkbox("Starry sky: the intro's and menus' star cards become the sky", &starry)) {

@@ -977,7 +977,151 @@ void InstallKeepAroundCamera() {
             g_keepAroundCamera, g_viewBoxTestsPatched, total);
 }
 
+// ------------------------------------------------------------------- the HUD at the sides
+//
+// On a picture wider than 4:3 the 2D layer is drawn in a centred 4:3 frame. With [Display]
+// HudAtSides the in-game HUD's elements move out to the picture's edges instead.
+//
+// The HUD is one 2D callback, FUN_0041b010, registered at level setup (the push at 0x00443533):
+// the HUD driver FUN_004a8990, then the radar FUN_004ac170. The driver places each element --
+// health portraits and numbers, the multiplayer scoreboard, armor, the weapon row, the
+// crosshair, the town bar -- from a layout table at 0x004e2300: 6 layouts (the game's InfoLayout
+// option; the active one at 0x0105e8a4) of 8 slots {mode, x, y}, mode 1 anchored to the right,
+// the others to the left. Each element is several quads drawn through shared helpers (the text
+// renderer, the icon and portrait drawers), so a quad cannot be sorted by where it lands: the
+// default weapon row starts left of the centre and runs past it. Instead each call that draws an
+// element goes through a small cave that records which element it is and jumps on, and the side
+// comes from that element's slot.
+//
+// A slot anchored right, or placed from x 160 on (the default armor and weapon row), goes to the
+// right edge; the radar by the engine's own rule, left below x 320; the rest to the left edge.
+// The crosshair and the town bar stay centred. The callback is bracketed: nothing drawn outside
+// it moves, so menus and the pause screen keep their frame.
+enum HudElement { kHudNone, kHudCentre, kHudHealth, kHudScoreboard, kHudArmor, kHudWeapons, kHudRadar };
+
+struct HudSite {
+    unsigned int site;     // a call to `target`
+    unsigned int target;
+    HudElement element;
+};
+
+const unsigned int kHudPortrait = 0x004A85B0;    // FUN_004a85b0, a health portrait
+const unsigned int kHudText = 0x004866A0;        // FUN_004866a0, a string
+const unsigned int kHudIcon = 0x004A7E60;        // FUN_004a7e60, an icon on its tile
+const HudSite kHudSites[] = {
+    { 0x004A8C86, kHudPortrait, kHudHealth },     { 0x004A8EC4, kHudPortrait, kHudHealth },
+    { 0x004A8D99, kHudText, kHudHealth },         { 0x004A8FC0, kHudText, kHudHealth },
+    { 0x004A97B9, kHudPortrait, kHudScoreboard }, { 0x004A94B6, kHudText, kHudScoreboard },
+    { 0x004A983A, kHudText, kHudScoreboard },     { 0x004A98AA, kHudText, kHudScoreboard },
+    { 0x004A98E8, kHudText, kHudScoreboard },     { 0x004A99AD, kHudText, kHudScoreboard },
+    { 0x004A99F2, kHudText, kHudScoreboard },     { 0x004A9A82, kHudText, kHudScoreboard },
+    { 0x004A9D00, kHudIcon, kHudWeapons },        { 0x004A9E57, kHudText, kHudWeapons },
+    { 0x004A9EE1, kHudIcon, kHudArmor },          { 0x004A9FC1, kHudText, kHudArmor },
+    { 0x004A9FDE, 0x004A8660, kHudCentre },       // the crosshair
+    { 0x004A9FF7, 0x004AA040, kHudCentre },       // the town bar
+    { 0x0041B080, 0x004AC170, kHudRadar },
+};
+// The scoreboard's rows call the 2D layer directly (call [0x007e5d98]); they are told by where
+// that call returns to.
+const unsigned int kScoreboardRowReturns[] = { 0x004A9477, 0x004A96C7, 0x004A978E };
+const unsigned int kHudCallbackPush = 0x00443533;
+const unsigned int kHudCallback = 0x0041B010;
+const unsigned int kHudLayoutTable = 0x004E2300;
+const unsigned int kHudLayout = 0x0105E8A4;
+const unsigned int kHudLayouts = 6;
+const unsigned int kHudLayoutSize = 0x60;
+const unsigned int kHudSlotOffset[] = { 0, 0, 0x00, 0x0C, 0x18, 0x24, 0x3C };   // by HudElement
+
+int g_hudElement = kHudNone;       // written by the caves, on the game's thread
+unsigned int g_hudReturn = 0;      // where the HUD callback returns to, while it runs
+int g_hudSitesTagged = 0;
+bool g_hudBracketed = false;
+
+// mov dword [g_hudElement], element; jmp target
+unsigned char* EmitHudTag(unsigned int target, int element) {
+    unsigned char* cave = g_write;
+    Emit(0xC7); Emit(0x05); EmitDword((unsigned int)&g_hudElement); EmitDword((unsigned int)element);
+    Emit(0xE9); EmitDword(Place(target) - ((unsigned int)g_write + 4));
+    return cave;
+}
+
+// The HUD callback runs with the element set to "centre" and returns through `after`, which
+// clears it. The caller's return address is swapped rather than the call repeated, so whatever
+// the callback takes stays where its caller put it.
+unsigned char* EmitHudBracket() {
+    unsigned char* cave = g_write;
+    Emit(0x8F); Emit(0x05); EmitDword((unsigned int)&g_hudReturn);           // pop [return]
+    Emit(0x68); unsigned char* after = g_write; EmitDword(0);                  // push after
+    Emit(0xC7); Emit(0x05); EmitDword((unsigned int)&g_hudElement); EmitDword(kHudCentre);
+    Emit(0xE9); EmitDword(Place(kHudCallback) - ((unsigned int)g_write + 4)); // jmp callback
+    const unsigned int afterAddress = (unsigned int)g_write;
+    memcpy(after, &afterAddress, 4);
+    Emit(0xC7); Emit(0x05); EmitDword((unsigned int)&g_hudElement); EmitDword(kHudNone);
+    Emit(0xFF); Emit(0x25); EmitDword((unsigned int)&g_hudReturn);           // jmp [return]
+    return cave;
+}
+
+void InstallHudSides() {
+    unsigned char* page = (unsigned char*)VirtualAlloc(0, 4096, MEM_COMMIT | MEM_RESERVE,
+                                                       PAGE_EXECUTE_READWRITE);
+    if (!page) {
+        return;
+    }
+    g_write = page;
+    const unsigned char kPushCallback[5] = { 0x68, 0x10, 0xB0, 0x41, 0x00 };  // push FUN_0041b010
+    if (!Verify(kHudCallbackPush, kPushCallback, sizeof(kPushCallback))) {
+        LogLine("    engine: 0x%08X is not the HUD callback's registration -- the HUD stays in the "
+                "frame", kHudCallbackPush);
+        return;
+    }
+    const int total = (int)(sizeof(kHudSites) / sizeof(kHudSites[0]));
+    for (int i = 0; i < total; ++i) {
+        const HudSite& s = kHudSites[i];
+        if (IsCallTo(s.site, s.target)) {
+            g_hudSitesTagged += RedirectCallSites(&s.site, 1, s.target, EmitHudTag(s.target, s.element));
+        }
+    }
+    const unsigned int bracket = (unsigned int)EmitHudBracket();
+    g_hudBracketed = Overwrite(kHudCallbackPush + 1, &bracket, 4);
+    LogLine("    engine: HUD elements told apart at %d/%d calls, callback %s; [Display] HudAtSides %d",
+            g_hudSitesTagged, total, g_hudBracketed ? "bracketed" : "NOT bracketed",
+            Config::HudAtSides() ? 1 : 0);
+}
+
 } // namespace
+
+int Engine::HudSide(unsigned int caller) {
+    if (!g_hudBracketed || !Config::HudAtSides() || g_hudElement == kHudNone) {
+        return 0;
+    }
+    int element = g_hudElement;
+    for (unsigned int row : kScoreboardRowReturns) {
+        if (caller == Place(row)) {
+            element = kHudScoreboard;
+        }
+    }
+    if (element == kHudCentre) {
+        return 0;
+    }
+    const unsigned int layoutAddress = Place(kHudLayout);
+    if (IsBadReadPtr((const void*)layoutAddress, 4)) {
+        return 0;
+    }
+    const unsigned int layout = *(const unsigned int*)layoutAddress;
+    const int* slot = (const int*)(Place(kHudLayoutTable) + layout * kHudLayoutSize + kHudSlotOffset[element]);
+    if (layout >= kHudLayouts || IsBadReadPtr(slot, 12)) {
+        return 0;
+    }
+    const int mode = slot[0];
+    const int x = slot[1];
+    if (mode < 0 || mode > 3 || x < 0 || x > 640) {
+        return 0;
+    }
+    if (element == kHudRadar) {
+        return x < 320 ? -1 : 1;
+    }
+    return (mode == 1 || x >= 160) ? 1 : -1;
+}
 
 void Engine::OnFrame() {
     bool cutscene = false;
@@ -988,6 +1132,7 @@ void Engine::OnFrame() {
     }
     g_fovScale = cutscene ? 1.0f : Config::FieldOfView();
     g_drawDistanceScale = Config::DrawDistanceScale();
+    g_hudElement = kHudNone;
     if (g_keepAroundCameraPatched) {
         g_keepAroundCamera = Config::KeepAroundCamera();
     }
@@ -1017,6 +1162,8 @@ void Engine::Install() {
                 "area fog sees the level's own distance at %d/2 sites", g_drawDistanceScale * 100.0f,
                 areaSites);
     }
+
+    InstallHudSides();
 
     if (!Config::LimitCutscenes()) {
         const unsigned char always = 0xEB;                   // jmp 0x0044473a

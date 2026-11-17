@@ -41,6 +41,7 @@ FILETIME g_iniWritten = {};
 DWORD g_iniNextCheck = 0;
 bool g_pauseWhenUnfocused = true;
 bool g_limitCutscenes = false;
+bool g_hudAtSides = true;
 
 bool g_disableTriangleSkipMask = false;
 bool g_disableOffscreenQuadReject = false;
@@ -95,6 +96,12 @@ const char* kDefaultIni =
     "; Field of view, as a multiple of the game's own: 1 is as shipped, 1.2 a fifth wider.\r\n"
     "; Cutscenes keep their own framing. The F4 overlay changes it while the game runs.\r\n"
     "FieldOfView=1.00\r\n"
+    "\r\n"
+    "; On a picture wider than 4:3, put the in-game HUD's elements at the picture's sides --\r\n"
+    "; health and radar at the left edge, armor and weapons at the right -- instead of in\r\n"
+    "; the centred 4:3 frame. The crosshair, menus and text screens stay centred. The F4\r\n"
+    "; overlay changes it while the game runs.\r\n"
+    "HudAtSides=1\r\n"
     "\r\n"
     "[Culling]\r\n"
     "; Ignore the per-triangle skip bitmask (display-list opcodes 0xa8 / 0xa7): 1 draws the\r\n"
@@ -392,6 +399,13 @@ void SetKeepAroundCamera(float radius) {
     }
 }
 
+void SetHudAtSides(bool sides) {
+    if (sides != g_hudAtSides) {
+        g_hudAtSides = sides;
+        LogLine("    config: HudAtSides %d", sides ? 1 : 0);
+    }
+}
+
 void SetDrawDistancePercent(float percent) {
     const int whole = percent < 100.0f ? 100 : (percent > 400.0f ? 400 : (int)(percent + 0.5f));
     if (whole / 100.0f != g_drawDistanceScale) {
@@ -407,6 +421,7 @@ void ReadLiveSettings() {
     SetStarrySky(ReadBool("Sky", "StarrySky", true));
     SetKeepAroundCamera((float)GetPrivateProfileIntA("FullMap", "KeepAroundCamera", 2048, g_iniPath));
     SetDrawDistancePercent((float)GetPrivateProfileIntA("FullMap", "DrawDistancePercent", 100, g_iniPath));
+    SetHudAtSides(ReadBool("Display", "HudAtSides", true));
 }
 
 } // namespace
@@ -600,6 +615,7 @@ float Config::AspectRatio()               { return g_aspectRatio; }
 bool Config::PauseWhenUnfocused()         { return g_pauseWhenUnfocused; }
 bool Config::LimitCutscenes()             { return g_limitCutscenes; }
 float Config::FieldOfView()               { return g_fieldOfView; }
+bool Config::HudAtSides()                 { return g_hudAtSides; }
 
 void Config::RefreshLive() {
     const DWORD now = GetTickCount();
@@ -623,6 +639,8 @@ bool Config::SetLive(const char* section, const char* key, float value) {
         SetStarrySky(value != 0.0f);
     } else if (lstrcmpiA(section, "FullMap") == 0 && lstrcmpiA(key, "KeepAroundCamera") == 0) {
         SetKeepAroundCamera(value);
+    } else if (lstrcmpiA(section, "Display") == 0 && lstrcmpiA(key, "HudAtSides") == 0) {
+        SetHudAtSides(value != 0.0f);
     } else if (lstrcmpiA(section, "FullMap") == 0 && lstrcmpiA(key, "DrawDistancePercent") == 0) {
         SetDrawDistancePercent(value);
     } else {

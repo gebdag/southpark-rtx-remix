@@ -42,8 +42,10 @@ IDirect3DTexture9* Texture(int handle);
 
 // The engine's entire 2D layer -- HUD, menus, fonts, fades -- is this one call, made once
 // per quad. Positions are 4 x {x, y, z} in the engine's 640x480 bottom-up screen space;
-// colours are 4 x {r, g, b, a} in 0..1; uvs are 4 x {u, v}.
-void DrawQuad(int handle, const float* positions, const float* colours, const float* uvs);
+// colours are 4 x {r, g, b, a} in 0..1; uvs are 4 x {u, v}. `caller` is where in the engine
+// the call came from, which tells some HUD elements apart (Engine::HudSide).
+void DrawQuad(int handle, const float* positions, const float* colours, const float* uvs,
+              unsigned int caller);
 
 // Quads drawn before any world geometry wait until the frame says what they were. The world
 // pipeline draws them as the frame's backdrop, at the far plane where RTX Remix takes them as

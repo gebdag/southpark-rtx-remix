@@ -206,6 +206,10 @@ bool LimitCutscenes();
 // [Display] FieldOfView: a multiple of the engine's own field of view (1 = as shipped).
 float FieldOfView();
 
+// [Display] HudAtSides: on a picture wider than 4:3, the in-game HUD's elements go to the
+// picture's edges instead of the centred 4:3 frame (Engine::HudSide). Set while the game runs.
+bool HudAtSides();
+
 // Re-reads the settings that may change while the game runs when the ini has changed. Cheap
 // to call every frame.
 void RefreshLive();

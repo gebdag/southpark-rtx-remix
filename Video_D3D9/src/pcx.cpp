@@ -1,4 +1,5 @@
 #include "pcx.h"
+#include "engine.h"
 #include "config.h"
 #include "device.h"
 #include "log.h"
@@ -91,6 +92,8 @@ enum Placement {
     kPlaceFramed,     // the 4:3 frame, centred: HUD, menus, fonts, loading art
     kPlaceCovering,   // scaled until it covers the picture, centred: the backdrop behind the 3D
     kPlaceFullWidth,  // the frame's height across the picture's full width: a solid colour
+    kPlaceLeftEdge,   // the 4:3 frame against the picture's left edge: a HUD element
+    kPlaceRightEdge,  // ... against its right edge ([Display] HudAtSides, Engine::HudSide)
 };
 
 void Place(const ScreenVertex* authored, ScreenVertex* out, Placement placement) {
@@ -106,7 +109,12 @@ void Place(const ScreenVertex* authored, ScreenVertex* out, Placement placement)
     } else if (placement == kPlaceFullWidth) {
         sx = fitX;
     }
-    const float x0 = (w - kAuthoredWidth * sx) * 0.5f;
+    float x0 = (w - kAuthoredWidth * sx) * 0.5f;
+    if (placement == kPlaceLeftEdge) {
+        x0 = 0.0f;
+    } else if (placement == kPlaceRightEdge) {
+        x0 = w - kAuthoredWidth * sx;
+    }
     const float y0 = (h - kAuthoredHeight * sy) * 0.5f;
     for (int i = 0; i < 4; ++i) {
         out[i] = authored[i];
@@ -562,7 +570,8 @@ void Pcx::SetBlendMode(int mode) {
     g_blendMode = mode;
 }
 
-void Pcx::DrawQuad(int handle, const float* positions, const float* colours, const float* uvs) {
+void Pcx::DrawQuad(int handle, const float* positions, const float* colours, const float* uvs,
+                   unsigned int caller) {
     IDirect3DDevice9* dev = Device::Get();
     if (!dev || !positions || !uvs || !Valid(handle)) {
         return;
@@ -616,7 +625,7 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
         v[i].specular = 0;
     }
     const bool spansWidth = minX <= 0.5f && maxX >= kAuthoredWidth - 0.5f;
-    const Placement placement = (e.solid && spansWidth) ? kPlaceFullWidth : kPlaceFramed;
+    Placement placement = (e.solid && spansWidth) ? kPlaceFullWidth : kPlaceFramed;
 
     if (g_quadLogged < 40) {
         ++g_quadLogged;
@@ -633,6 +642,10 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
     // path tracing before the world was drawn. A waiting quad still counts as the frame's first
     // draw, so the synthesised sky does not paint over it.
     if (Device::WorldHasDrawn()) {
+        const int side = placement == kPlaceFramed ? Engine::HudSide(caller) : 0;
+        if (side) {
+            placement = side < 0 ? kPlaceLeftEdge : kPlaceRightEdge;
+        }
         if (DrawOverlay(dev, e, v, g_blendMode, placement)) {
             ++g_quadsDrawn;
         }
