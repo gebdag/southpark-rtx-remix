@@ -23,9 +23,9 @@ if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 pushd "%OUTDIR%"
 
 cl /nologo /LD /MT /O2 /W3 /EHsc /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /I"%~dp0..\common" ^
-   "%~dp0src\shim.cpp" "%~dp0src\pad.cpp" ^
+   "%~dp0src\shim.cpp" "%~dp0src\pad.cpp" "%~dp0src\cdaudio.cpp" ^
    /Fe:dinput.dll ^
-   /link /MAP:dinput.map /DEF:"%~dp0dinput.def" user32.lib dinput8.lib dxguid.lib
+   /link /MAP:dinput.map /DEF:"%~dp0dinput.def" user32.lib dinput8.lib dxguid.lib winmm.lib
 
 set RC=%errorlevel%
 popd

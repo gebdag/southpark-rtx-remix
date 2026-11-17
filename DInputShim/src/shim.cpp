@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "cdaudio.h"
 #include "pad.h"
 
 namespace {
@@ -64,6 +65,7 @@ void Log(const char* fmt, ...) {
 // Read from the renderer's Video_D3D9.ini so the port has one settings file rather than two.
 
 char g_iniPath[MAX_PATH];
+char g_gameFolder[MAX_PATH];    // this module's folder, the game's, with a trailing backslash
 bool g_forceNonExclusive = true;
 bool g_suspendWhenUnfocused = true;
 bool g_menuSuspendsInput = true;
@@ -855,6 +857,7 @@ void LoadConfig(HMODULE self) {
     } else {
         modulePath[0] = 0;
     }
+    lstrcpynA(g_gameFolder, modulePath, MAX_PATH);
     _snprintf(g_iniPath, MAX_PATH, "%sVideo_D3D9.ini", modulePath);
     _snprintf(g_logPath, MAX_PATH, "%sDInputShim.log", modulePath);
     g_iniPath[MAX_PATH - 1] = 0;
@@ -1001,6 +1004,7 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
             g_keepCursorVisible);
         BecomeDpiAware();
         PatchExecutableImports();
+        CdAudio::Install(g_gameFolder, &Log);
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("=== DInputShim unloading: %d device vtables patched, %d cooperative levels "
             "rewritten, %ld reads blocked, %ld acquires deferred to the first read, %ld "
