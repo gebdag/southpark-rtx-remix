@@ -1,4 +1,5 @@
 #include "lights.h"
+#include "game_build.h"
 #include "log.h"
 #include "overlay.h"
 #include "remix.h"
@@ -33,17 +34,31 @@ const int kNodeSize = 0x18;
 const unsigned char kUploadPrologue[] = {0x83, 0xec, 0x20, 0x56, 0x57, 0x68, 0x08, 0x42, 0x52, 0x00};
 const unsigned char kLookupPrologue[] = {0x8b, 0x44, 0x24, 0x04, 0x8b, 0x80, 0x84, 0x00, 0x00, 0x00};
 
+// `address` and the addresses inside `bytes` are the US build's (game_build.h); they are
+// compared as the running build's.
 bool Matches(unsigned int address, const unsigned char* bytes, size_t size) {
-    return !IsBadReadPtr((const void*)address, size) && memcmp((const void*)address, bytes, size) == 0;
+    unsigned char placed[32];
+    if (size > sizeof(placed)) {
+        return false;
+    }
+    memcpy(placed, bytes, size);
+    GameBuild::PlaceEmbedded(placed, size);
+    address = GameBuild::Place(address);
+    return !IsBadReadPtr((const void*)address, size) && memcmp((const void*)address, placed, size) == 0;
 }
 
 template <typename T> T Read(unsigned int address) {
     return *(const T*)address;
 }
 
+// The pool's first node in the running build; nodes link to each other by their real addresses.
+unsigned int PoolNodes() {
+    return GameBuild::Place(kPool) + (kPoolNodes - kPool);
+}
+
 bool IsNode(unsigned int node) {
-    return node >= kPoolNodes && node < kPoolNodes + kNodeCount * kNodeSize &&
-           (node - kPoolNodes) % kNodeSize == 0;
+    const unsigned int first = PoolNodes();
+    return node >= first && node < first + kNodeCount * kNodeSize && (node - first) % kNodeSize == 0;
 }
 
 struct Definition {
@@ -218,15 +233,15 @@ void ReadDefinitions(unsigned int table) {
 
 void ReadPool() {
     g_live.clear();
-    const unsigned int table = Read<unsigned int>(kWorld + kWorldLightTable);
+    const unsigned int table = Read<unsigned int>(GameBuild::Place(kWorld) + kWorldLightTable);
     ReadDefinitions(table);
     const unsigned int stride = table ? Read<unsigned int>(table) : 0;
 
-    unsigned int node = Read<unsigned int>(kPool + 4);
+    unsigned int node = Read<unsigned int>(GameBuild::Place(kPool) + 4);
     for (int steps = 0; node && steps < kNodeCount && IsNode(node); ++steps) {
         if (Read<short>(node + 0x16)) {
             LiveLight l;
-            l.slot = (int)((node - kPoolNodes) / kNodeSize);
+            l.slot = (int)((node - PoolNodes()) / kNodeSize);
             l.intensity = Read<float>(node + 0xc);
             l.position[0] = Read<short>(node + 0x10);
             l.position[1] = Read<short>(node + 0x12);
@@ -470,13 +485,13 @@ const char* NotPlaying() {
     if (!g_gameStateKnown) {
         return nullptr;
     }
-    if (Read<unsigned int>(kGameMode) != kGameModeLevel) {
+    if (Read<unsigned int>(GameBuild::Place(kGameMode)) != kGameModeLevel) {
         return "not in a level";
     }
-    if (Read<unsigned int>(kPaused) != 0) {
+    if (Read<unsigned int>(GameBuild::Place(kPaused)) != 0) {
         return "paused";
     }
-    const unsigned int cutscene = Read<unsigned int>(kCutsceneState);
+    const unsigned int cutscene = Read<unsigned int>(GameBuild::Place(kCutsceneState));
     if (cutscene && !IsBadReadPtr((const void*)(cutscene + 0x28), 4) && Read<int>(cutscene + 0x28) != 0) {
         return "cutscene";
     }
@@ -585,6 +600,7 @@ D3DCOLOR Colour(const unsigned char* c) {
 // =============================================================================== Lights
 
 void Lights::Init(const char* ini) {
+    Log("lights: SouthPark.exe build %s", GameBuild::Name());
     for (const Key& k : kKeys) {
         ReadKey(ini, k);
     }

@@ -1,4 +1,5 @@
 #include "zones.h"
+#include "game_build.h"
 
 #include <windows.h>
 #include <math.h>
@@ -22,9 +23,11 @@ namespace {
 // The world tick (0x0043d490) registers the sets with FUN_004405e0 and releases them with
 // FUN_00440880, which zeroes the count, before the frame is drawn. The release call at
 // 0x0043d5db is redirected here, so the zones are copied while they are still registered.
+// Addresses are the US build's (game_build.h). Fields of the world are offsets from it: the
+// structure moves as one piece between builds.
 const unsigned int kWorld = 0x00522a68;
-const unsigned int kSetCount = kWorld + 0x1278;
-const unsigned int kSets = kWorld + 0x127c;
+const unsigned int kSetCount = 0x1278;
+const unsigned int kSets = 0x127c;
 const unsigned int kZoneLightingOn = 0x004d74c8;
 const unsigned int kFrameCounter = 0x0053edd0;
 const unsigned int kWaveTable = 0x004d86f4;   // 90 signed bytes, also the lit-vertex wave
@@ -59,8 +62,17 @@ bool Readable(unsigned int address, unsigned int size) {
     return address && !IsBadReadPtr((const void*)address, size);
 }
 
+// `address` and the addresses inside `bytes` are the US build's (game_build.h); they are
+// compared as the running build's.
 bool Matches(unsigned int address, const unsigned char* bytes, size_t size) {
-    return Readable(address, (unsigned int)size) && memcmp((const void*)address, bytes, size) == 0;
+    unsigned char placed[32];
+    if (size > sizeof(placed)) {
+        return false;
+    }
+    memcpy(placed, bytes, size);
+    GameBuild::PlaceEmbedded(placed, size);
+    address = GameBuild::Place(address);
+    return Readable(address, (unsigned int)size) && memcmp((const void*)address, placed, size) == 0;
 }
 
 template <typename T> T Peek(unsigned int address) {
@@ -82,12 +94,12 @@ void Normalise(float* v) {
 // added to every colour channel (FUN_00430e40).
 float Flicker(unsigned int record) {
     const int phase = Peek<unsigned char>(record + 0xe) % 7;
-    const int frame = Peek<int>(kFrameCounter);
+    const int frame = Peek<int>(GameBuild::Place(kFrameCounter));
     int step = ((phase + 1) * 16 + frame) % kWaveLength;
     if (step < 0) {
         step += kWaveLength;
     }
-    return (float)Peek<signed char>(kWaveTable + step);
+    return (float)Peek<signed char>(GameBuild::Place(kWaveTable) + step);
 }
 
 Zones::Zone ReadRecord(unsigned int record) {
@@ -145,15 +157,16 @@ void AddOnce(std::vector<Zones::Zone>& zones, const Zones::Zone& z) {
 
 std::vector<Zones::Zone> ReadRegistered() {
     std::vector<Zones::Zone> zones;
-    if (!Peek<int>(kZoneLightingOn)) {
+    if (!Peek<int>(GameBuild::Place(kZoneLightingOn))) {
         return zones;
     }
-    const int sets = Peek<int>(kSetCount);
-    if (sets <= 0 || sets > kMaxSets || !Readable(kSets, sets * 8)) {
+    const unsigned int world = GameBuild::Place(kWorld);
+    const int sets = Peek<int>(world + kSetCount);
+    if (sets <= 0 || sets > kMaxSets || !Readable(world + kSets, sets * 8)) {
         return zones;
     }
     for (int s = 0; s < sets; ++s) {
-        const unsigned int entry = Peek<unsigned int>(kSets + s * 8);
+        const unsigned int entry = Peek<unsigned int>(world + kSets + s * 8);
         if (!Readable(entry, 4)) {
             continue;
         }
@@ -178,7 +191,7 @@ std::vector<Zones::Zone> ReadRegistered() {
 
 Zones::PointLight SampleProbe(unsigned int world, const float* position) {
     unsigned char block[24] = {};
-    ((LightAtPointFn)kLightAtPoint)(world, position, block);
+    ((LightAtPointFn)GameBuild::Place(kLightAtPoint))(world, position, block);
     Zones::PointLight light;
     light.valid = true;
     for (int c = 0; c < 3; ++c) {
@@ -200,11 +213,12 @@ void __cdecl ReleaseZoneSets(unsigned int world) {
     g_latest.swap(zones);
     g_probeLight = light;
     LeaveCriticalSection(&g_lock);
-    ((ReleaseFn)kRelease)(world);
+    ((ReleaseFn)GameBuild::Place(kRelease))(world);
 }
 
-// Points the call's rel32 at the replacement.
+// Points the call's rel32 at the replacement. `call` is the US build's address.
 bool RedirectCall(unsigned int call, void* target) {
+    call = GameBuild::Place(call);
     DWORD old;
     if (!VirtualProtect((void*)call, 5, PAGE_EXECUTE_READWRITE, &old)) {
         return false;

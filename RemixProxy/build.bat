@@ -21,7 +21,7 @@ if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
 pushd "%OUTDIR%"
 
-cl /nologo /LD /MT /O2 /W3 /EHsc /std:c++17 /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN ^
+cl /nologo /LD /MT /O2 /W3 /EHsc /std:c++17 /D_CRT_SECURE_NO_WARNINGS /DWIN32_LEAN_AND_MEAN /I"%~dp0..\common" ^
    /I"%~dp0include" ^
    "%~dp0src\proxy.cpp" "%~dp0src\remix.cpp" "%~dp0src\lights.cpp" "%~dp0src\overlay.cpp" ^
    "%~dp0src\zones.cpp" "%~dp0src\settings.cpp" "%~dp0src\log.cpp" ^

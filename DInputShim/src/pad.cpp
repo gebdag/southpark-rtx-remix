@@ -1,5 +1,6 @@
 #define DIRECTINPUT_VERSION 0x0500
 #include "pad.h"
+#include "game_build.h"
 
 #include <dinput.h>
 #include <math.h>
@@ -673,11 +674,30 @@ const DWORD kPadButtonDefaults[16] = {
     11, 11, 11, 11,
 };
 
+// Addresses here are the US build's (game_build.h); Is, Write and Matches place them in the
+// running build, so they are only ever handed US addresses. An expected dword that is itself
+// an address (a jump-table entry) is placed too.
 template <typename T> bool Is(unsigned int address, T expected) {
+    address = GameBuild::Place(address);
+    if (sizeof(T) == 4) {
+        expected = (T)GameBuild::Place((unsigned int)expected);
+    }
     return !IsBadReadPtr((const void*)address, sizeof(T)) && *(const T*)address == expected;
 }
 
+bool Matches(unsigned int address, const unsigned char* bytes, size_t size) {
+    unsigned char placed[16];
+    if (size > sizeof(placed)) {
+        return false;
+    }
+    memcpy(placed, bytes, size);
+    GameBuild::PlaceEmbedded(placed, size);
+    address = GameBuild::Place(address);
+    return !IsBadReadPtr((const void*)address, size) && memcmp((const void*)address, placed, size) == 0;
+}
+
 template <typename T> void Write(unsigned int address, T value) {
+    address = GameBuild::Place(address);
     DWORD old;
     VirtualProtect((void*)address, sizeof(T), PAGE_EXECUTE_READWRITE, &old);
     *(T*)address = value;
@@ -696,8 +716,8 @@ template <typename T> void Write(unsigned int address, T value) {
 // A confirms and B goes back, each once per press.
 const unsigned int kMenuDirections = 0x00476100;
 const unsigned int kMenuConfirm = 0x004760c0;
-const unsigned char kMenuDirectionsStock[5] = {0x51, 0xa1, 0x40, 0x0e, 0x7e};
-const unsigned char kMenuConfirmStock[5] = {0xa1, 0x40, 0x0e, 0x7e, 0x00};
+const unsigned char kMenuDirectionsStock[6] = {0x51, 0xa1, 0x40, 0x0e, 0x7e, 0x00};   // push ecx; mov eax, [..]
+const unsigned char kMenuConfirmStock[5] = {0xa1, 0x40, 0x0e, 0x7e, 0x00};           // mov eax, [0x007e0e40]
 // FUN_004871d0(vk, type): the menus' own key event; type 1 is a key release, which is when
 // Esc becomes "back".
 const unsigned int kMenuKeyEvent = 0x004871d0;
@@ -743,7 +763,7 @@ unsigned int __cdecl MenuDirections() {
     const PadState& s = usable ? g_state : none;
 
     if (s.b && !g_menuBackHeld) {
-        ((MenuKeyEventFn)kMenuKeyEvent)(VK_ESCAPE, 1);
+        ((MenuKeyEventFn)GameBuild::Place(kMenuKeyEvent))(VK_ESCAPE, 1);
     }
     g_menuBackHeld = s.b;
 
@@ -772,7 +792,7 @@ unsigned int __cdecl MenuConfirm() {
 // A jump at the start of the function: the caller's call lands in ours instead.
 void Redirect(unsigned int function, void* replacement) {
     Write<unsigned char>(function, 0xe9);
-    Write<int>(function + 1, (int)((unsigned int)replacement - (function + 5)));
+    Write<int>(function + 1, (int)((unsigned int)replacement - (GameBuild::Place(function) + 5)));
 }
 
 // ------------------------------------------------------------------ look: pad or mouse
@@ -789,18 +809,18 @@ typedef void(__cdecl* MouseLookPitchFn)(int delta, int player, int flag);
 
 void __cdecl MouseLookPitch(int delta, int player, int flag) {
     if (!g_padLooks) {
-        ((MouseLookPitchFn)kMouseLookPitch)(delta, player, flag);
+        ((MouseLookPitchFn)GameBuild::Place(kMouseLookPitch))(delta, player, flag);
     }
 }
 
 bool GameMatches() {
     bool ok = Is<unsigned int>(kAxisJumpEntry3, kAxisJumpEntry3Stock) && Is<unsigned char>(kAxisByteTable + 31, 3) &&
               Is<unsigned char>(kAxisByteTable + 0, 0) && Is<unsigned char>(kAxisByteTable + 7, 3);
-    ok = ok && !IsBadReadPtr((const void*)kMenuDirections, 5) && !IsBadReadPtr((const void*)kMenuConfirm, 5) &&
-         memcmp((const void*)kMenuDirections, kMenuDirectionsStock, 5) == 0 &&
-         memcmp((const void*)kMenuConfirm, kMenuConfirmStock, 5) == 0 &&
+    ok = ok && Matches(kMenuDirections, kMenuDirectionsStock, sizeof(kMenuDirectionsStock)) &&
+         Matches(kMenuConfirm, kMenuConfirmStock, sizeof(kMenuConfirmStock)) &&
          Is<unsigned char>(kMouseLookCall, 0xe8) &&
-         Is<int>(kMouseLookCall + 1, (int)(kMouseLookPitch - (kMouseLookCall + 5)));
+         Is<int>(kMouseLookCall + 1,
+                 (int)(GameBuild::Place(kMouseLookPitch) - (GameBuild::Place(kMouseLookCall) + 5)));
     for (int slot : kZeroSlots) {
         ok = ok && Is<unsigned char>(kAxisByteTable + slot - 1, 3);
     }
@@ -811,12 +831,14 @@ bool GameMatches() {
         ok = ok && Is<unsigned short>(store, 0x8188) && Is<unsigned int>(store + 2, 0x00000a91);
     }
     ok = ok && Is<unsigned short>(kAlwaysLookDefault - 1, 0x006a);   // 6a 00
-    ok = ok && !IsBadReadPtr((const void*)kButtonDefaults, sizeof(kStockButtonDefaults)) &&
-         memcmp((const void*)kButtonDefaults, kStockButtonDefaults, sizeof(kStockButtonDefaults)) == 0;
+    const unsigned int buttons = GameBuild::Place(kButtonDefaults);
+    ok = ok && !IsBadReadPtr((const void*)buttons, sizeof(kStockButtonDefaults)) &&
+         memcmp((const void*)buttons, kStockButtonDefaults, sizeof(kStockButtonDefaults)) == 0;
     return ok;
 }
 
 void PatchGame() {
+    LOG("pad: SouthPark.exe build %s", GameBuild::Name());
     if (!GameMatches()) {
         LOG("pad: not the expected SouthPark.exe -- the game keeps its own stick layout");
         return;
@@ -838,7 +860,8 @@ void PatchGame() {
     }
     Redirect(kMenuDirections, (void*)&MenuDirections);
     Redirect(kMenuConfirm, (void*)&MenuConfirm);
-    Write<int>(kMouseLookCall + 1, (int)((unsigned int)&MouseLookPitch - (kMouseLookCall + 5)));
+    Write<int>(kMouseLookCall + 1,
+               (int)((unsigned int)&MouseLookPitch - (GameBuild::Place(kMouseLookCall) + 5)));
     LOG("pad: game patched -- N64 stick turn and look, strafe, pad button defaults, menu navigation");
 }
 

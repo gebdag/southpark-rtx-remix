@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "config.h"
+#include "game_build.h"
 #include "log.h"
 #include "lookdev.h"
 
@@ -12,15 +13,32 @@ namespace {
 // addresses recovered from the dumped image are also the addresses in the running process.
 // Every site below is verified against the bytes it expects before anything is written; a
 // mismatch logs and skips rather than corrupting a build these addresses do not belong to.
+//
+// Every address in this file is the US build's. The helpers below (Verify, Overwrite,
+// PatchOperand, IsCallTo, RedirectCallSites) place it in the running build themselves
+// (game_build.h); code that computes with an address or calls into the game places it
+// explicitly. Placing an address that is already placed is wrong, so the helpers are only
+// ever handed US addresses.
+using GameBuild::Place;
 
 // ------------------------------------------------------------------- patch helpers
 
+// `expected` may hold US addresses inside its instructions; they are compared as the running
+// build's.
 bool Verify(unsigned int address, const unsigned char* expected, size_t size) {
+    unsigned char placed[64];
+    if (size > sizeof(placed)) {
+        return false;
+    }
+    memcpy(placed, expected, size);
+    GameBuild::PlaceEmbedded(placed, size);
+    address = Place(address);
     return !IsBadReadPtr((const void*)address, size) &&
-           memcmp((const void*)address, expected, size) == 0;
+           memcmp((const void*)address, placed, size) == 0;
 }
 
 bool Overwrite(unsigned int address, const void* bytes, size_t size) {
+    address = Place(address);
     DWORD previous = 0;
     if (!VirtualProtect((void*)address, size, PAGE_EXECUTE_READWRITE, &previous)) {
         return false;
@@ -38,7 +56,7 @@ bool PatchOperand(unsigned int address, unsigned int expected, unsigned int repl
     unsigned char bytes[4];
     memcpy(bytes, &expected, 4);
     if (!Verify(address, bytes, 4)) {
-        LogLine("    engine: 0x%08X does not hold 0x%08X -- not patching", address, expected);
+        LogLine("    engine: 0x%08X does not hold 0x%08X -- not patching", Place(address), Place(expected));
         return false;
     }
     return Overwrite(address, &replacement, 4);
@@ -146,12 +164,13 @@ unsigned int g_cacheSlots = 0;
 // Counts occupied slots. Walked at intervals rather than per frame: the table is thousands of
 // entries and this is a diagnostic, not a hot path.
 void SampleResourceCache() {
-    if (IsBadReadPtr((const void*)kResourceCacheMask, 4) ||
-        IsBadReadPtr((const void*)kResourceCacheTable, 4)) {
+    const unsigned int maskAddress = Place(kResourceCacheMask);
+    const unsigned int tableAddress = Place(kResourceCacheTable);
+    if (IsBadReadPtr((const void*)maskAddress, 4) || IsBadReadPtr((const void*)tableAddress, 4)) {
         return;
     }
-    const unsigned int mask = *(const unsigned int*)kResourceCacheMask;
-    void** table = *(void***)kResourceCacheTable;
+    const unsigned int mask = *(const unsigned int*)maskAddress;
+    void** table = *(void***)tableAddress;
     if (!table || mask == 0 || mask > 0xFFFF) {
         return;
     }
@@ -242,8 +261,8 @@ int g_keptEntitiesPeak = 0;
 typedef void (__cdecl *BuildCullBoundsFn)(unsigned char*);
 
 void __cdecl BuildCullBoundsAroundCamera(unsigned char* set) {
-    ((BuildCullBoundsFn)kBuildCullBounds)(set);
-    float* box = (float*)kViewBoxCopy;
+    ((BuildCullBoundsFn)Place(kBuildCullBounds))(set);
+    float* box = (float*)Place(kViewBoxCopy);
     const float r = g_keepAroundCamera;
     for (const unsigned char* camera = *(unsigned char**)(set + kCameraList); camera;
          camera = *(unsigned char**)(camera + kCameraNext)) {
@@ -277,7 +296,7 @@ bool PatchViewBoxTest(const ViewBoxTest& t) {
     }
     for (int i = 0; i < 4; ++i) {
         unsigned char patch[6] = { t.opcode, (unsigned char)((t.modrm & 0x38) | 0x05) };
-        const unsigned int address = kViewBoxCopy + (t.fields[i] - kCameraViewBox);
+        const unsigned int address = Place(kViewBoxCopy + (t.fields[i] - kCameraViewBox));
         memcpy(patch + 2, &address, 4);
         Overwrite(t.sites[i], patch, sizeof(patch));
     }
@@ -290,7 +309,7 @@ typedef int (__cdecl *FrustumTestFn)(const void*, const void*);
 // still drawn when it lies within KeepAroundCamera of the eye, and, with UncullEntities on,
 // while the frame's budget lasts.
 int __cdecl EntityFrustumTest(const void* planes, const void* box) {
-    if (((FrustumTestFn)kFrustumPlaneTest)(planes, box)) {
+    if (((FrustumTestFn)Place(kFrustumPlaneTest))(planes, box)) {
         return 1;
     }
     if (g_keepAroundCamera > 0.0f && NearCamera(planes, (const float*)box)) {
@@ -406,7 +425,7 @@ void __cdecl AreaFogFromEngineDistance(unsigned char* camera) {
     ScaledCamera& r = ScaledRecord(camera);
     *field = EngineDistance(r, *field);
     r.applied = -1.0f;
-    ((AreaFogFn)kAreaFog)(camera);
+    ((AreaFogFn)Place(kAreaFog))(camera);
 }
 
 // The field of view is the value loaded at the same site, in degrees: the camera eases it
@@ -708,7 +727,7 @@ void __cdecl OnDrawListsReady() {
     }
     for (int i = 0; i < (int)(sizeof(g_arrays) / sizeof(g_arrays[0])); ++i) {
         DrawArray& a = g_arrays[i];
-        const int value = *a.counter;
+        const int value = *Place(a.counter);
         if (value > a.peak) {
             a.peak = value;
         }
@@ -782,6 +801,8 @@ void EmitCall(unsigned int target) {
 }
 
 bool IsCallTo(unsigned int site, unsigned int target) {
+    site = Place(site);
+    target = Place(target);
     if (IsBadReadPtr((const void*)site, 5)) {
         return false;
     }
@@ -805,7 +826,7 @@ unsigned char* BuildPreCallDetour(unsigned int original, void* callback) {
     g_write = cave;
     EmitCall((unsigned int)callback);
     Emit(0xE9);                                        // jmp original
-    EmitDword(original - ((unsigned int)g_write + 4));
+    EmitDword(Place(original) - ((unsigned int)g_write + 4));
     return cave;
 }
 
@@ -829,7 +850,7 @@ unsigned char* BuildArgumentTapDetour(unsigned int original, void* callback) {
     EmitCall((unsigned int)callback);
     Emit(0x83); Emit(0xC4); Emit(0x04);               // add esp, 4
     Emit(0xE9);                                       // jmp original
-    EmitDword(original - ((unsigned int)g_write + 4));
+    EmitDword(Place(original) - ((unsigned int)g_write + 4));
     return cave;
 }
 
@@ -856,14 +877,17 @@ bool InstallCameraDetour() {
     Emit(0xD9); Emit(0x44); Emit(0x24); Emit(0x10);            // fld  dword ptr [esp+0x10]
     Emit(0xD9); Emit(0x15); EmitDword((unsigned int)&g_fovEngine);     // fst  [engine fov]
     Emit(0xD8); Emit(0x0D); EmitDword((unsigned int)&g_fovScale);      // fmul [fov scale]
-    for (int i = 4; i < (int)sizeof(kCameraDistanceCode); ++i) {
-        Emit(kCameraDistanceCode[i]);                          // fmul qword ptr [0x4c9440]
+    unsigned char relocated[sizeof(kCameraDistanceCode)];
+    memcpy(relocated, kCameraDistanceCode, sizeof(relocated));
+    GameBuild::PlaceEmbedded(relocated, sizeof(relocated));
+    for (int i = 4; i < (int)sizeof(relocated); ++i) {
+        Emit(relocated[i]);                                    // fmul qword ptr [0x4c9440]
     }
     Emit(0xE9);
-    EmitDword(kCameraDistanceResume - ((unsigned int)g_write + 4));
+    EmitDword(Place(kCameraDistanceResume) - ((unsigned int)g_write + 4));
 
     unsigned char patch[sizeof(kCameraDistanceCode)];
-    const int rel = (int)((unsigned int)cave - (kCameraDistanceSite + 5));
+    const int rel = (int)((unsigned int)cave - (Place(kCameraDistanceSite) + 5));
     patch[0] = 0xE9;
     memcpy(patch + 1, &rel, 4);
     memset(patch + 5, 0x90, sizeof(patch) - 5);
@@ -891,14 +915,17 @@ bool InstallCameraAspect() {
     g_write = cave;
     Emit(0xD8); Emit(0x0D);
     EmitDword((unsigned int)&g_cameraAspectScale);             // fmul dword ptr [scale]
-    for (int i = 0; i < (int)sizeof(kCameraAspectCode); ++i) {
-        Emit(kCameraAspectCode[i]);                            // the relocated originals
+    unsigned char relocated[sizeof(kCameraAspectCode)];
+    memcpy(relocated, kCameraAspectCode, sizeof(relocated));
+    GameBuild::PlaceEmbedded(relocated, sizeof(relocated));
+    for (int i = 0; i < (int)sizeof(relocated); ++i) {
+        Emit(relocated[i]);                                    // the relocated originals
     }
     Emit(0xE9);
-    EmitDword(kCameraAspectResume - ((unsigned int)g_write + 4));
+    EmitDword(Place(kCameraAspectResume) - ((unsigned int)g_write + 4));
 
     unsigned char patch[sizeof(kCameraAspectCode)];
-    const int rel = (int)((unsigned int)cave - (kCameraAspectSite + 5));
+    const int rel = (int)((unsigned int)cave - (Place(kCameraAspectSite) + 5));
     patch[0] = 0xE9;
     memcpy(patch + 1, &rel, 4);
     memset(patch + 5, 0x90, sizeof(patch) - 5);
@@ -919,7 +946,7 @@ int RedirectCallSites(const unsigned int* sites, int count, unsigned int target,
             LogLine("    engine: 0x%08X is not a call to 0x%08X -- not patching", site, target);
             continue;
         }
-        const int rel = (int)((unsigned int)detour - (site + 5));
+        const int rel = (int)((unsigned int)detour - (Place(site) + 5));
         if (Overwrite(site + 1, &rel, 4)) {
             ++patched;
         }
@@ -955,7 +982,7 @@ void InstallKeepAroundCamera() {
 void Engine::OnFrame() {
     bool cutscene = false;
     if (g_cutsceneTestKnown) {
-        const unsigned int state = *(const unsigned int*)kCutsceneState;
+        const unsigned int state = *(const unsigned int*)Place(kCutsceneState);
         cutscene = state && !IsBadReadPtr((const void*)(state + 0x28), 4) &&
                    *(const int*)(state + 0x28) != 0;
     }
@@ -967,6 +994,7 @@ void Engine::OnFrame() {
 }
 
 void Engine::Install() {
+    LogLine("    engine: SouthPark.exe build %s", GameBuild::Name());
     // The draw arrays are raised regardless of LoadEntireMap. They are an engine limitation,
     // not a consequence of showing more of the map: the stock sizes saturate on their own in
     // the denser parts of town, and an entry the engine cannot record is geometry that is
@@ -1144,7 +1172,7 @@ bool Engine::RedirectApiCall(unsigned int site, const void* replacement) {
     static const unsigned char kDispatcherCall[6] = {0xFF, 0x15, 0x18, 0xD2, 0x56, 0x01};
     unsigned char patch[6];
     patch[0] = 0xE8;
-    const int rel = (int)((unsigned int)replacement - (site + 5));
+    const int rel = (int)((unsigned int)replacement - (Place(site) + 5));
     memcpy(patch + 1, &rel, 4);
     patch[5] = 0x90;
     if (Verify(site, patch, sizeof(patch))) {
