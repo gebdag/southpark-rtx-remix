@@ -28,7 +28,7 @@ int g_displayWidth = 1280;
 int g_displayHeight = 960;
 int g_displayX = -1;
 int g_displayY = -1;
-bool g_keepAspect = true;
+float g_aspectRatio = Config::kOriginalAspect;
 bool g_pauseWhenUnfocused = true;
 
 bool g_disableBackfaceCulling  = true;
@@ -70,9 +70,11 @@ const char* kDefaultIni =
     "WindowHeight=960\r\n"
     "WindowX=-1\r\n"
     "WindowY=-1\r\n"
-    "; The game draws a 4:3 picture. 1 keeps it 4:3 with black bars at the sides (or top and\r\n"
-    "; bottom); 0 stretches it to fill the window.\r\n"
-    "KeepAspect=1\r\n"
+    "; Shape of the picture, width:height. 4:3 is the game as it shipped. A wider ratio such\r\n"
+    "; as 16:9, 16:10 or 21:9 widens the 3D view at the sides, keeping its height, and keeps\r\n"
+    "; the HUD, menus and loading art 4:3 in the middle. window follows the window's own\r\n"
+    "; shape. Whatever the window has left over is black bars; nothing is stretched.\r\n"
+    "AspectRatio=4:3\r\n"
     "; The game pauses itself while its window is not in front. 0 keeps it running.\r\n"
     "PauseWhenUnfocused=1\r\n"
     "\r\n"
@@ -173,10 +175,9 @@ const char* kDefaultIni =
     "; tabbing away really does stop the game rather than leaving it running blind.\r\n"
     "SuspendInputWhenUnfocused=1\r\n"
     "\r\n"
-    "; Mirror the Alt+X Remix overlay toggle: while the overlay is up the game stops reading\r\n"
-    "; its devices, so the pointer belongs to the overlay. Alt+X again hands it back. Set to\r\n"
-    "; 0 if the overlay is bound to some other key.\r\n"
-    "RemixMenuHotkeySuspendsInput=1\r\n"
+    "; While the Remix menu is open the game stops reading its devices, so the pointer and\r\n"
+    "; keyboard belong to the menu. Follows the menu itself, whatever key opens it.\r\n"
+    "RemixMenuSuspendsInput=1\r\n"
     "\r\n"
     "; Keep an OS cursor on screen: refuse the game's SetCursor(NULL), give its window class\r\n"
     "; an arrow, and drop its ClipCursor and its recentring mouse_event calls while it is not\r\n"
@@ -256,10 +257,43 @@ const char* kDefaultIni =
     "[Log]\r\n"
     "; Log every engine call. The 2D layer alone makes about 1.6 million calls per run, so\r\n"
     "; this produces gigabytes and costs frame rate. Leave off unless tracing a problem.\r\n"
-    "LogEveryCall=0\r\n";
+    "LogEveryCall=0\r\n"
+    "\r\n"
+    "[Lights]\r\n"
+    "; The game's own dynamic lights, sent to RTX Remix by the proxy (d3d9.dll); F4 shows them.\r\n"
+    "; RadianceScale: brightness of every game light. EmitterRadius: size of each Remix sphere\r\n"
+    "; light, in world units. ScaleByReach: brighter for the game's long-reach lights.\r\n"
+    "; SwapRedBlue: if colours come out red where the game means blue. Markers: ring and label\r\n"
+    "; each light on screen. KeepFallbackLight: keep Remix's fallback light on -- the game gives\r\n"
+    "; Remix no other lights, and by default that light switches off as soon as any light exists.\r\n"
+    "Enabled=1\r\n"
+    "RadianceScale=1500\r\n"
+    "EmitterRadius=6\r\n"
+    "ScaleByReach=1\r\n"
+    "SwapRedBlue=0\r\n"
+    "Markers=0\r\n"
+    "KeepFallbackLight=1\r\n";
 
 bool ReadBool(const char* section, const char* key, bool fallback) {
     return GetPrivateProfileIntA(section, key, fallback ? 1 : 0, g_iniPath) != 0;
+}
+
+// [Display] AspectRatio: "W:H" (16:9, 2.39:1), a plain ratio (1.7778), or "window" for 0.
+float ReadAspectRatio() {
+    char text[32];
+    GetPrivateProfileStringA("Display", "AspectRatio", "4:3", text, sizeof(text), g_iniPath);
+    if (lstrcmpiA(text, "window") == 0) {
+        return 0.0f;
+    }
+    float width = 0.0f;
+    float height = 1.0f;
+    const int fields = sscanf(text, "%f:%f", &width, &height);
+    const float ratio = (fields >= 1 && height > 0.0f) ? width / height : 0.0f;
+    if (ratio < 0.5f || ratio > 4.0f) {
+        LogLine("    [Display] AspectRatio=%s is not a usable ratio -- 4:3", text);
+        return Config::kOriginalAspect;
+    }
+    return ratio;
 }
 
 } // namespace
@@ -368,15 +402,16 @@ void Config::Load(void* self) {
     if (g_displayHeight < 240) g_displayHeight = 240;
     g_displayX = GetPrivateProfileIntA("Display", "WindowX", -1, g_iniPath);
     g_displayY = GetPrivateProfileIntA("Display", "WindowY", -1, g_iniPath);
-    g_keepAspect = ReadBool("Display", "KeepAspect", true);
+    g_aspectRatio = ReadAspectRatio();
     g_pauseWhenUnfocused = ReadBool("Display", "PauseWhenUnfocused", true);
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
 
     LogLine("=== config: %s", g_iniPath);
-    LogLine("    Display Mode=%s Window=%dx%d at %d,%d KeepAspect=%d PauseWhenUnfocused=%d",
+    LogLine("    Display Mode=%s Window=%dx%d at %d,%d AspectRatio=%.4f%s PauseWhenUnfocused=%d",
             g_displayWindowed ? "windowed" : "borderless", g_displayWidth, g_displayHeight,
-            g_displayX, g_displayY, g_keepAspect, g_pauseWhenUnfocused);
+            g_displayX, g_displayY, g_aspectRatio, g_aspectRatio == 0.0f ? " (window)" : "",
+            g_pauseWhenUnfocused);
     LogLine("    DisableBackfaceCulling=%d DisableTriangleSkipMask=%d DisableOffscreenQuadReject=%d",
             g_disableBackfaceCulling, g_disableTriangleSkipMask, g_disableOffscreenQuadReject);
     LogLine("    UseEngineBackgroundColour=%d SkyTextureNames=%s SmoothingAngle=%.0f",
@@ -434,7 +469,7 @@ int Config::DisplayWindowWidth()          { return g_displayWidth; }
 int Config::DisplayWindowHeight()         { return g_displayHeight; }
 int Config::DisplayWindowX()              { return g_displayX; }
 int Config::DisplayWindowY()              { return g_displayY; }
-bool Config::KeepAspect()                 { return g_keepAspect; }
+float Config::AspectRatio()               { return g_aspectRatio; }
 bool Config::PauseWhenUnfocused()         { return g_pauseWhenUnfocused; }
 int Config::LookdevGameWindowX()          { return g_lookdevGameX; }
 int Config::LookdevGameWindowY()          { return g_lookdevGameY; }

@@ -43,12 +43,30 @@ RECT MonitorArea(bool workArea) {
     return workArea ? info.rcWork : info.rcMonitor;
 }
 
+// A framed window larger than the work area would hang its frame off the screen and sit behind
+// the taskbar -- a borderless window in all but name. The configured size is a request: it is
+// shrunk, keeping its shape, until the whole frame fits.
 RECT ConfiguredWindowedRect() {
-    RECT frame = {0, 0, g_placement.width, g_placement.height};
-    AdjustWindowRect(&frame, kWindowedStyle, FALSE);
-    const int width = frame.right - frame.left;
-    const int height = frame.bottom - frame.top;
     const RECT work = MonitorArea(true);
+    const int workWidth = work.right - work.left;
+    const int workHeight = work.bottom - work.top;
+    RECT border = {0, 0, 0, 0};
+    AdjustWindowRect(&border, kWindowedStyle, FALSE);
+    const int frameX = border.right - border.left;
+    const int frameY = border.bottom - border.top;
+
+    int clientWidth = g_placement.width;
+    int clientHeight = g_placement.height;
+    const float fitX = (float)(workWidth - frameX) / (float)clientWidth;
+    const float fitY = (float)(workHeight - frameY) / (float)clientHeight;
+    const float fit = fitX < fitY ? fitX : fitY;
+    if (fit < 1.0f) {
+        clientWidth = (int)(clientWidth * fit);
+        clientHeight = (int)(clientHeight * fit);
+    }
+
+    const int width = clientWidth + frameX;
+    const int height = clientHeight + frameY;
     const int x = g_placement.x >= 0 ? g_placement.x
                                      : work.left + ((work.right - work.left) - width) / 2;
     const int y = g_placement.y >= 0 ? g_placement.y

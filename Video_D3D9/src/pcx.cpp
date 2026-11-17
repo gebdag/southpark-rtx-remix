@@ -37,6 +37,7 @@ struct Entry {
     // Dirty rect in pixels, half-open. Empty when x0 >= x1.
     int   dx0, dy0, dx1, dy1;
     bool  synthetic;   // made by Create(); never matched by name in Load()
+    bool  solid;       // every pixel the same colour; see IsSolid
 };
 
 Entry g_entries[kMaxImages];
@@ -79,9 +80,54 @@ const DWORD kBackdropFVF = D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1;
 const unsigned short kQuadIndices[6] = {0, 1, 2, 0, 2, 3};
 
 // The engine's 2D coordinates are always 640x480; the original hardcodes the 479.0 flip.
-// The backbuffer is the window, which is larger, so quads are scaled on the way out.
+// The back buffer is larger, and may be wider than 4:3, so quads are placed on the way out.
 const float kAuthoredWidth  = 640.0f;
 const float kAuthoredHeight = 480.0f;
+
+// Where a quad's authored 640x480 coordinates land in the back buffer. The 2D layer keeps its
+// proportions whatever shape the picture is ([Display] AspectRatio); full-screen art is drawn
+// as tiles, so the rule has to hold for the layer as a whole rather than be guessed per quad.
+enum Placement {
+    kPlaceFramed,     // the 4:3 frame, centred: HUD, menus, fonts, loading art
+    kPlaceCovering,   // scaled until it covers the picture, centred: the backdrop behind the 3D
+    kPlaceFullWidth,  // the frame's height across the picture's full width: a solid colour
+};
+
+void Place(const ScreenVertex* authored, ScreenVertex* out, Placement placement) {
+    const float w = (float)Device::Width();
+    const float h = (float)Device::Height();
+    const float fitX = w / kAuthoredWidth;
+    const float fitY = h / kAuthoredHeight;
+    const float fit = fitX < fitY ? fitX : fitY;
+    float sx = fit;
+    float sy = fit;
+    if (placement == kPlaceCovering) {
+        sx = sy = fitX > fitY ? fitX : fitY;
+    } else if (placement == kPlaceFullWidth) {
+        sx = fitX;
+    }
+    const float x0 = (w - kAuthoredWidth * sx) * 0.5f;
+    const float y0 = (h - kAuthoredHeight * sy) * 0.5f;
+    for (int i = 0; i < 4; ++i) {
+        out[i] = authored[i];
+        out[i].x = x0 + authored[i].x * sx;
+        out[i].y = y0 + authored[i].y * sy;
+    }
+}
+
+// True when every pixel is the same colour. Such an image has no proportions to keep, so a
+// quad of it spanning the frame's whole width -- a fade, a flash -- reaches the picture's
+// edges instead of leaving the sides of a wide picture untouched.
+bool IsSolid(const EngineImageFile* img) {
+    const unsigned int* p = (const unsigned int*)img->rgba;
+    const int count = img->width * img->height;
+    for (int i = 1; i < count; ++i) {
+        if (p[i] != p[0]) {
+            return false;
+        }
+    }
+    return true;
+}
 
 int g_blendMode = 0;
 int g_quadsDrawn = 0;
@@ -207,9 +253,7 @@ void ApplyQuadBlend(IDirect3DDevice9* dev, Entry& e, int blendMode) {
                               (blendMode == 1) ? D3DTOP_MODULATE : D3DTOP_SELECTARG1);
 }
 
-// The UI: on top of the scene unconditionally, pre-transformed, no depth. RTX Remix
-// rasterises it over the path traced frame (rtx.preTransformedVerticesIsUI).
-bool DrawOverlay(IDirect3DDevice9* dev, Entry& e, const ScreenVertex* v, int blendMode) {
+void ClaimOverlayPipeline(IDirect3DDevice9* dev) {
     if (Device::ClaimPipeline(Device::Pipeline2D)) {
         dev->SetFVF(kScreenFVF);
         dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
@@ -217,15 +261,50 @@ bool DrawOverlay(IDirect3DDevice9* dev, Entry& e, const ScreenVertex* v, int ble
         InstallQuadStates(dev);
     }
     Device::SetDepthRange(0.0f, 1.0f);
+}
+
+// The UI: on top of the scene unconditionally, pre-transformed, no depth. RTX Remix
+// rasterises it over the path traced frame (rtx.preTransformedVerticesIsUI).
+bool DrawOverlay(IDirect3DDevice9* dev, Entry& e, const ScreenVertex* authored, int blendMode,
+                 Placement placement) {
+    ScreenVertex v[4];
+    Place(authored, v, placement);
+    ClaimOverlayPipeline(dev);
     ApplyQuadBlend(dev, e, blendMode);
     return Device::DrawTriangles(v, sizeof(ScreenVertex), 4, kQuadIndices, 6);
+}
+
+// A 2D screen is the whole picture: whatever its 4:3 frame leaves uncovered is black, as in
+// the original, rather than the clear colour or what RTX Remix shows behind its UI.
+void DrawBlackUnderlay(IDirect3DDevice9* dev) {
+    const float w = (float)Device::Width();
+    const float h = (float)Device::Height();
+    ScreenVertex v[4];
+    memset(v, 0, sizeof(v));
+    v[1].x = w;
+    v[2].x = w; v[2].y = h;
+    v[3].y = h;
+    for (int i = 0; i < 4; ++i) {
+        v[i].rhw = 1.0f;
+        v[i].diffuse = 0xff000000u;
+    }
+    ClaimOverlayPipeline(dev);
+    dev->SetTexture(0, 0);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+    Device::DrawTriangles(v, sizeof(ScreenVertex), 4, kQuadIndices, 6);
 }
 
 // The backdrop: the same quad as geometry through an orthographic projection that lands each
 // vertex on the pixel the pre-transformed one would, at the far plane -- which Remix takes as
 // its sky layer. It writes depth, harmlessly at 1, because an orthographic draw that writes
-// none is what Remix's UI heuristic (rtx.orthographicIsUI) looks for.
-bool DrawBackdrop(IDirect3DDevice9* dev, Entry& e, const ScreenVertex* v, int blendMode) {
+// none is what Remix's UI heuristic (rtx.orthographicIsUI) looks for. It sits behind the 3D,
+// which fills the whole picture, so it covers the whole picture too.
+bool DrawBackdrop(IDirect3DDevice9* dev, Entry& e, const ScreenVertex* authored, int blendMode,
+                  Placement) {
+    ScreenVertex v[4];
+    Place(authored, v, kPlaceCovering);
     if (Device::ClaimPipeline(Device::Pipeline2DBackdrop)) {
         dev->SetFVF(kBackdropFVF);
         dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
@@ -270,13 +349,14 @@ bool DrawBackdrop(IDirect3DDevice9* dev, Entry& e, const ScreenVertex* v, int bl
 struct PendingQuad {
     int handle;
     int blendMode;
-    ScreenVertex v[4];
+    Placement placement;
+    ScreenVertex v[4];     // authored coordinates
 };
 const int kMaxPendingQuads = 4096;
 PendingQuad g_pending[kMaxPendingQuads];
 int g_pendingCount = 0;
 
-typedef bool (*QuadDrawFn)(IDirect3DDevice9*, Entry&, const ScreenVertex*, int);
+typedef bool (*QuadDrawFn)(IDirect3DDevice9*, Entry&, const ScreenVertex*, int, Placement);
 
 void DrawPending(QuadDrawFn draw) {
     IDirect3DDevice9* dev = Device::Get();
@@ -284,7 +364,7 @@ void DrawPending(QuadDrawFn draw) {
         const PendingQuad& q = g_pending[i];
         // The engine may have unloaded the image since; it drew nothing then either.
         if (Valid(q.handle) && g_entries[q.handle].texture &&
-            draw(dev, g_entries[q.handle], q.v, q.blendMode)) {
+            draw(dev, g_entries[q.handle], q.v, q.blendMode, q.placement)) {
             ++g_quadsDrawn;
         }
     }
@@ -344,12 +424,14 @@ int Pcx::Load(const char* name) {
     e.refcount = 1;
     e.name = _strdup(name);
     e.dx0 = 0; e.dy0 = 0; e.dx1 = e.image->width; e.dy1 = e.image->height;
+    e.solid = IsSolid(e.image);
 
     if (CreateTexture(e)) {
         UploadRect(e, 0, 0, e.image->width, e.image->height);
     }
 
-    LogLine("    PCX[%d] \"%s\" %dx%d", slot, name, e.image->width, e.image->height);
+    LogLine("    PCX[%d] \"%s\" %dx%d%s", slot, name, e.image->width, e.image->height,
+            e.solid ? " solid" : "");
     return slot;
 }
 
@@ -393,6 +475,7 @@ int Pcx::Create(int width, int height) {
     e.name = _strdup(name);
     e.synthetic = true;
     e.dx0 = 0; e.dy0 = 0; e.dx1 = e.image->width; e.dy1 = e.image->height;
+    e.solid = IsSolid(e.image);
 
     if (CreateTexture(e)) {
         UploadRect(e, 0, 0, e.image->width, e.image->height);
@@ -454,6 +537,7 @@ void Pcx::Update(int handle) {
     }
     UploadRect(e, x0, y0, x1, y1);
     e.dx0 = e.dy0 = e.dx1 = e.dy1 = 0;
+    e.solid = IsSolid(e.image);
 }
 
 IDirect3DTexture9* Pcx::Texture(int handle) {
@@ -492,10 +576,10 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
     const float halfTexelV = (e.image->height > 0) ? 0.5f / (float)e.image->height : 0.0f;
     const float uScale = Pcx::UScale(handle);
     const float vScale = Pcx::VScale(handle);
-    const float sx = (float)Device::Width()  / kAuthoredWidth;
-    const float sy = (float)Device::Height() / kAuthoredHeight;
 
-    ScreenVertex v[4];
+    ScreenVertex v[4];      // authored coordinates, placed on screen when drawn
+    float minX = kAuthoredWidth;
+    float maxX = 0.0f;
     for (int i = 0; i < 4; ++i) {
         const float x = positions[i * 3 + 0];
         const float y = positions[i * 3 + 1];
@@ -506,8 +590,10 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
             ++g_quadsRejected;
             return;
         }
-        v[i].x = x * sx;
-        v[i].y = (kAuthoredHeight - 1.0f - y) * sy;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        v[i].x = x;
+        v[i].y = kAuthoredHeight - 1.0f - y;
         v[i].z = positions[i * 3 + 2];
         v[i].rhw = 1.0f;
 
@@ -529,15 +615,15 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
         }
         v[i].specular = 0;
     }
+    const bool spansWidth = minX <= 0.5f && maxX >= kAuthoredWidth - 0.5f;
+    const Placement placement = (e.solid && spansWidth) ? kPlaceFullWidth : kPlaceFramed;
 
     if (g_quadLogged < 40) {
         ++g_quadLogged;
-        LogLine("    2D quad h=%-3d mode=%d img=%dx%d tex=%dx%d scale=%.2f,%.2f "
-                "authored(%.0f,%.0f)-(%.0f,%.0f) -> screen(%.0f,%.0f)-(%.0f,%.0f)",
+        LogLine("    2D quad h=%-3d mode=%d img=%dx%d tex=%dx%d authored(%.0f,%.0f)-(%.0f,%.0f)%s",
                 handle, g_blendMode, e.image->width, e.image->height, e.texWidth, e.texHeight,
-                sx, sy,
                 positions[0], positions[1], positions[6], positions[7],
-                v[0].x, v[0].y, v[2].x, v[2].y);
+                placement == kPlaceFullWidth ? " full width" : "");
     }
 
     // After the world, a quad is the UI on top. Before it, it waits: a frame that goes on to
@@ -547,7 +633,7 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
     // path tracing before the world was drawn. A waiting quad still counts as the frame's first
     // draw, so the synthesised sky does not paint over it.
     if (Device::WorldHasDrawn()) {
-        if (DrawOverlay(dev, e, v, g_blendMode)) {
+        if (DrawOverlay(dev, e, v, g_blendMode, placement)) {
             ++g_quadsDrawn;
         }
         return;
@@ -557,6 +643,7 @@ void Pcx::DrawQuad(int handle, const float* positions, const float* colours, con
         PendingQuad& q = g_pending[g_pendingCount++];
         q.handle = handle;
         q.blendMode = g_blendMode;
+        q.placement = placement;
         memcpy(q.v, v, sizeof(q.v));
     }
 }
@@ -566,6 +653,10 @@ void Pcx::DrawPendingAsBackdrop() {
 }
 
 void Pcx::DrawPendingAsScreen() {
+    IDirect3DDevice9* dev = Device::Get();
+    if (dev && g_pendingCount > 0) {
+        DrawBlackUnderlay(dev);
+    }
     DrawPending(&DrawOverlay);
 }
 

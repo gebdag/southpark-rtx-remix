@@ -1,5 +1,6 @@
 #include "device.h"
 #include "config.h"
+#include "engine.h"
 #include "log.h"
 #include "lookdev.h"
 
@@ -35,11 +36,20 @@ float g_depthMax = -1.0f;
 const D3DCOLOR kFallbackClearColour = D3DCOLOR_XRGB(0x20, 0x30, 0x60);
 D3DCOLOR g_clearColour = kFallbackClearColour;
 
-// Where in the window the back buffer goes. With [Display] KeepAspect the back buffer is the
-// largest 4:3 rectangle the client area holds -- the engine's picture is always 640x480 --
-// and Present places it centred, leaving bars; otherwise it is the whole client area.
+// Where in the window the back buffer goes. The back buffer is the largest rectangle of the
+// picture's shape the client area holds, and Present places it centred, leaving bars.
 RECT g_presentRect;
 bool g_presentToRect = false;
+
+// The picture's width over height. The engine renders 4:3 unless its camera has been patched
+// to follow the display, so anything else is only asked for once it has.
+float PictureAspect(int clientWidth, int clientHeight) {
+    if (!Engine::CameraFollowsDisplayAspect()) {
+        return Config::kOriginalAspect;
+    }
+    const float requested = Config::AspectRatio();
+    return requested > 0.0f ? requested : (float)clientWidth / (float)clientHeight;
+}
 
 void SizeToWindow(HWND window, UINT* width, UINT* height) {
     RECT client = {0, 0, 640, 480};
@@ -57,9 +67,10 @@ void SizeToWindow(HWND window, UINT* width, UINT* height) {
     g_presentRect.right = w;
     g_presentRect.bottom = h;
     g_presentToRect = false;
-    if (Config::KeepAspect() && w * 3 != h * 4) {
-        const int fitW = (w * 3 > h * 4) ? h * 4 / 3 : w;
-        const int fitH = (w * 3 > h * 4) ? h : w * 3 / 4;
+    const float aspect = PictureAspect(w, h);
+    const int fitW = ((float)w > (float)h * aspect) ? (int)((float)h * aspect + 0.5f) : w;
+    const int fitH = ((float)w > (float)h * aspect) ? h : (int)((float)w / aspect + 0.5f);
+    if (fitW != w || fitH != h) {
         g_presentRect.left = (w - fitW) / 2;
         g_presentRect.top = (h - fitH) / 2;
         g_presentRect.right = g_presentRect.left + fitW;
@@ -70,6 +81,7 @@ void SizeToWindow(HWND window, UINT* width, UINT* height) {
     }
     *width = (UINT)w;
     *height = (UINT)h;
+    Engine::SetDisplayAspect((float)w / (float)h);
 }
 
 void FillPresentParams(HWND window) {

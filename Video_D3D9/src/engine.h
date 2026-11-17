@@ -19,6 +19,15 @@ void Install();
 // fit the arrays".
 void LogState();
 
+// True once the engine's camera has been patched to take its aspect ratio from the display
+// ([Display] AspectRatio other than 4:3). Without it the engine renders 4:3 whatever the back
+// buffer is, so the display has to stay 4:3 too.
+bool CameraFollowsDisplayAspect();
+
+// The back buffer's width over height. The camera widens its view to it (Hor+) from the next
+// frame on; ignored while CameraFollowsDisplayAspect() is false.
+void SetDisplayAspect(float aspect);
+
 // Sends one of the engine's API calls to `replacement` instead. The unpacked executable calls
 // every API through the copy protection's dispatcher (`call [0x0156D218]`), which picks the
 // real function from the return address, so its import table cannot be redirected; the call

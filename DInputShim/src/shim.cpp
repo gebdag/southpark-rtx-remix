@@ -64,7 +64,7 @@ void Log(const char* fmt, ...) {
 char g_iniPath[MAX_PATH];
 bool g_forceNonExclusive = true;
 bool g_suspendWhenUnfocused = true;
-bool g_menuHotkeySuspends = true;
+bool g_menuSuspendsInput = true;
 bool g_keepCursorVisible = true;
 
 bool ReadBool(const char* section, const char* key, bool fallback) {
@@ -112,12 +112,14 @@ FARPROC Real(const char* name) {
 
 // ------------------------------------------------------------------------ focus state
 
-// Alt+X toggles the Remix overlay. The overlay lives in the bridge's 64-bit process and the
-// shim cannot ask whether it is open, so the toggle is mirrored here: while the overlay is
-// up the game stops reading its devices, which is what makes the pointer usable over it.
-// The mirror can drift if the overlay is closed some other way; pressing Alt+X resyncs it.
+// True while the Remix menu, or the Remix proxy's overlay, is open and wants the game's input.
+// Set from their own menu-state messages (see RemixMenuMessageHook), so neither can drift.
 bool g_inputSuspendedByMenu = false;
-bool g_menuChordHeld = false;
+bool g_inputSuspendedByOverlay = false;
+
+bool MenuOwnsInput() {
+    return g_inputSuspendedByMenu || g_inputSuspendedByOverlay;
+}
 
 // The cursor belongs to whoever is entitled to the mouse. While the game is reading its
 // devices that is the game, which hides the pointer -- an arrow parked in the middle of
@@ -142,19 +144,6 @@ bool GameHasFocus() {
     DWORD pid = 0;
     GetWindowThreadProcessId(fg, &pid);
     return pid == GetCurrentProcessId();
-}
-
-void PollMenuHotkey() {
-    if (!g_menuHotkeySuspends) {
-        return;
-    }
-    const bool held = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0 &&
-                      (GetAsyncKeyState('X') & 0x8000) != 0;
-    if (held && !g_menuChordHeld) {
-        g_inputSuspendedByMenu = !g_inputSuspendedByMenu;
-        Log("Alt+X: game input %s", g_inputSuspendedByMenu ? "suspended (overlay)" : "resumed");
-    }
-    g_menuChordHeld = held;
 }
 
 // ShowCursor keeps an internal counter, so the show and the hide have to be balanced rather
@@ -191,9 +180,8 @@ void UpdateCursor(bool release) {
 
 // True when the game must not see any input on this call.
 bool InputBlocked() {
-    PollMenuHotkey();
     const bool focused = GameHasFocus();
-    const bool blocked = (g_suspendWhenUnfocused && !focused) || g_inputSuspendedByMenu;
+    const bool blocked = (g_suspendWhenUnfocused && !focused) || MenuOwnsInput();
     UpdateCursor(blocked || !focused);
     return blocked;
 }
@@ -201,16 +189,20 @@ bool InputBlocked() {
 // ------------------------------------------------------------------- vtable patching
 
 typedef HRESULT (STDMETHODCALLTYPE *QueryInterfaceFn)(void*, const IID&, void**);
+typedef ULONG (STDMETHODCALLTYPE *ReleaseFn)(void*);
 typedef HRESULT (STDMETHODCALLTYPE *CreateDeviceFn)(void*, const GUID*, void**, void*);
 typedef HRESULT (STDMETHODCALLTYPE *AcquireFn)(void*);
+typedef HRESULT (STDMETHODCALLTYPE *UnacquireFn)(void*);
 typedef HRESULT (STDMETHODCALLTYPE *SetCooperativeLevelFn)(void*, HWND, DWORD);
 typedef HRESULT (STDMETHODCALLTYPE *GetDeviceStateFn)(void*, DWORD, void*);
 typedef HRESULT (STDMETHODCALLTYPE *GetDeviceDataFn)(void*, DWORD, void*, DWORD*, DWORD);
 
 // Vtable slots, counting the three IUnknown methods first.
 const int kSlotQueryInterface      = 0;
+const int kSlotRelease             = 2;
 const int kSlotCreateDevice        = 3;    // IDirectInput
 const int kSlotAcquire             = 7;    // IDirectInputDevice from here down
+const int kSlotUnacquire           = 8;
 const int kSlotGetDeviceState      = 9;
 const int kSlotGetDeviceData       = 10;
 const int kSlotSetCooperativeLevel = 13;
@@ -329,6 +321,15 @@ void RememberLevel(void* device, DWORD flags) {
     }
 }
 
+void ForgetDevice(void* device) {
+    for (int i = 0; i < g_deviceLevelCount; ++i) {
+        if (g_deviceLevels[i].device == device) {
+            g_deviceLevels[i] = g_deviceLevels[--g_deviceLevelCount];
+            return;
+        }
+    }
+}
+
 bool RecallLevel(void* device, DWORD* flags) {
     for (int i = 0; i < g_deviceLevelCount; ++i) {
         if (g_deviceLevels[i].device == device) {
@@ -347,6 +348,68 @@ bool GameWindowInFront() {
     }
     const HWND fg = GetForegroundWindow();
     return fg && GetAncestor(fg, GA_ROOT) == GetAncestor(g_inputWindow, GA_ROOT);
+}
+
+// --------------------------------------------------------------------- Remix menu state
+//
+// The Remix runtime tells the bridge client whether its menu is open through a registered
+// window message posted to the game window, and the client handles it in its own window
+// procedure. When the menu closes -- which the runtime also reports once at startup -- that
+// handler drains the mouse it saw the game acquire, calling GetDeviceData with the DirectInput 8
+// record size. The game's DirectInput 5 device accepts only the older size and answers any
+// other with DI_OK and the count untouched, so the drain never ends and the game window stops
+// responding for good. The client forgets a device it sees unacquired, so the game's devices
+// are released as the message comes off the queue, before it is dispatched, and Reacquire
+// takes them back on the game's next read. This holds for any bridge build that drains this
+// way and costs nothing with one that does not.
+//
+// The same message is the one reliable record of whether the menu is open, whatever opened
+// or closed it, so it also decides when the game stops reading input for the menu. The South
+// Park Remix proxy (d3d9.dll, F4 overlay) posts its own UWM_SOUTHPARK_OVERLAY_ACTIVE the same
+// way, and is treated like the Remix menu.
+
+UINT g_remixMenuMessage = 0;
+UINT g_overlayMessage = 0;
+HHOOK g_menuHook = 0;
+
+void UnacquireGameDevices() {
+    for (int i = 0; i < g_deviceLevelCount; ++i) {
+        void* device = g_deviceLevels[i].device;
+        UnacquireFn unacquire = (UnacquireFn)(*(void***)device)[kSlotUnacquire];
+        unacquire(device);
+    }
+}
+
+LRESULT CALLBACK RemixMenuMessageHook(int code, WPARAM removal, LPARAM param) {
+    const MSG* msg = (const MSG*)param;
+    if (code == HC_ACTION && removal == PM_REMOVE && msg->message == g_remixMenuMessage) {
+        const bool open = (msg->wParam & 1) != 0;
+        UnacquireGameDevices();
+        g_inputSuspendedByMenu = open && g_menuSuspendsInput;
+        Log("Remix menu %s: %d game devices released before the bridge handles it",
+            open ? "opened" : "closed", g_deviceLevelCount);
+    } else if (code == HC_ACTION && removal == PM_REMOVE && msg->message == g_overlayMessage) {
+        const bool open = (msg->wParam & 1) != 0;
+        g_inputSuspendedByOverlay = open && g_menuSuspendsInput;
+        Log("proxy overlay %s", open ? "opened" : "closed");
+    }
+    return CallNextHookEx(g_menuHook, code, removal, param);
+}
+
+// Watches the message queue of the thread that owns the game's input window. Thread-local, so
+// it sees the game's own messages only.
+void WatchRemixMenu(HWND window) {
+    if (g_menuHook) {
+        return;
+    }
+    g_remixMenuMessage = RegisterWindowMessageA("UWM_REMIX_UIACTIVE_MSG");
+    g_overlayMessage = RegisterWindowMessageA("UWM_SOUTHPARK_OVERLAY_ACTIVE");
+    const DWORD thread = GetWindowThreadProcessId(window, 0);
+    if (g_remixMenuMessage && thread) {
+        g_menuHook = SetWindowsHookExA(WH_GETMESSAGE, &RemixMenuMessageHook, 0, thread);
+    }
+    Log("watching for Remix menu messages (0x%04x) on thread %lu: %s", g_remixMenuMessage,
+        (unsigned long)thread, g_menuHook ? "ok" : "FAILED");
 }
 
 // ------------------------------------------------------------------------ device hooks
@@ -385,6 +448,7 @@ HRESULT STDMETHODCALLTYPE HookedSetCooperativeLevel(void* self, HWND window, DWO
 
     if (window) {
         g_inputWindow = window;
+        WatchRemixMenu(window);
     }
     if (SUCCEEDED(hr)) {
         RememberLevel(self, applied);
@@ -510,6 +574,20 @@ HRESULT STDMETHODCALLTYPE HookedDeviceQueryInterface(void* self, const IID& iid,
     return hr;
 }
 
+// The device list feeds UnacquireGameDevices, so a device leaves it as it is destroyed.
+ULONG STDMETHODCALLTYPE HookedDeviceRelease(void* self) {
+    Vtable* v = FindVtable(self);
+    if (!v) {
+        return 0;
+    }
+    ReleaseFn original = (ReleaseFn)v->original[kSlotRelease];
+    const ULONG remaining = original(self);
+    if (remaining == 0) {
+        ForgetDevice(self);
+    }
+    return remaining;
+}
+
 void PatchDevice(void* device) {
     if (!device) {
         return;
@@ -527,6 +605,7 @@ void PatchDevice(void* device) {
     PatchMethod(v, kSlotGetDeviceState, (void*)&HookedGetDeviceState);
     PatchMethod(v, kSlotGetDeviceData, (void*)&HookedGetDeviceData);
     PatchMethod(v, kSlotQueryInterface, (void*)&HookedDeviceQueryInterface);
+    PatchMethod(v, kSlotRelease, (void*)&HookedDeviceRelease);
     if (fresh) {
         ++g_devicesPatched;
         Log("device vtable %p patched", (void*)v->table);
@@ -610,7 +689,7 @@ BOOL WINAPI ShimClipCursor(const RECT* rect) {
 }
 
 void WINAPI ShimMouseEvent(DWORD flags, DWORD dx, DWORD dy, DWORD data, ULONG_PTR extra) {
-    if (g_inputSuspendedByMenu || (g_suspendWhenUnfocused && !GameHasFocus())) {
+    if (MenuOwnsInput() || (g_suspendWhenUnfocused && !GameHasFocus())) {
         return;
     }
     g_realMouseEvent(flags, dx, dy, data, extra);
@@ -705,7 +784,7 @@ void LoadConfig(HMODULE self) {
 
     g_forceNonExclusive    = ReadBool("Input", "ForceNonExclusiveInput", true);
     g_suspendWhenUnfocused = ReadBool("Input", "SuspendInputWhenUnfocused", true);
-    g_menuHotkeySuspends   = ReadBool("Input", "RemixMenuHotkeySuspendsInput", true);
+    g_menuSuspendsInput    = ReadBool("Input", "RemixMenuSuspendsInput", true);
     g_keepCursorVisible    = ReadBool("Input", "KeepCursorVisible", true);
 }
 
@@ -784,6 +863,40 @@ extern "C" HRESULT WINAPI DllUnregisterServer(void) {
     return fn ? fn() : E_FAIL;
 }
 
+// ----------------------------------------------------------------------- DPI awareness
+//
+// The engine sizes its window from the screen metrics before any renderer loads. A process
+// that is not DPI aware gets virtualised metrics -- 1920x1080 on a 4K monitor at 200% -- and a
+// window Windows then scales up, blurred. The Remix bridge declares the process DPI aware later,
+// when the device comes up, which leaves a window created under one set of coordinates being
+// managed under another. This module is the only code that runs before the engine creates its
+// window, so the process becomes per-monitor aware here, once, for everything after it.
+typedef BOOL (WINAPI *SetProcessDpiAwarenessContextFn)(HANDLE);
+typedef HANDLE (WINAPI *GetThreadDpiAwarenessContextFn)(void);
+typedef int (WINAPI *GetAwarenessFromDpiAwarenessContextFn)(HANDLE);
+const HANDLE kPerMonitorAwareV2 = (HANDLE)-4;    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+
+void BecomeDpiAware() {
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    if (!user32) {
+        Log("user32 not resident at load time; DPI awareness left to the system");
+        return;
+    }
+    SetProcessDpiAwarenessContextFn set =
+        (SetProcessDpiAwarenessContextFn)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+    GetThreadDpiAwarenessContextFn current =
+        (GetThreadDpiAwarenessContextFn)GetProcAddress(user32, "GetThreadDpiAwarenessContext");
+    GetAwarenessFromDpiAwarenessContextFn awareness =
+        (GetAwarenessFromDpiAwarenessContextFn)GetProcAddress(user32,
+                                                              "GetAwarenessFromDpiAwarenessContext");
+    // Fails harmlessly when a manifest or a compatibility setting has already decided.
+    const BOOL set_ok = set ? set(kPerMonitorAwareV2) : FALSE;
+    const int now = (current && awareness) ? awareness(current()) : -1;
+    static const char* const kNames[] = {"unaware", "system aware", "per-monitor aware"};
+    Log("DPI awareness: %s (%s)", (now >= 0 && now <= 2) ? kNames[now] : "unknown",
+        set_ok ? "set here" : "already decided before this module");
+}
+
 BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(self);
@@ -793,9 +906,10 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
         g_logReady = true;
         Log("=== DInputShim loaded ===");
         Log("ForceNonExclusiveInput=%d SuspendInputWhenUnfocused=%d "
-            "RemixMenuHotkeySuspendsInput=%d KeepCursorVisible=%d",
-            g_forceNonExclusive, g_suspendWhenUnfocused, g_menuHotkeySuspends,
+            "RemixMenuSuspendsInput=%d KeepCursorVisible=%d",
+            g_forceNonExclusive, g_suspendWhenUnfocused, g_menuSuspendsInput,
             g_keepCursorVisible);
+        BecomeDpiAware();
         PatchExecutableImports();
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("=== DInputShim unloading: %d device vtables patched, %d cooperative levels "
@@ -803,6 +917,9 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
             "unacquirable device ===",
             g_devicesPatched, g_coopCallsRewritten, g_statesBlocked, g_reacquires, g_rebinds,
             g_unacquirable);
+        if (g_menuHook) {
+            UnhookWindowsHookEx(g_menuHook);
+        }
         g_logReady = false;
         DeleteCriticalSection(&g_logLock);
     }

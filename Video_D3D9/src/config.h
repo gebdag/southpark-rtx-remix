@@ -164,9 +164,14 @@ int DisplayWindowHeight();
 int DisplayWindowX();
 int DisplayWindowY();
 
-// Present the engine's 4:3 picture at 4:3, with black bars where the window is wider or
-// taller, instead of stretching it to fill.
-bool KeepAspect();
+// The engine's own picture: 640x480.
+const float kOriginalAspect = 4.0f / 3.0f;
+
+// [Display] AspectRatio: the picture's width over height. kOriginalAspect is the game as it
+// shipped; a wider ratio widens the 3D view at the sides and keeps the 2D layer 4:3 in the
+// middle. 0 means the window's own shape. Whatever the window has left over is black bars;
+// nothing is stretched.
+float AspectRatio();
 
 // Let the engine pause the game when its window loses focus, as it always has. Off, the game
 // keeps running behind other windows.

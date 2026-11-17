@@ -1,6 +1,7 @@
 #include "engine.h"
 #include "config.h"
 #include "log.h"
+#include "lookdev.h"
 
 #include <windows.h>
 #include <string.h>
@@ -237,6 +238,36 @@ const unsigned char kCameraDistanceCode[10] = {
 float g_drawDistanceFloor   = 0.0f;
 float g_drawDistanceApplied = 0.0f;
 bool  g_drawDistancePatched = false;
+
+// ------------------------------------------------------------------- camera aspect ratio
+//
+// SP_UpdateCamera holds a horizontal field of view and derives everything else from the
+// camera's viewport shape (camera+0x2a2 / +0x2a6, 640x480): the vertical field of view, and
+// from it an aspect ratio that reaches three consumers -- the stored camera aspect, the
+// projection builder (FUN_004aea90) and the far corners of the frustum that culls entities and
+// geometry. Scaling that one value after the vertical field of view is fixed widens all three
+// together: the picture keeps its height and gains at the sides (Hor+), and the culling sees
+// exactly what the wider picture shows.
+//
+//   00421880  fld  [esp+0x1c]       tan(fov/2), over the breathing scale
+//   00421884  fdiv [esp+0x18]       / tan(vertical fov/2)     -> the aspect, in st0
+//   00421888  fstp [esp+0x20]       <- patched: multiplied by g_cameraAspectScale first
+//   0042188c  mov  eax, [esp+0x20]
+//   00421890  fstp [esi+0x54]       vertical fov
+//   0042189d  mov  [esi+0x58], eax  camera aspect; eax is also the projection's argument
+//   00421a47  fld  [esp+0x1c]       the same slot, esp back at its earlier depth: frustum width
+//
+// Nothing branches into the eight relocated bytes. The engine's own picture is 640x480, so
+// the scale is the display's aspect over 4:3.
+const unsigned int kCameraAspectSite   = 0x00421888;
+const unsigned int kCameraAspectResume = 0x00421890;
+const unsigned char kCameraAspectCode[8] = {
+    0xD9, 0x5C, 0x24, 0x20,                      // fstp dword ptr [esp+0x20]
+    0x8B, 0x44, 0x24, 0x20,                      // mov  eax, dword ptr [esp+0x20]
+};
+
+float g_cameraAspectScale   = 1.0f;
+bool  g_cameraAspectPatched = false;
 
 // ------------------------------------------------------- the camera's visible-object lists
 //
@@ -640,6 +671,39 @@ bool InstallDrawDistanceFloor(float distance) {
     return true;
 }
 
+bool InstallCameraAspect() {
+    if (!Verify(kCameraAspectSite, kCameraAspectCode, sizeof(kCameraAspectCode))) {
+        LogLine("    engine: 0x%08X is not the camera aspect code -- the picture stays 4:3",
+                kCameraAspectSite);
+        return false;
+    }
+    unsigned char* cave = (unsigned char*)VirtualAlloc(0, 64, MEM_COMMIT | MEM_RESERVE,
+                                                       PAGE_EXECUTE_READWRITE);
+    if (!cave) {
+        return false;
+    }
+    g_write = cave;
+    Emit(0xD8); Emit(0x0D);
+    EmitDword((unsigned int)&g_cameraAspectScale);             // fmul dword ptr [scale]
+    for (int i = 0; i < (int)sizeof(kCameraAspectCode); ++i) {
+        Emit(kCameraAspectCode[i]);                            // the relocated originals
+    }
+    Emit(0xE9);
+    EmitDword(kCameraAspectResume - ((unsigned int)g_write + 4));
+
+    unsigned char patch[sizeof(kCameraAspectCode)];
+    const int rel = (int)((unsigned int)cave - (kCameraAspectSite + 5));
+    patch[0] = 0xE9;
+    memcpy(patch + 1, &rel, 4);
+    memset(patch + 5, 0x90, sizeof(patch) - 5);
+    if (!Overwrite(kCameraAspectSite, patch, sizeof(patch))) {
+        return false;
+    }
+    g_cameraAspectPatched = true;
+    LogLine("    engine: camera aspect follows the display");
+    return true;
+}
+
 int RedirectCallSites(const unsigned int* sites, int count, unsigned int target,
                       unsigned char* detour) {
     int patched = 0;
@@ -677,6 +741,12 @@ void Engine::Install() {
     const float distance = Config::DrawDistance();
     if (distance > 1024.0f) {
         InstallDrawDistanceFloor(distance);
+    }
+
+    // The lookdev tee draws the same camera through the original renderer, whose picture is
+    // 4:3 whatever ours is, so the camera keeps the engine's shape there.
+    if (Config::AspectRatio() != Config::kOriginalAspect && !Lookdev::IsTee()) {
+        InstallCameraAspect();
     }
 
     // Raised before the peak counters are installed, so the reported cap is the live one.
@@ -748,6 +818,16 @@ void Engine::Install() {
         }
     }
 
+}
+
+bool Engine::CameraFollowsDisplayAspect() {
+    return g_cameraAspectPatched;
+}
+
+void Engine::SetDisplayAspect(float aspect) {
+    if (g_cameraAspectPatched && aspect > 0.0f) {
+        g_cameraAspectScale = aspect / Config::kOriginalAspect;
+    }
 }
 
 void Engine::LogState() {
