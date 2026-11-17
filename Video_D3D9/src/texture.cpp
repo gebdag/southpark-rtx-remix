@@ -187,7 +187,6 @@ inline unsigned int ExpandPaletteEntry(unsigned short stored, int effectMode) {
     return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
-// Format 3 is the only one whose palette carries a full alpha channel.
 // Format 3 is the effect atlas and the only format whose palette is not packed colour.
 // Returns the mode ExpandPaletteEntry should use: 0 leaves RGBA5551 for everything else.
 inline int EffectPaletteMode(int format) {
@@ -302,68 +301,6 @@ void Texture::Enumerate(void* blob) {
     g_sets[g_count++] = copy;
 }
 
-static const char* SetName(const void* blob);
-
-// Chunks 1 and 2 are themselves blobs with the same count+offsets layout. Their sizes against
-// the set's dimensions give the bits per pixel.
-static void DescribeSet(int index, const void* blob) {
-    const unsigned char* base = (const unsigned char*)blob;
-    const unsigned int size = BlobSize(blob);
-    if (size == 0) {
-        return;
-    }
-    const unsigned int count = *(const unsigned int*)base;
-    const unsigned char* c0 = base + *(const unsigned int*)(base + 4);
-    int w = c0[2] ? c0[2] : 256;
-    int h = c0[3] ? c0[3] : 256;
-    LogLine("    set[%d] %p size=%u chunks=%u  hdr=%02x %02x %02x %02x %02x %02x %02x %02x  %dx%d",
-            index, blob, size, count,
-            c0[0], c0[1], c0[2], c0[3], c0[4], c0[5], c0[6], c0[7], w, h);
-
-    for (unsigned int c = 1; c < count && c < 4; ++c) {
-        const unsigned int off = *(const unsigned int*)(base + 4 + c * 4);
-        const unsigned int end = *(const unsigned int*)(base + 8 + c * 4);
-        if (off >= size || end > size || end <= off) {
-            continue;
-        }
-        const unsigned char* sub = base + off;
-        const unsigned int subBytes = end - off;
-        const unsigned int subCount = *(const unsigned int*)sub;
-        LogLine("      chunk%u: %u bytes, nested count=%u", c, subBytes, subCount);
-        if (subCount == 0 || subCount > 32 || 4 + (subCount + 1) * 4 > subBytes) {
-            continue;
-        }
-        for (unsigned int k = 0; k < subCount && k < 6; ++k) {
-            const unsigned int so = *(const unsigned int*)(sub + 4 + k * 4);
-            const unsigned int se = *(const unsigned int*)(sub + 8 + k * 4);
-            if (se <= so) {
-                continue;
-            }
-            const unsigned int px = (unsigned int)(w * h);
-            LogLine("        sub[%u] %u bytes  (%u px -> %.2f bits/px)",
-                    k, se - so, px, px ? (double)(se - so) * 8.0 / (double)px : 0.0);
-        }
-    }
-}
-
-// Writes a whole texture-set blob to disk, for decoding offline.
-void Texture::DumpSet(int index, const char* path) {
-    if (index < 0 || index >= g_count || !g_sets[index]) {
-        return;
-    }
-    const unsigned int size = BlobSize(g_sets[index]);
-    if (size == 0) {
-        return;
-    }
-    FILE* f = fopen(path, "wb");
-    if (!f) {
-        return;
-    }
-    fwrite(g_sets[index], 1, size, f);
-    fclose(f);
-    LogLine("    dumped set %d (%u bytes) -> %s", index, size, path);
-}
-
 // The last chunk holds an ASCII name, the only stable way to tell which set is which.
 static const char* SetName(const void* blob) {
     const unsigned char* base = (const unsigned char*)blob;
@@ -444,19 +381,6 @@ void Texture::FinishEnumeration() {
     }
     LogLine("    texture enumeration finished: %d sets (%d copied, %d KB)",
             g_count, valid, bytes / 1024);
-    // A few fixed sets, written as probe_NNN.bin on every run as samples for checking the
-    // decoder offline.
-    static const int kProbe[] = { 281, 227, 17, 0, 1, 189 };
-    for (unsigned int k = 0; k < sizeof(kProbe) / sizeof(kProbe[0]); ++k) {
-        const int i = kProbe[k];
-        if (i >= g_count || !g_sets[i]) {
-            continue;
-        }
-        char path[64];
-        _snprintf(path, sizeof(path), "probe_%03d.bin", i);
-        path[sizeof(path) - 1] = 0;
-        DumpSet(i, path);
-    }
 }
 
 void* Texture::GetSet(int index, int* outWidth, int* outHeight) {

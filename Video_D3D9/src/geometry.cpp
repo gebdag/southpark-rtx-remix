@@ -2375,12 +2375,6 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
                 ++g_textureSelects;
                 LogLine("    tex select: word0=0x%08x word1=0x%08x -> index %d  %s",
                         word0, word1, tex, Texture::Name(tex));
-                if (g_textureSelects <= 12) {
-                    char path[128];
-                    _snprintf(path, sizeof(path), "texdump_%03d.bin", tex);
-                    path[sizeof(path) - 1] = 0;
-                    Texture::DumpSet(tex, path);
-                }
             }
             // word1 holds the two sub-chunk selectors: the low half sign-extended, the
             // high half as-is. Texture::GetTexture turns them into a frame and a palette.
@@ -2645,7 +2639,7 @@ void Geometry::LogTextureStats() {
     LogLine("    binds suppressed by the combiner mode (flat modes 0x12-0x15, 0x17, 0x19, "
             "0x1c): %u", g_modeSuppressedBinds);
     LogLine("    batches skipped for a constant alpha of 0: %u", g_zeroAlphaBatches);
-    LogLine("    UNTEXTURED batches by (mode, constant, blend) -- this is where the houses are:");
+    LogLine("    UNTEXTURED batches by (mode, constant, blend):");
     for (int i = 0; i < g_untexturedKindCount; ++i) {
         const UntexturedKind& k = g_untexturedKinds[i];
         LogLine("      mode=%02X  constant R=%02X G=%02X B=%02X A=%02X  %-8s  %7u flushes  "

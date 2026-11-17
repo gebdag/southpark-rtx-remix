@@ -147,7 +147,7 @@ bool EnvironmentMapsAsMetal();
 const char* ChromeTextureNames();
 
 // [Debug] DumpEnvTextures: write each texture variant drawn environment-mapped, and each of
-// the sets named in DumpTextureNames (name prefixes), to <game>\env_textures// (Texture::DumpTexels), once per run.
+// the sets named in DumpTextureNames (name prefixes), to <game>\env_textures\ (Texture::DumpTexels), once per run.
 bool DumpEnvTextures();
 const char* DumpTextureNames();
 // [Debug] HideTextureNames: sets (name prefixes) whose batches are not drawn at all, to see

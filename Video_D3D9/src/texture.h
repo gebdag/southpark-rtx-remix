@@ -91,9 +91,6 @@ void FlushDecoded();
 
 void ReleaseAll();
 
-// Writes a whole set blob to disk for offline analysis.
-void DumpSet(int index, const char* path);
-
 // Writes the texels of the variant a (subA, subB) selection resolves to, as uploaded, to
 // <folder><set>_<frame>_<palette>_<w>x<h>_<name>.bgra. RTX Remix names a texture by XXH3-64 of
 // exactly these bytes, which is what a material override in a Remix mod is keyed by.

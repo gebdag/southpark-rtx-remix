@@ -46,7 +46,7 @@ void LogOpen(const char* path) {
     if (!g_file) {
         g_file = fopen(path, "w");
     }
-    LogLine("=== Video_D3D9 stub loaded ===");
+    LogLine("=== Video_D3D9 loaded ===");
 }
 
 void LogClose() {

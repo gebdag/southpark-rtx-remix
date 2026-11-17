@@ -523,17 +523,17 @@ GFXAPI void GFXDLL_BeginScene(void) {
     }
 }
 
-// For the Remix proxy (d3d9.dll): how many of `count` points (x, y, z each) have level
-// geometry above them, or -1 when the renderer holds no geometry around any of them. The proxy
-// calls it from Present, on the thread that renders.
-// The F4 overlay's live settings ([Display] FieldOfView, [Sky] StarrySky, [FullMap]
-// KeepAroundCamera). 1 when the key is one of them; the input shim exports the same function
-// for its keys.
+// The F4 overlay's live settings ([Display] FieldOfView and HudAtSides, [Sky] StarrySky,
+// [FullMap] KeepAroundCamera and DrawDistancePercent). 1 when the key is one of them; the input
+// shim exports the same function for its keys.
 extern "C" __declspec(dllexport) int __cdecl SouthPark_SetSetting(const char* section, const char* key,
                                                                   float value) {
     return section && key && Config::SetLive(section, key, value) ? 1 : 0;
 }
 
+// For the Remix proxy (d3d9.dll): how many of `count` points (x, y, z each) have level
+// geometry above them, or -1 when the renderer holds no geometry around any of them. The proxy
+// calls it from Present, on the thread that renders.
 extern "C" __declspec(dllexport) int __cdecl SouthPark_CoverAbove(const float* points, int count) {
     return NormalCache::CoverAbove(points, count);
 }
