@@ -142,6 +142,14 @@ const char* SkyTextureNames();
 // while the game runs.
 bool StarrySky();
 
+// [Materials] EnvironmentMapsAsMetal: a surface the engine environment-maps (its chrome, the
+// Iguana logo's gold) is drawn with a flat swatch of its reflection image's mean colour instead
+// of the image on the surface's own coordinates; a Remix mod makes the swatches metallic.
+bool EnvironmentMapsAsMetal();
+// [Materials] ChromeTextureNames: sets that are reflection images painted on with ordinary
+// coordinates (the Acclaim logo's chrome), drawn as metal swatches like environment maps.
+const char* ChromeTextureNames();
+
 // [Debug] DumpEnvTextures: write each texture variant drawn environment-mapped, and each of
 // the sets named in DumpTextureNames (name prefixes), to <game>\env_textures// (Texture::DumpTexels), once per run.
 bool DumpEnvTextures();

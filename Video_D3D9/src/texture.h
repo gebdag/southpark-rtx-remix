@@ -69,6 +69,16 @@ bool IsSkySet(int index);
 bool IsStarSet(int index);
 // Whether a set is one of [Debug] DumpTextureNames.
 bool IsDumpedSet(int index);
+// Whether a set is one of [Materials] ChromeTextureNames.
+bool IsChromeSet(int index);
+
+// A flat swatch in the mean colour of the variant (subA, subB) of a set, rounded to 16 levels a
+// channel: what an environment-mapped surface is drawn with when the reflection is left to RTX
+// Remix. Swatches are kMetalSwatchSize square, opaque, and shared by colour; a Remix material
+// override is keyed by a swatch's hash (XXH3-64 of its texels), and with 4096 possible colours
+// the mod covers all of them (the SouthParkMaterials mod).
+const int kMetalSwatchSize = 16;
+IDirect3DTexture9* MetalSwatch(int index, int subA, int subB, unsigned int* colour);
 
 // Drops every decoded frame but keeps the blobs, so the next draw decodes afresh. The engine
 // asks for this through GFXDLL_FlushTextureCache, which the original honours by jumping into

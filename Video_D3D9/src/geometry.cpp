@@ -1608,6 +1608,15 @@ void Flush() {
     IDirect3DTexture9* tex = (activeTexture >= 0)
                            ? Texture::GetTexture(activeTexture, g_currentSubA, g_currentSubB)
                            : 0;
+    if (tex && Config::EnvironmentMapsAsMetal() &&
+        ((g_renderFlags & kFlagEnvironmentMap) || Texture::IsChromeSet(activeTexture))) {
+        // The reflection is RTX Remix's to draw: the surface gets the image's mean colour.
+        unsigned int colour = 0;
+        if (IDirect3DTexture9* swatch = Texture::MetalSwatch(activeTexture, g_currentSubA,
+                                                             g_currentSubB, &colour)) {
+            tex = swatch;
+        }
+    }
     if (tex) { ++g_texturedFlushes; } else { ++g_untexturedFlushes; }
     if (activeTexture >= 0 && activeTexture < kCensusSets) {
         SetDraws& d = g_setDraws[activeTexture];
@@ -2039,8 +2048,9 @@ void DumpBatch(int vertexCount, bool textured, bool culled, bool sky, bool decal
                 (g_renderFlags & kFlagLighting) ? "_lit" : "");
         for (int i = 0; i < vertexCount; ++i) {
             const WorldVertex& v = g_compactVertices[i];
-            fprintf(g_dumpObj, "v %.4f %.4f %.4f\nvn %.5f %.5f %.5f\n", v.x, v.y, v.z, v.nx, v.ny,
-                    v.nz);
+            // The vertex colour as drawn (ARGB) rides along as a comment.
+            fprintf(g_dumpObj, "v %.4f %.4f %.4f\nvn %.5f %.5f %.5f\n# c %08X\n", v.x, v.y, v.z,
+                    v.nx, v.ny, v.nz, (unsigned int)v.diffuse);
         }
         for (int i = 0; i + 2 < g_indexCount; i += 3) {
             const int a = g_dumpObjVertices + g_compactIndices[i] + 1;

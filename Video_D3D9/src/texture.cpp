@@ -36,6 +36,23 @@ struct SetCache {
     int next;   // round-robin victim once the cache is full
 };
 SetCache g_cache[kMaxSets];
+
+// Flat swatches for environment-mapped surfaces (Texture::MetalSwatch), one per colour.
+struct Swatch {
+    unsigned int colour;
+    IDirect3DTexture9* tex;
+};
+Swatch g_swatches[64];
+int g_swatchCount = 0;
+// Which swatch each environment-mapped set variant was given, so its image is decoded once.
+struct SwatchUse {
+    int set, pix, pal;
+    unsigned int colour;
+    IDirect3DTexture9* tex;
+};
+SwatchUse g_swatchUses[256];
+int g_swatchUseCount = 0;
+IDirect3DTexture9* CreateSwatch(unsigned int texel);
 bool  g_decodeFailed[kMaxSets];
 int   g_decodeFailuresLogged = 0;
 // Filled by the decoder and consumed by the caller that cached the variant.
@@ -45,6 +62,7 @@ int   g_decodeFailures = 0;
 bool  g_isSky[kMaxSets];
 bool  g_isStars[kMaxSets];
 bool  g_isDumped[kMaxSets];
+bool  g_isChrome[kMaxSets];
 int   g_count = 0;
 int   g_paletteLogged = 0;
 
@@ -405,6 +423,7 @@ void Texture::FinishEnumeration() {
             LogLine("    sky texture set %d: %s", i, SetName(g_sets[i]));
         }
         g_isDumped[i] = g_sets[i] && NameInList(SetName(g_sets[i]), Config::DumpTextureNames());
+        g_isChrome[i] = g_sets[i] && NameInList(SetName(g_sets[i]), Config::ChromeTextureNames());
         if (g_sets[i] && NameInList(SetName(g_sets[i]), Config::StarTextureNames())) {
             g_isStars[i] = true;
             LogLine("    star-field texture set %d: %s", i, SetName(g_sets[i]));
@@ -883,6 +902,10 @@ bool Texture::IsStarSet(int index) {
     return index >= 0 && index < g_count && g_isStars[index];
 }
 
+bool Texture::IsChromeSet(int index) {
+    return index >= 0 && index < g_count && g_isChrome[index];
+}
+
 bool Texture::IsDumpedSet(int index) {
     return index >= 0 && index < g_count && g_isDumped[index];
 }
@@ -904,6 +927,11 @@ void Texture::FlushDecoded() {
 }
 
 void Texture::ReleaseAll() {
+    for (int i = 0; i < g_swatchCount; ++i) {
+        g_swatches[i].tex->Release();
+    }
+    g_swatchCount = 0;
+    g_swatchUseCount = 0;
     for (int i = 0; i < g_count; ++i) {
         for (int v = 0; v < g_cache[i].n; ++v) {
             if (g_cache[i].v[v].tex) {
@@ -920,6 +948,7 @@ void Texture::ReleaseAll() {
         g_isSky[i] = false;
         g_isStars[i] = false;
         g_isDumped[i] = false;
+        g_isChrome[i] = false;
     }
     g_count = 0;
 }
@@ -952,3 +981,100 @@ bool Texture::DumpTexels(int index, int subA, int subB, const char* folder) {
     fclose(f);
     return true;
 }
+
+IDirect3DTexture9* Texture::MetalSwatch(int index, int subA, int subB, unsigned int* colour) {
+    IDirect3DDevice9* dev = Device::Get();
+    int pixSub = 0, palSub = 0;
+    if (!dev || !ResolveVariant(index, subA, subB, &pixSub, &palSub)) {
+        return 0;
+    }
+    for (int i = 0; i < g_swatchUseCount; ++i) {
+        const SwatchUse& u = g_swatchUses[i];
+        if (u.set == index && u.pix == pixSub && u.pal == palSub) {
+            *colour = u.colour;
+            return u.tex;
+        }
+    }
+    std::vector<unsigned int> texels;
+    int w = 0, h = 0;
+    if (!DecodeTexels(index, pixSub, palSub, texels, &w, &h)) {
+        return 0;
+    }
+    // The mean of the reflection image is the mean of what it reflects, not how much the metal
+    // reflects: chrome painted on a dark scene averages near black. So the swatch keeps the
+    // mean's hue and is brightened until its strongest channel is kMetalPeak, the reflectance
+    // of a bright metal; grey becomes silver, olive becomes gold.
+    // Mean of the visible texels.
+    unsigned int sum[3] = {0, 0, 0}, visible = 0;
+    for (unsigned int t : texels) {
+        if (t >> 24) {
+            sum[0] += t & 0xffu; sum[1] += (t >> 8) & 0xffu; sum[2] += (t >> 16) & 0xffu;
+            ++visible;
+        }
+    }
+    const unsigned int mean = visible
+        ? ((sum[2] / visible) << 16) | ((sum[1] / visible) << 8) | (sum[0] / visible) : 0u;
+    const unsigned int kMetalPeak = 0xdd;
+    unsigned int peak = 1;
+    for (int shift = 0; shift < 24; shift += 8) {
+        const unsigned int c = (mean >> shift) & 0xffu;
+        peak = c > peak ? c : peak;
+    }
+    // Rounded to 16 levels a channel (0x00, 0x11, ... 0xFF): 4096 possible swatches, so the
+    // Remix mod can carry a material for every one of them without a list of what the game uses.
+    unsigned int rounded = 0;
+    for (int shift = 0; shift < 24; shift += 8) {
+        const unsigned int c = ((mean >> shift) & 0xffu) * kMetalPeak / peak;
+        rounded |= (((c + 8u) / 17u) * 17u) << shift;
+    }
+    const unsigned int texel = 0xff000000u | rounded;
+    *colour = rounded;
+    IDirect3DTexture9* tex = 0;
+    for (int i = 0; i < g_swatchCount && !tex; ++i) {
+        if (g_swatches[i].colour == texel) {
+            tex = g_swatches[i].tex;
+        }
+    }
+    if (!tex) {
+        tex = CreateSwatch(texel);
+        if (!tex) {
+            return 0;
+        }
+        LogLine("    metal swatch %06X (image mean %06X) for set %d \"%s\" (frame/palette %d,%d)",
+                rounded, mean, index, Name(index), pixSub, palSub);
+    }
+    if (g_swatchUseCount < (int)(sizeof(g_swatchUses) / sizeof(g_swatchUses[0]))) {
+        g_swatchUses[g_swatchUseCount++] = {index, pixSub, palSub, rounded, tex};
+    }
+    return tex;
+}
+
+namespace {
+
+IDirect3DTexture9* CreateSwatch(unsigned int texel) {
+    IDirect3DDevice9* dev = Device::Get();
+    if (!dev || g_swatchCount == (int)(sizeof(g_swatches) / sizeof(g_swatches[0]))) {
+        return 0;
+    }
+    IDirect3DTexture9* tex = 0;
+    if (FAILED(dev->CreateTexture(Texture::kMetalSwatchSize, Texture::kMetalSwatchSize, 1, 0, D3DFMT_A8R8G8B8,
+                                  D3DPOOL_MANAGED, &tex, 0))) {
+        return 0;
+    }
+    D3DLOCKED_RECT lr;
+    if (FAILED(tex->LockRect(0, &lr, 0, 0))) {
+        tex->Release();
+        return 0;
+    }
+    for (int y = 0; y < Texture::kMetalSwatchSize; ++y) {
+        unsigned int* row = (unsigned int*)((unsigned char*)lr.pBits + (size_t)y * lr.Pitch);
+        for (int x = 0; x < Texture::kMetalSwatchSize; ++x) {
+            row[x] = texel;
+        }
+    }
+    tex->UnlockRect(0);
+    g_swatches[g_swatchCount++] = {texel, tex};
+    return tex;
+}
+
+} // namespace

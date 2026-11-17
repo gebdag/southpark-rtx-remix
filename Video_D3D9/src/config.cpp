@@ -14,6 +14,8 @@ char g_skyNames[512];
 char g_starNames[512];
 bool g_starrySky = true;
 bool g_dumpEnvTextures = false;
+bool g_environmentMapsAsMetal = true;
+char g_chromeNames[512];
 char g_dumpTextureNames[512];
 int g_screenshotFrame = 0;
 int g_screenshotInterval = 0;
@@ -270,6 +272,16 @@ const char* kDefaultIni =
     "StarrySky=1\r\n"
     "StarTextureNames=STARS01\r\n"
     "\r\n"
+    "[Materials]\r\n"
+    "; Surfaces the game environment-maps -- its chrome, the gold edge of the Iguana logo -- show\r\n"
+    "; a reflection image wrapped by the surface normal, which this renderer does not generate.\r\n"
+    "; 1 draws them with a flat swatch of that image's mean colour, which the South Park Remix mod\r\n"
+    "; (rtx-remix\\mods\\SouthParkMaterials) makes metallic, so RTX Remix reflects the real scene.\r\n"
+    "EnvironmentMapsAsMetal=1\r\n"
+    "; Sets that are reflection images painted on with ordinary coordinates -- the Acclaim logo's\r\n"
+    "; chrome -- drawn the same way, by name prefix.\r\n"
+    "ChromeTextureNames=RYCHROME,ALCHROME,YLWCHRM\r\n"
+    "\r\n"
     "[Normals]\r\n"
     "; Pre-lit geometry -- most of the world -- carries vertex colours instead of normals, so\r\n"
     "; its normals are computed from its triangles. Faces meeting at less than this angle, in\r\n"
@@ -464,6 +476,9 @@ void Config::Load(void* self) {
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
     g_dumpEnvTextures = ReadBool("Debug", "DumpEnvTextures", false);
+    g_environmentMapsAsMetal = ReadBool("Materials", "EnvironmentMapsAsMetal", true);
+    GetPrivateProfileStringA("Materials", "ChromeTextureNames", "RYCHROME,ALCHROME,YLWCHRM",
+                             g_chromeNames, sizeof(g_chromeNames), g_iniPath);
     GetPrivateProfileStringA("Debug", "DumpTextureNames", "", g_dumpTextureNames,
                              sizeof(g_dumpTextureNames), g_iniPath);
     GetPrivateProfileStringA("Sky", "StarTextureNames", "STARS01",
@@ -505,6 +520,8 @@ bool Config::DisableOffscreenQuadReject() { return g_disableOffscreenQuadReject;
 bool Config::UseEngineBackgroundColour()  { return g_useEngineBackgroundColour; }
 bool Config::StarrySky()                 { return g_starrySky; }
 bool Config::DumpEnvTextures()           { return g_dumpEnvTextures; }
+bool Config::EnvironmentMapsAsMetal()    { return g_environmentMapsAsMetal; }
+const char* Config::ChromeTextureNames() { return g_chromeNames; }
 const char* Config::DumpTextureNames()   { return g_dumpTextureNames; }
 const char* Config::StarTextureNames()   { return g_starNames; }
 const char* Config::SkyTextureNames()     { return g_skyNames; }
