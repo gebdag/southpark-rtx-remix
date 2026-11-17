@@ -470,6 +470,27 @@ unsigned int g_opaqueFlushes = 0;
 unsigned int g_blendedFlushes = 0;
 
 // Frame dump. Armed from a key, spent over one frame, so the log stays readable.
+// What the batch path costs, per frame, logged every kCostFrames frames: the state calls, the
+// normals, the decal search and the draw call (which crosses the proxy and the Remix bridge).
+struct FlushCost {
+    double state, normals, decals, draw;
+    unsigned int flushes, frames;
+};
+FlushCost g_cost = {};
+const unsigned int kCostFrames = 600;
+double g_ticksPerMs = 0.0;
+
+double NowMs() {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    if (g_ticksPerMs == 0.0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_ticksPerMs = (double)f.QuadPart / 1000.0;
+    }
+    return (double)t.QuadPart / g_ticksPerMs;
+}
+
 bool g_dumpArmed = false;
 bool g_dumpingFrame = false;
 int  g_dumpBatch = 0;
@@ -931,13 +952,23 @@ void RecordPrelitFaces(int vertexCount) {
     }
 }
 
-// The smoothed normal of corner `corner` (an index position).
-void CornerNormal(int corner, float creaseCos, float* out) {
-    const int first = corner - corner % 3;
-    NormalCache::CornerNormal(&g_vertices[g_indices[first]].x, &g_vertices[g_indices[first + 1]].x,
-                              &g_vertices[g_indices[first + 2]].x, corner % 3, creaseCos, out);
-    if (!Normalise(out)) {
-        out[0] = 0.0f; out[1] = 1.0f; out[2] = 0.0f;
+// The smoothed normals of triangle `t`'s three corners. A face the cache does not hold -- too
+// small to key, or with a lit corner -- takes its own normal.
+void TriangleNormals(int t, float creaseCos, float out[3][3]) {
+    const WorldVertex& a = g_vertices[g_indices[t * 3]];
+    const WorldVertex& b = g_vertices[g_indices[t * 3 + 1]];
+    const WorldVertex& c = g_vertices[g_indices[t * 3 + 2]];
+    if (!NormalCache::FaceNormals(&a.x, &b.x, &c.x, creaseCos, out)) {
+        float own[3];
+        FaceNormal(a, b, c, own);
+        for (int k = 0; k < 3; ++k) {
+            out[k][0] = own[0]; out[k][1] = own[1]; out[k][2] = own[2];
+        }
+    }
+    for (int k = 0; k < 3; ++k) {
+        if (!Normalise(out[k])) {
+            out[k][0] = 0.0f; out[k][1] = 1.0f; out[k][2] = 0.0f;
+        }
     }
 }
 
@@ -955,6 +986,8 @@ int CompactBatch(int vertexCount) {
         g_slotFirstVariant[v] = -1;
     }
     int count = 0;
+    float triangle[3][3];
+    int triangleRead = -1;
     for (int i = 0; i < g_indexCount; ++i) {
         const int v = g_indices[i];
         if (v >= vertexCount) {
@@ -963,7 +996,11 @@ int CompactBatch(int vertexCount) {
         }
         float n[3] = { g_vertices[v].nx, g_vertices[v].ny, g_vertices[v].nz };
         if (!g_slotLit[v]) {
-            CornerNormal(i, creaseCos, n);
+            if (triangleRead != i / 3) {
+                triangleRead = i / 3;
+                TriangleNormals(triangleRead, creaseCos, triangle);
+            }
+            n[0] = triangle[i % 3][0]; n[1] = triangle[i % 3][1]; n[2] = triangle[i % 3][2];
         }
         int found = -1;
         for (int k = g_slotFirstVariant[v]; k >= 0; k = g_variantNext[k]) {
@@ -995,9 +1032,10 @@ int CompactBatch(int vertexCount) {
 // tracer has no "later": two surfaces in one plane are one surface hit at random, and the
 // sign loses.
 //
-// So they are found here. Every opaque world triangle drawn this frame is filed by its plane;
-// a batch with a triangle lying in the plane of an earlier one, facing the same way and
-// overlapping it by more than a sliver, is laid onto that surface, and is tagged for Remix as
+// So they are found here. Every opaque world triangle drawn this frame is filed by its plane
+// and by the cells of a 256-unit grid its bounds cover; a batch with a triangle lying in the
+// plane of an earlier one, facing the same way and overlapping it by more than a sliver, is
+// laid onto that surface, and is tagged for Remix as
 // a decal (stage 0's D3DTSS_CONSTANT = 0xD15DECA1, rtx.fixedFunctionDecalMarkerEnabled), which
 // blends it onto the surface beneath instead of fighting it. The constant is inert to the
 // rasteriser: no stage argument reads D3DTA_CONSTANT.
@@ -1008,12 +1046,28 @@ struct PlaneTriangle {
     float n[3];          // unit normal, in the triangle's own winding
     float d;             // n . p for any p in the plane
     float p[3][3];
-    int next;            // next triangle filed in the same bucket
+    float lo[3], hi[3];  // bounds
+};
+// The ground is one plane, so filing by plane alone puts every ground triangle of the frame in
+// one bucket and tests each new one against all of them, at around 11 ms a frame.
+// Two triangles that overlap share a grid cell, so each is filed under every cell its bounds
+// cover and only meets its neighbours. A triangle covering more cells than kMaxCells is filed
+// under its plane alone, and every query of that plane meets it. A triangle is also filed
+// under each plane-distance cell its distance tolerance reaches, so a query looks in one.
+struct PlaneLink {
+    int triangle;
+    int next;            // next link in the same bucket
 };
 const int kMaxPlaneTriangles = 1 << 16;
-const int kPlaneBuckets = 1 << 14;
+const int kMaxPlaneLinks = 1 << 18;
+const int kPlaneBuckets = 1 << 16;
+const float kPlaneCell = 512.0f;
+const int kMaxCells = 64;
+const int kWholePlane = 0x7fffffff;  // the cell key of a triangle filed by plane alone
 PlaneTriangle g_planeTriangles[kMaxPlaneTriangles];
 int g_planeTriangleCount = 0;
+PlaneLink g_planeLinks[kMaxPlaneLinks];
+int g_planeLinkCount = 0;
 int g_planeBucket[kPlaneBuckets];
 unsigned int g_decalBatches = 0;
 
@@ -1027,15 +1081,37 @@ const float kOverlapMargin = 0.5f;
 void ResetDecalPlanes() {
     memset(g_planeBucket, 0xff, sizeof(g_planeBucket));
     g_planeTriangleCount = 0;
+    g_planeLinkCount = 0;
 }
 
-unsigned int PlaneBucket(const float* n, int distanceCell) {
+unsigned int PlaneBucket(const float* n, int distanceCell, int cx, int cy, int cz) {
     const int qx = (int)floorf(n[0] * 16.0f + 0.5f);
     const int qy = (int)floorf(n[1] * 16.0f + 0.5f);
     const int qz = (int)floorf(n[2] * 16.0f + 0.5f);
     unsigned int h = (unsigned int)qx * 73856093u ^ (unsigned int)qy * 19349663u ^
                      (unsigned int)qz * 83492791u ^ (unsigned int)distanceCell * 2654435761u;
-    return h & (kPlaneBuckets - 1);
+    h ^= (unsigned int)cx * 2246822519u ^ (unsigned int)cy * 3266489917u ^ (unsigned int)cz * 668265263u;
+    return (h ^ (h >> 16)) & (kPlaneBuckets - 1);
+}
+
+// The grid cells covering [lo - margin, hi + margin]; false when there are more than kMaxCells.
+bool CellRange(const float* lo, const float* hi, float margin, int* first, int* last) {
+    int cells = 1;
+    for (int k = 0; k < 3; ++k) {
+        first[k] = (int)floorf((lo[k] - margin) / kPlaneCell);
+        last[k] = (int)floorf((hi[k] + margin) / kPlaneCell);
+        cells *= last[k] - first[k] + 1;
+    }
+    return cells <= kMaxCells;
+}
+
+void Link(unsigned int bucket, int triangle) {
+    if (g_planeLinkCount < kMaxPlaneLinks) {
+        PlaneLink& l = g_planeLinks[g_planeLinkCount];
+        l.triangle = triangle;
+        l.next = g_planeBucket[bucket];
+        g_planeBucket[bucket] = g_planeLinkCount++;
+    }
 }
 
 int DistanceCell(float d) {
@@ -1053,6 +1129,10 @@ bool MakePlaneTriangle(const WorldVertex& a, const WorldVertex& b, const WorldVe
         out.p[i][0] = v[i]->x; out.p[i][1] = v[i]->y; out.p[i][2] = v[i]->z;
     }
     out.d = Dot(out.n, out.p[0]);
+    for (int k = 0; k < 3; ++k) {
+        out.lo[k] = fminf(out.p[0][k], fminf(out.p[1][k], out.p[2][k]));
+        out.hi[k] = fmaxf(out.p[0][k], fmaxf(out.p[1][k], out.p[2][k]));
+    }
     return true;
 }
 
@@ -1097,19 +1177,68 @@ bool TrianglesOverlap(const PlaneTriangle& a, const PlaneTriangle& b) {
     return true;
 }
 
+bool MatchesInBucket(const PlaneTriangle& t, unsigned int bucket) {
+    for (int l = g_planeBucket[bucket]; l >= 0; l = g_planeLinks[l].next) {
+        const PlaneTriangle& o = g_planeTriangles[g_planeLinks[l].triangle];
+        if (o.lo[0] <= t.hi[0] + kCoplanarDistance && t.lo[0] <= o.hi[0] + kCoplanarDistance &&
+            o.lo[1] <= t.hi[1] + kCoplanarDistance && t.lo[1] <= o.hi[1] + kCoplanarDistance &&
+            o.lo[2] <= t.hi[2] + kCoplanarDistance && t.lo[2] <= o.hi[2] + kCoplanarDistance &&
+            Dot(o.n, t.n) >= kCoplanarCos && fabsf(o.d - t.d) <= kCoplanarDistance &&
+            TrianglesOverlap(o, t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool LiesOnEarlierGeometry(const PlaneTriangle& t) {
-    const int cell = DistanceCell(t.d);
-    for (int dc = -1; dc <= 1; ++dc) {
-        for (int i = g_planeBucket[PlaneBucket(t.n, cell + dc)]; i >= 0;
-             i = g_planeTriangles[i].next) {
+    const int plane = DistanceCell(t.d);
+    if (MatchesInBucket(t, PlaneBucket(t.n, plane, kWholePlane, kWholePlane, kWholePlane))) {
+        return true;
+    }
+    int first[3], last[3];
+    if (!CellRange(t.lo, t.hi, kCoplanarDistance, first, last)) {
+        // Too large to look up by cell: meet every triangle of the frame.
+        for (int i = 0; i < g_planeTriangleCount; ++i) {
             const PlaneTriangle& o = g_planeTriangles[i];
             if (Dot(o.n, t.n) >= kCoplanarCos && fabsf(o.d - t.d) <= kCoplanarDistance &&
                 TrianglesOverlap(o, t)) {
                 return true;
             }
         }
+        return false;
+    }
+    for (int x = first[0]; x <= last[0]; ++x) {
+        for (int y = first[1]; y <= last[1]; ++y) {
+            for (int z = first[2]; z <= last[2]; ++z) {
+                if (MatchesInBucket(t, PlaneBucket(t.n, plane, x, y, z))) {
+                    return true;
+                }
+            }
+        }
     }
     return false;
+}
+
+void FilePlaneTriangle(int index) {
+    const PlaneTriangle& t = g_planeTriangles[index];
+    const int nearPlane = DistanceCell(t.d - kCoplanarDistance);
+    const int farPlane = DistanceCell(t.d + kCoplanarDistance);
+    int first[3], last[3];
+    const bool bounded = CellRange(t.lo, t.hi, 0.0f, first, last);
+    for (int plane = nearPlane; plane <= farPlane; ++plane) {
+        if (!bounded) {
+            Link(PlaneBucket(t.n, plane, kWholePlane, kWholePlane, kWholePlane), index);
+            continue;
+        }
+        for (int x = first[0]; x <= last[0]; ++x) {
+            for (int y = first[1]; y <= last[1]; ++y) {
+                for (int z = first[2]; z <= last[2]; ++z) {
+                    Link(PlaneBucket(t.n, plane, x, y, z), index);
+                }
+            }
+        }
+    }
 }
 
 // True when any of the batch's triangles is laid onto geometry drawn earlier this frame. The
@@ -1130,10 +1259,7 @@ bool BatchIsDecal(const WorldVertex* verts, const unsigned short* indices, int i
         }
     }
     for (int i = first; i < g_planeTriangleCount; ++i) {
-        PlaneTriangle& t = g_planeTriangles[i];
-        const unsigned int bucket = PlaneBucket(t.n, DistanceCell(t.d));
-        t.next = g_planeBucket[bucket];
-        g_planeBucket[bucket] = i;
+        FilePlaneTriangle(i);
     }
     return decal;
 }
@@ -1292,6 +1418,7 @@ void Flush() {
     }
     // Indices are bytes and may point past what this batch actually uploaded; clamping the
     // declared vertex count keeps the draw inside the array either way.
+    const double started = NowMs();
     int maxIndex = 0;
     for (int i = 0; i < g_indexCount; ++i) {
         if (g_indices[i] > maxIndex) {
@@ -1466,7 +1593,9 @@ void Flush() {
     //
     // Compacting makes the hashed data exactly the drawn geometry, so a wall that does not
     // change keeps its identity from frame to frame.
+    const double stateDone = NowMs();
     const int compactCount = CompactBatch(vertexCount);
+    const double normalsDone = NowMs();
 
     // The engine's front faces are counter-clockwise on screen, as in the original.
     //
@@ -1487,9 +1616,15 @@ void Flush() {
         DumpBatch(compactCount, tex != 0, cull, sky, decal);
     }
 
+    const double decalsDone = NowMs();
     Device::DrawTriangles(g_compactVertices, sizeof(WorldVertex), compactCount,
                           g_compactIndices, g_indexCount);
     g_indexCount = 0;
+    g_cost.state += stateDone - started;
+    g_cost.normals += normalsDone - stateDone;
+    g_cost.decals += decalsDone - normalsDone;
+    g_cost.draw += NowMs() - decalsDone;
+    ++g_cost.flushes;
 }
 
 void SetMatrixFromList(const float* src, unsigned char flags) {
@@ -1957,6 +2092,13 @@ void Geometry::BeginFrame() {
 
 void Geometry::EndFrame() {
     Flush();
+    if (++g_cost.frames == kCostFrames) {
+        const double f = (double)g_cost.frames;
+        LogLine("    batch path per frame: %.0f flushes; state %.2f ms, normals %.2f ms, decals %.2f "
+                "ms, draw calls %.2f ms", g_cost.flushes / f, g_cost.state / f, g_cost.normals / f,
+                g_cost.decals / f, g_cost.draw / f);
+        g_cost = {};
+    }
     if (g_dumpingFrame) {
         g_dumpingFrame = false;
         if (g_dumpObj) {

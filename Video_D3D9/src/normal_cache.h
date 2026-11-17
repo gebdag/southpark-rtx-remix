@@ -19,7 +19,8 @@ void BeginFrame(unsigned int frame);
 // Records a face (corners in world space, in its winding).
 void AddFace(const float* a, const float* b, const float* c);
 
-// The smoothed normal at corner `corner` (0..2) of the recorded face a, b, c.
+// The smoothed normals at the three corners of the recorded face a, b, c, in that order (not
+// normalised). False when the face is not in the cache.
 //
 // An edge is sharp when the faces on either side of it meet at more than the crease angle
 // (`creaseCos` is its cosine). The corner averages the faces it reaches around its point
@@ -28,9 +29,10 @@ void AddFace(const float* a, const float* b, const float* c);
 // differently the faces around them lean. Weighting by angle rather than area keeps one long
 // triangle from pulling the normal of every corner it touches.
 //
-// A face not in the cache, or a result further than the crease angle from the face, gives the
-// face's own normal.
-void CornerNormal(const float* a, const float* b, const float* c, int corner, float creaseCos,
-                  float* out);
+// A result further than the crease angle from the face gives the face's own normal.
+//
+// The world is static, so a face keeps its three results until a face appears at or leaves one
+// of its corner points; only then are they walked again.
+bool FaceNormals(const float* a, const float* b, const float* c, float creaseCos, float out[3][3]);
 
 } // namespace NormalCache

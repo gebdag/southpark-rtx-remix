@@ -21,6 +21,11 @@ struct Face {
     unsigned long long corners[3];
     unsigned int lastSeen;
     bool live;
+    // The smoothed normal at each corner, valid while `stale` is false and the crease is the
+    // one it was computed for.
+    float smoothed[3][3];
+    float smoothedCrease;
+    bool stale;
 };
 
 std::vector<Face> g_faces;
@@ -99,6 +104,19 @@ float AngleAt(const Face& f, unsigned long long corner) {
     return 0.0f;
 }
 
+// A face arrived at or left these points: the faces around them walk again.
+void MarkAround(const unsigned long long* corners) {
+    for (int k = 0; k < 3; ++k) {
+        auto it = g_facesAt.find(corners[k]);
+        if (it == g_facesAt.end()) {
+            continue;
+        }
+        for (int index : it->second) {
+            g_faces[index].stale = true;
+        }
+    }
+}
+
 void Unlink(int index) {
     Face& f = g_faces[index];
     for (unsigned long long corner : f.corners) {
@@ -121,6 +139,7 @@ void Unlink(int index) {
     g_faceByKey.erase(FaceKey(f.corners));
     f.live = false;
     g_free.push_back(index);
+    MarkAround(f.corners);
 }
 
 } // namespace
@@ -168,6 +187,8 @@ void NormalCache::AddFace(const float* a, const float* b, const float* c) {
     }
     f.lastSeen = g_frame;
     f.live = true;
+    f.stale = true;
+    f.smoothedCrease = 0.0f;
 
     int index;
     if (!g_free.empty()) {
@@ -182,36 +203,30 @@ void NormalCache::AddFace(const float* a, const float* b, const float* c) {
     for (unsigned long long corner : f.corners) {
         g_facesAt[corner].push_back(index);
     }
+    MarkAround(f.corners);
 }
 
-void NormalCache::CornerNormal(const float* a, const float* b, const float* c, int corner,
-                               float creaseCos, float* out) {
-    unsigned long long corners[3] = {CornerKey(a), CornerKey(b), CornerKey(c)};
-    auto own = g_faceByKey.find(FaceKey(corners));
-    auto fan = g_facesAt.find(corners[corner]);
-    if (own == g_faceByKey.end() || fan == g_facesAt.end()) {
-        const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-        const float e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-        out[0] = e1[1] * e2[2] - e1[2] * e2[1];
-        out[1] = e1[2] * e2[0] - e1[0] * e2[2];
-        out[2] = e1[0] * e2[1] - e1[1] * e2[0];
+namespace {
+
+// The walk around one point of face `own`: the faces reached without crossing a sharp edge,
+// angle-weighted.
+void WalkCorner(int own, unsigned long long point, float creaseCos, float* out) {
+    out[0] = out[1] = out[2] = 0.0f;
+    auto fan = g_facesAt.find(point);
+    if (fan == g_facesAt.end()) {
         return;
     }
-    const unsigned long long point = corners[corner];
     const std::vector<int>& around = fan->second;
-
-    // A walk over the faces around the point, stepping only across smooth edges.
     const int kMaxFan = 64;
     int reached[kMaxFan];
     int count = 0;
-    reached[count++] = own->second;
-    float sum[3] = {};
+    reached[count++] = own;
     for (int next = 0; next < count; ++next) {
         const Face& f = g_faces[reached[next]];
         const float w = AngleAt(f, point);
-        sum[0] += f.unit[0] * w;
-        sum[1] += f.unit[1] * w;
-        sum[2] += f.unit[2] * w;
+        out[0] += f.unit[0] * w;
+        out[1] += f.unit[1] * w;
+        out[2] += f.unit[2] * w;
         for (int index : around) {
             if (count == kMaxFan) {
                 break;
@@ -226,12 +241,40 @@ void NormalCache::CornerNormal(const float* a, const float* b, const float* c, i
             }
         }
     }
-
-    const float* unit = g_faces[own->second].unit;
-    const float length = Length(sum);
-    if (length > 1e-10f && Dot(sum, unit) >= creaseCos * length) {
-        out[0] = sum[0] / length; out[1] = sum[1] / length; out[2] = sum[2] / length;
-    } else {
-        out[0] = unit[0]; out[1] = unit[1]; out[2] = unit[2];
+    const float length = Length(out);
+    if (!(length > 1e-10f) || Dot(out, g_faces[own].unit) < creaseCos * length) {
+        out[0] = g_faces[own].unit[0];
+        out[1] = g_faces[own].unit[1];
+        out[2] = g_faces[own].unit[2];
     }
+}
+
+} // namespace
+
+bool NormalCache::FaceNormals(const float* a, const float* b, const float* c, float creaseCos,
+                              float out[3][3]) {
+    const unsigned long long corners[3] = {CornerKey(a), CornerKey(b), CornerKey(c)};
+    auto found = g_faceByKey.find(FaceKey(corners));
+    if (found == g_faceByKey.end()) {
+        return false;
+    }
+    Face& f = g_faces[found->second];
+    if (f.stale || f.smoothedCrease != creaseCos) {
+        for (int k = 0; k < 3; ++k) {
+            WalkCorner(found->second, f.corners[k], creaseCos, f.smoothed[k]);
+        }
+        f.stale = false;
+        f.smoothedCrease = creaseCos;
+    }
+    // The cached face may have been recorded starting from another corner.
+    for (int k = 0; k < 3; ++k) {
+        int j = 0;
+        while (j < 2 && f.corners[j] != corners[k]) {
+            ++j;
+        }
+        out[k][0] = f.smoothed[j][0];
+        out[k][1] = f.smoothed[j][1];
+        out[k][2] = f.smoothed[j][2];
+    }
+    return true;
 }
