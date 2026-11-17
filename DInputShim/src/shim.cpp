@@ -32,6 +32,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "pad.h"
+
 namespace {
 
 // --------------------------------------------------------------------------- logging
@@ -66,6 +68,9 @@ bool g_forceNonExclusive = true;
 bool g_suspendWhenUnfocused = true;
 bool g_menuSuspendsInput = true;
 bool g_keepCursorVisible = true;
+bool g_controller = true;
+void* g_keyboard = 0;
+void* g_mouse = 0;
 
 bool ReadBool(const char* section, const char* key, bool fallback) {
     return GetPrivateProfileIntA(section, key, fallback ? 1 : 0, g_iniPath) != 0;
@@ -135,6 +140,7 @@ int g_devicesPatched = 0;
 int g_coopCallsRewritten = 0;
 long g_statesBlocked = 0;
 long g_reacquires = 0;
+long g_deferredAcquires = 0;
 
 bool GameHasFocus() {
     const HWND fg = GetForegroundWindow();
@@ -191,6 +197,7 @@ bool InputBlocked() {
 typedef HRESULT (STDMETHODCALLTYPE *QueryInterfaceFn)(void*, const IID&, void**);
 typedef ULONG (STDMETHODCALLTYPE *ReleaseFn)(void*);
 typedef HRESULT (STDMETHODCALLTYPE *CreateDeviceFn)(void*, const GUID*, void**, void*);
+typedef HRESULT (STDMETHODCALLTYPE *EnumDevicesFn)(void*, DWORD, void*, void*, DWORD);
 typedef HRESULT (STDMETHODCALLTYPE *AcquireFn)(void*);
 typedef HRESULT (STDMETHODCALLTYPE *UnacquireFn)(void*);
 typedef HRESULT (STDMETHODCALLTYPE *SetCooperativeLevelFn)(void*, HWND, DWORD);
@@ -201,6 +208,7 @@ typedef HRESULT (STDMETHODCALLTYPE *GetDeviceDataFn)(void*, DWORD, void*, DWORD*
 const int kSlotQueryInterface      = 0;
 const int kSlotRelease             = 2;
 const int kSlotCreateDevice        = 3;    // IDirectInput
+const int kSlotEnumDevices         = 4;
 const int kSlotAcquire             = 7;    // IDirectInputDevice from here down
 const int kSlotUnacquire           = 8;
 const int kSlotGetDeviceState      = 9;
@@ -420,6 +428,9 @@ HRESULT STDMETHODCALLTYPE HookedSetCooperativeLevel(void* self, HWND window, DWO
         return E_FAIL;
     }
     SetCooperativeLevelFn original = (SetCooperativeLevelFn)v->original[kSlotSetCooperativeLevel];
+    if (Pad::IsOwnDevice(self)) {
+        return original(self, window, flags);
+    }
 
     DWORD effective = flags;
     if (g_forceNonExclusive) {
@@ -452,6 +463,26 @@ HRESULT STDMETHODCALLTYPE HookedSetCooperativeLevel(void* self, HWND window, DWO
     }
     if (SUCCEEDED(hr)) {
         RememberLevel(self, applied);
+    }
+    return hr;
+}
+
+// The game asks for background access to its keyboard, which can always be acquired. Made
+// foreground above, an Acquire fails while another window is in front -- and if that happens
+// while the game sets up input, it gives up on the rest: no mouse, no joystick. A refusal for
+// that reason alone is reported as success; the reads below reacquire on demand.
+const HRESULT DIERR_OTHERAPPHASPRIO = (HRESULT)0x80070005L;
+
+HRESULT STDMETHODCALLTYPE HookedAcquire(void* self) {
+    Vtable* v = FindVtable(self);
+    if (!v) {
+        return E_FAIL;
+    }
+    AcquireFn original = (AcquireFn)v->original[kSlotAcquire];
+    const HRESULT hr = original(self);
+    if (hr == DIERR_OTHERAPPHASPRIO && g_forceNonExclusive && !Pad::IsOwnDevice(self)) {
+        InterlockedIncrement(&g_deferredAcquires);
+        return S_OK;
     }
     return hr;
 }
@@ -512,11 +543,14 @@ HRESULT STDMETHODCALLTYPE HookedGetDeviceState(void* self, DWORD size, void* dat
     if (!v) {
         return E_FAIL;
     }
+    GetDeviceStateFn original = (GetDeviceStateFn)v->original[kSlotGetDeviceState];
+    if (Pad::IsOwnDevice(self)) {
+        return original(self, size, data);
+    }
     if (InputBlocked()) {
         InterlockedIncrement(&g_statesBlocked);
         return ReportNoState(data, size);
     }
-    GetDeviceStateFn original = (GetDeviceStateFn)v->original[kSlotGetDeviceState];
     HRESULT hr = original(self, size, data);
     if (IsLost(hr) && Reacquire(v, self)) {
         hr = original(self, size, data);
@@ -524,6 +558,11 @@ HRESULT STDMETHODCALLTYPE HookedGetDeviceState(void* self, DWORD size, void* dat
     if (IsLost(hr)) {
         InterlockedIncrement(&g_unacquirable);
         return ReportNoState(data, size);
+    }
+    // DIMOUSESTATE starts with lX, lY.
+    if (SUCCEEDED(hr) && self == g_mouse && data && size >= 2 * sizeof(LONG) && Pad::Installed() &&
+        (((const LONG*)data)[0] != 0 || ((const LONG*)data)[1] != 0)) {
+        Pad::OnMouseMoved();
     }
     return hr;
 }
@@ -535,6 +574,9 @@ HRESULT STDMETHODCALLTYPE HookedGetDeviceData(void* self, DWORD objectSize, void
         return E_FAIL;
     }
     GetDeviceDataFn original = (GetDeviceDataFn)v->original[kSlotGetDeviceData];
+    if (Pad::IsOwnDevice(self)) {
+        return original(self, objectSize, buffer, inOut, flags);
+    }
     if (InputBlocked()) {
         // Buffered events keep queueing while the game is not looking and would replay as a
         // burst on the way back, so flush the queue: passing a null buffer with an unlimited
@@ -555,6 +597,9 @@ HRESULT STDMETHODCALLTYPE HookedGetDeviceData(void* self, DWORD objectSize, void
     if (IsLost(hr)) {
         InterlockedIncrement(&g_unacquirable);
         return ReportNoData(inOut);
+    }
+    if (SUCCEEDED(hr) && self == g_keyboard && buffer && Pad::Installed()) {
+        Pad::AddKeyEvents(buffer, objectSize, inOut, capacity);
     }
     return hr;
 }
@@ -597,10 +642,7 @@ void PatchDevice(void* device) {
     if (!v) {
         return;
     }
-    // Acquire is not hooked, only remembered: the recovery path above needs to call it.
-    if (!v->original[kSlotAcquire] && !IsBadReadPtr(v->table, (kSlotAcquire + 1) * sizeof(void*))) {
-        v->original[kSlotAcquire] = v->table[kSlotAcquire];
-    }
+    PatchMethod(v, kSlotAcquire, (void*)&HookedAcquire);
     PatchMethod(v, kSlotSetCooperativeLevel, (void*)&HookedSetCooperativeLevel);
     PatchMethod(v, kSlotGetDeviceState, (void*)&HookedGetDeviceState);
     PatchMethod(v, kSlotGetDeviceData, (void*)&HookedGetDeviceData);
@@ -614,18 +656,53 @@ void PatchDevice(void* device) {
 
 // ----------------------------------------------------------------------- factory hooks
 
+// The game's keyboard, which the pad layer adds Esc to (Start). Spelled out rather than taken
+// from dxguid.lib for the same reason as kIidUnknown.
+const GUID kGuidSysKeyboard = { 0x6F1D2B61, 0xD5A0, 0x11CF,
+                                { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+// The game's mouse, whose movement hands the view back from the pad (Pad::OnMouseMoved).
+const GUID kGuidSysMouse = { 0x6F1D2B60, 0xD5A0, 0x11CF,
+                             { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+
 HRESULT STDMETHODCALLTYPE HookedCreateDevice(void* self, const GUID* guid, void** out,
                                              void* outer) {
     Vtable* v = FindVtable(self);
     if (!v) {
         return E_FAIL;
     }
+    if (Pad::Installed() && Pad::IsVirtualJoystick(guid)) {
+        return Pad::CreateVirtualJoystick(out);
+    }
     CreateDeviceFn original = (CreateDeviceFn)v->original[kSlotCreateDevice];
     HRESULT hr = original(self, guid, out, outer);
     if (SUCCEEDED(hr) && out && *out) {
         PatchDevice(*out);
+        if (guid && IsEqualGUID(*guid, kGuidSysKeyboard)) {
+            g_keyboard = *out;
+        }
+        if (guid && IsEqualGUID(*guid, kGuidSysMouse)) {
+            g_mouse = *out;
+        }
     }
     return hr;
+}
+
+// With the pad layer on, the game is offered the one virtual joystick (pad.cpp) instead of the
+// real ones, which the layer reads itself.
+const DWORD kDevTypeJoystick = 4;   // DIDEVTYPE_JOYSTICK
+
+HRESULT STDMETHODCALLTYPE HookedEnumDevices(void* self, DWORD type, void* callback, void* context,
+                                            DWORD flags) {
+    Vtable* v = FindVtable(self);
+    if (!v) {
+        return E_FAIL;
+    }
+    if (Pad::Installed() && !Pad::IsOwnFactory(self) && (type & 0xff) == kDevTypeJoystick && callback) {
+        Pad::EnumerateJoysticks(callback, context);
+        return S_OK;
+    }
+    EnumDevicesFn original = (EnumDevicesFn)v->original[kSlotEnumDevices];
+    return original(self, type, callback, context, flags);
 }
 
 HRESULT STDMETHODCALLTYPE HookedFactoryQueryInterface(void* self, const IID& iid, void** out) {
@@ -651,6 +728,7 @@ void PatchFactory(void* factory) {
         return;
     }
     PatchMethod(v, kSlotCreateDevice, (void*)&HookedCreateDevice);
+    PatchMethod(v, kSlotEnumDevices, (void*)&HookedEnumDevices);
     PatchMethod(v, kSlotQueryInterface, (void*)&HookedFactoryQueryInterface);
     if (fresh) {
         Log("IDirectInput vtable %p patched", (void*)v->table);
@@ -786,6 +864,7 @@ void LoadConfig(HMODULE self) {
     g_suspendWhenUnfocused = ReadBool("Input", "SuspendInputWhenUnfocused", true);
     g_menuSuspendsInput    = ReadBool("Input", "RemixMenuSuspendsInput", true);
     g_keepCursorVisible    = ReadBool("Input", "KeepCursorVisible", true);
+    g_controller           = ReadBool("Input", "Controller", true);
 }
 
 } // namespace
@@ -805,6 +884,10 @@ extern "C" HRESULT WINAPI DirectInputCreateA(HINSTANCE inst, DWORD version, void
         (unsigned long)hr);
     if (SUCCEEDED(hr) && out && *out) {
         PatchFactory(*out);
+        // The game's code is decrypted by now, and it is about to enumerate joysticks.
+        if (g_controller) {
+            Pad::Install(g_realCreateA, &InputBlocked, &Log);
+        }
     }
     return hr;
 }
@@ -913,10 +996,10 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
         PatchExecutableImports();
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("=== DInputShim unloading: %d device vtables patched, %d cooperative levels "
-            "rewritten, %ld reads blocked, %ld reacquires, %ld rebinds, %ld reads of an "
-            "unacquirable device ===",
-            g_devicesPatched, g_coopCallsRewritten, g_statesBlocked, g_reacquires, g_rebinds,
-            g_unacquirable);
+            "rewritten, %ld reads blocked, %ld acquires deferred to the first read, %ld "
+            "reacquires, %ld rebinds, %ld reads of an unacquirable device ===",
+            g_devicesPatched, g_coopCallsRewritten, g_statesBlocked, g_deferredAcquires,
+            g_reacquires, g_rebinds, g_unacquirable);
         if (g_menuHook) {
             UnhookWindowsHookEx(g_menuHook);
         }
