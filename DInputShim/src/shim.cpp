@@ -33,7 +33,9 @@
 #include <string.h>
 
 #include "cdaudio.h"
+#include "game_build.h"
 #include "pad.h"
+#include "rawmouse.h"
 
 namespace {
 
@@ -72,7 +74,36 @@ bool g_menuSuspendsInput = true;
 bool g_keepCursorVisible = true;
 bool g_controller = true;
 void* g_keyboard = 0;
-void* g_mouse = 0;
+
+// The game's mouse: the device CreateDevice returns for GUID_SysMouse and every interface
+// QueryInterface hands out for it, each a separate object the game may read through.
+const int kMaxMice = 8;
+void* g_mice[kMaxMice];
+int g_mouseCount = 0;
+
+bool IsMouse(void* device) {
+    for (int i = 0; i < g_mouseCount; ++i) {
+        if (g_mice[i] == device) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void AddMouse(void* device) {
+    if (!IsMouse(device) && g_mouseCount < kMaxMice) {
+        g_mice[g_mouseCount++] = device;
+    }
+}
+
+void ForgetMouse(void* device) {
+    for (int i = 0; i < g_mouseCount; ++i) {
+        if (g_mice[i] == device) {
+            g_mice[i] = g_mice[--g_mouseCount];
+            return;
+        }
+    }
+}
 
 bool ReadBool(const char* section, const char* key, bool fallback) {
     return GetPrivateProfileIntA(section, key, fallback ? 1 : 0, g_iniPath) != 0;
@@ -549,9 +580,21 @@ HRESULT STDMETHODCALLTYPE HookedGetDeviceState(void* self, DWORD size, void* dat
     if (Pad::IsOwnDevice(self)) {
         return original(self, size, data);
     }
+    const bool mouse = IsMouse(self) && RawMouse::Running();
     if (InputBlocked()) {
+        if (mouse) {
+            RawMouse::Discard();
+        }
         InterlockedIncrement(&g_statesBlocked);
         return ReportNoState(data, size);
+    }
+    if (mouse && RawMouse::Read(data, size)) {
+        // DIMOUSESTATE starts with lX, lY.
+        const LONG* axes = (const LONG*)data;
+        if (Pad::Installed() && (axes[0] != 0 || axes[1] != 0)) {
+            Pad::OnMouseMoved();
+        }
+        return S_OK;
     }
     HRESULT hr = original(self, size, data);
     if (IsLost(hr) && Reacquire(v, self)) {
@@ -560,11 +603,6 @@ HRESULT STDMETHODCALLTYPE HookedGetDeviceState(void* self, DWORD size, void* dat
     if (IsLost(hr)) {
         InterlockedIncrement(&g_unacquirable);
         return ReportNoState(data, size);
-    }
-    // DIMOUSESTATE starts with lX, lY.
-    if (SUCCEEDED(hr) && self == g_mouse && data && size >= 2 * sizeof(LONG) && Pad::Installed() &&
-        (((const LONG*)data)[0] != 0 || ((const LONG*)data)[1] != 0)) {
-        Pad::OnMouseMoved();
     }
     return hr;
 }
@@ -617,6 +655,9 @@ HRESULT STDMETHODCALLTYPE HookedDeviceQueryInterface(void* self, const IID& iid,
     HRESULT hr = original(self, iid, out);
     if (SUCCEEDED(hr) && out && *out && !IsUnknownIid(iid)) {
         PatchDevice(*out);
+        if (IsMouse(self)) {
+            AddMouse(*out);
+        }
     }
     return hr;
 }
@@ -631,6 +672,7 @@ ULONG STDMETHODCALLTYPE HookedDeviceRelease(void* self) {
     const ULONG remaining = original(self);
     if (remaining == 0) {
         ForgetDevice(self);
+        ForgetMouse(self);
     }
     return remaining;
 }
@@ -662,9 +704,34 @@ void PatchDevice(void* device) {
 // from dxguid.lib for the same reason as kIidUnknown.
 const GUID kGuidSysKeyboard = { 0x6F1D2B61, 0xD5A0, 0x11CF,
                                 { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
-// The game's mouse, whose movement hands the view back from the pad (Pad::OnMouseMoved).
+// The game's mouse, read through RawMouse; its movement also hands the view back from the pad
+// (Pad::OnMouseMoved).
 const GUID kGuidSysMouse = { 0x6F1D2B60, 0xD5A0, 0x11CF,
                              { 0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00 } };
+
+// The game smooths its mouse (FUN_00476910): each axis becomes the average speed of the last N
+// reads times the time since the last read, measured with GetTickCount, which advances in 15-16
+// ms steps. Above about 62 frames a second most reads see no tick pass, and the smoothed movement
+// comes out as zero -- the view turns in jerks or not at all. N is 1 and nothing in the game
+// changes it; 0 skips the smoothing, so the game uses the mouse as read. Its address comes from
+// the instruction that loads it (mov ebx, [N] at 0x4769a8).
+void DisableMouseSmoothing() {
+    const unsigned char* site = (const unsigned char*)GameBuild::Place(0x004769a8);
+    if (!site || IsBadReadPtr(site, 6) || site[0] != 0x8b || site[1] != 0x1d) {
+        Log("mouse smoothing: the smoothing code is not where expected -- left on");
+        return;
+    }
+    LONG* length = *(LONG* const*)(site + 2);
+    DWORD old;
+    if (IsBadReadPtr(length, sizeof(LONG)) || *length != 1 ||
+        !VirtualProtect(length, sizeof(LONG), PAGE_READWRITE, &old)) {
+        Log("mouse smoothing: length at %p is not the expected 1 -- left on", (void*)length);
+        return;
+    }
+    *length = 0;
+    VirtualProtect(length, sizeof(LONG), old, &old);
+    Log("mouse smoothing off (length at %p)", (void*)length);
+}
 
 HRESULT STDMETHODCALLTYPE HookedCreateDevice(void* self, const GUID* guid, void** out,
                                              void* outer) {
@@ -683,7 +750,14 @@ HRESULT STDMETHODCALLTYPE HookedCreateDevice(void* self, const GUID* guid, void*
             g_keyboard = *out;
         }
         if (guid && IsEqualGUID(*guid, kGuidSysMouse)) {
-            g_mouse = *out;
+            AddMouse(*out);
+            Log("mouse %p created", *out);
+            RawMouse::Start(&Log);
+            static bool smoothingChecked = false;
+            if (!smoothingChecked) {
+                smoothingChecked = true;
+                DisableMouseSmoothing();
+            }
         }
     }
     return hr;
@@ -1008,9 +1082,9 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("=== DInputShim unloading: %d device vtables patched, %d cooperative levels "
             "rewritten, %ld reads blocked, %ld acquires deferred to the first read, %ld "
-            "reacquires, %ld rebinds, %ld reads of an unacquirable device ===",
+            "reacquires, %ld rebinds, %ld reads of an unacquirable device, %ld raw mouse events ===",
             g_devicesPatched, g_coopCallsRewritten, g_statesBlocked, g_deferredAcquires,
-            g_reacquires, g_rebinds, g_unacquirable);
+            g_reacquires, g_rebinds, g_unacquirable, RawMouse::Events());
         if (g_menuHook) {
             UnhookWindowsHookEx(g_menuHook);
         }
