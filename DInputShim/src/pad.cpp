@@ -71,7 +71,6 @@ volatile LONG g_diFoundReady = 0;      // g_diFound* hold a pad for the game thr
 GUID g_diFoundInstance;
 WORD g_diFoundVendor = 0;
 char g_diFoundName[MAX_PATH];
-HANDLE g_scanThread = 0;
 void* volatile g_scanFactory = 0;      // the search thread's own DirectInput
 
 void LoadXInput() {
@@ -378,10 +377,21 @@ void ReadPad() {
         // Here rather than at install: loaded inside the game's DirectInputCreateA, XInput
         // makes the game's mouse fail to set up right after.
         LoadXInput();
-        g_scanThread = CreateThread(0, 0, &ScanForPads, 0, 0, 0);
+        if (HANDLE thread = CreateThread(0, 0, &ScanForPads, 0, 0, 0)) {
+            CloseHandle(thread);
+        } else {
+            LOG("pad: no search thread (error %lu) -- pads connected later are not found",
+                (unsigned long)GetLastError());
+        }
     }
     PadState s;
-    g_haveState = ReadXInput(s) || ReadDirectInput(s);
+    if (ReadXInput(s)) {
+        // An XInput pad is in use, so the search stops looking for DirectInput ones.
+        InterlockedExchange(&g_wantDirectInput, 0);
+        g_haveState = true;
+    } else {
+        g_haveState = ReadDirectInput(s);
+    }
     if (g_haveState) {
         ApplyDeadZone(s.lx, s.ly);
         ApplyDeadZone(s.rx, s.ry);

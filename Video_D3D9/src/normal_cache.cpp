@@ -26,6 +26,8 @@ struct Face {
     float smoothed[3][3];
     float smoothedCrease;
     bool stale;
+    float p[3][3];          // the corners, world space
+    float lo[2], hi[2];     // footprint in X and Z
 };
 
 std::vector<Face> g_faces;
@@ -188,6 +190,12 @@ void NormalCache::AddFace(const float* a, const float* b, const float* c) {
     f.lastSeen = g_frame;
     f.live = true;
     f.stale = true;
+    const float* corner[3] = {a, b, c};
+    for (int k = 0; k < 3; ++k) {
+        f.p[k][0] = corner[k][0]; f.p[k][1] = corner[k][1]; f.p[k][2] = corner[k][2];
+    }
+    f.lo[0] = fminf(a[0], fminf(b[0], c[0])); f.hi[0] = fmaxf(a[0], fmaxf(b[0], c[0]));
+    f.lo[1] = fminf(a[2], fminf(b[2], c[2])); f.hi[1] = fmaxf(a[2], fmaxf(b[2], c[2]));
     f.smoothedCrease = 0.0f;
 
     int index;
@@ -277,4 +285,71 @@ bool NormalCache::FaceNormals(const float* a, const float* b, const float* c, fl
         out[k][2] = f.smoothed[j][2];
     }
     return true;
+}
+
+namespace {
+
+// Geometry further above a point than this is sky or cloud layer, not a roof.
+const float kCoverReach = 2048.0f;
+const int kMaxCoverPoints = 16;
+
+// Where the vertical line through (x, z) meets face f, if it does.
+bool HeightAt(const Face& f, float x, float z, float* y) {
+    const float* a = f.p[0];
+    const float* b = f.p[1];
+    const float* c = f.p[2];
+    const float det = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
+    if (fabsf(det) < 1e-6f) {
+        return false;   // a wall: no footprint
+    }
+    const float u = ((b[2] - c[2]) * (x - c[0]) + (c[0] - b[0]) * (z - c[2])) / det;
+    const float v = ((c[2] - a[2]) * (x - c[0]) + (a[0] - c[0]) * (z - c[2])) / det;
+    const float w = 1.0f - u - v;
+    if (u < 0.0f || v < 0.0f || w < 0.0f) {
+        return false;
+    }
+    *y = u * a[1] + v * b[1] + w * c[1];
+    return true;
+}
+
+} // namespace
+
+int NormalCache::CoverAbove(const float* points, int count) {
+    count = count < kMaxCoverPoints ? count : kMaxCoverPoints;
+    if (count <= 0) {
+        return -1;
+    }
+    float lo[2] = {points[0], points[2]};
+    float hi[2] = {points[0], points[2]};
+    for (int i = 1; i < count; ++i) {
+        lo[0] = fminf(lo[0], points[i * 3]);     hi[0] = fmaxf(hi[0], points[i * 3]);
+        lo[1] = fminf(lo[1], points[i * 3 + 2]); hi[1] = fmaxf(hi[1], points[i * 3 + 2]);
+    }
+    bool covered[kMaxCoverPoints] = {};
+    bool known = false;
+    for (const Face& f : g_faces) {
+        if (!f.live || f.hi[0] < lo[0] || f.lo[0] > hi[0] || f.hi[1] < lo[1] || f.lo[1] > hi[1]) {
+            continue;
+        }
+        for (int i = 0; i < count; ++i) {
+            const float* q = points + i * 3;
+            float y;
+            if (covered[i] || q[0] < f.lo[0] || q[0] > f.hi[0] || q[2] < f.lo[1] || q[2] > f.hi[1] ||
+                !HeightAt(f, q[0], q[2], &y)) {
+                continue;
+            }
+            known = true;
+            if (y > q[1] + 1.0f && y < q[1] + kCoverReach) {
+                covered[i] = true;
+            }
+        }
+    }
+    if (!known) {
+        return -1;
+    }
+    int n = 0;
+    for (int i = 0; i < count; ++i) {
+        n += covered[i] ? 1 : 0;
+    }
+    return n;
 }

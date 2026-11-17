@@ -25,6 +25,7 @@
 #include "texture.h"
 #include "window.h"
 #include "geometry.h"
+#include "normal_cache.h"
 #include "config.h"
 
 #include <stdio.h>
@@ -516,6 +517,13 @@ GFXAPI void GFXDLL_BeginScene(void) {
     if (g_original.beginScene) {
         g_original.beginScene();
     }
+}
+
+// For the Remix proxy (d3d9.dll): how many of `count` points (x, y, z each) have level
+// geometry above them, or -1 when the renderer holds no geometry around any of them. The proxy
+// calls it from Present, on the thread that renders.
+extern "C" __declspec(dllexport) int __cdecl SouthPark_CoverAbove(const float* points, int count) {
+    return NormalCache::CoverAbove(points, count);
 }
 
 GFXAPI void GFXDLL_EndScene(void) {

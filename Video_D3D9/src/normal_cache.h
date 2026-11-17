@@ -35,4 +35,10 @@ void AddFace(const float* a, const float* b, const float* c);
 // of its corner points; only then are they walked again.
 bool FaceNormals(const float* a, const float* b, const float* c, float creaseCos, float out[3][3]);
 
+// The cache is also the renderer's record of the level around the camera. For `count` points
+// (x, y, z each), how many have a recorded face above them: one whose footprint in X and Z
+// covers the point and that passes between a unit and kCoverReach above it. -1 when no recorded
+// face covers any of the points' footprints at all -- nothing is known there.
+int CoverAbove(const float* points, int count);
+
 } // namespace NormalCache

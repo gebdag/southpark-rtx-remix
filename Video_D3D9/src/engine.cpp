@@ -375,11 +375,17 @@ bool g_cutsceneTestKnown = false;
 // running frame-rate estimate (0x004d4d90, ten frames of 1000 / elapsed) is above 20:
 // Sleep(1000 * (0.05 - 1 / estimate)). The estimate counts the sleep itself, so it settles
 // near 2000 / (50 + work) -- about 38 fps -- and the company logos and the intro, which are
-// cutscenes, run there however fast the machine is. Cutscenes advance by real time (the step
-// at 0x0044469d is elapsed milliseconds x 15 / 1000, up to four steps), so skipping the sleep
-// gives more frames of the same cutscene, not a faster one.
-const unsigned int kCutsceneSleepBranch = 0x00444701;
-const unsigned char kCutsceneSleepCode[2] = {0x74, 0x37};   // je 0x0044473a (skip the sleep)
+// cutscenes, run there however fast the machine is. Cutscenes advance by real time (their step
+// at 0x004446ac is the elapsed time of the engine's timeGetTime clock, read once a pass, capped
+// at four steps), so skipping the sleep gives more frames of the same cutscene, not a faster
+// one.
+const unsigned int kCutsceneSleepTest = 0x004446FF;
+const unsigned char kCutsceneSleepCode[10] = {
+    0x85, 0xC0,                          // test eax, eax   (the cutscene test's answer)
+    0x74, 0x37,                          // je   0x0044473a (no cutscene: skip the sleep)
+    0xD9, 0x05, 0x90, 0x4D, 0x4D, 0x00,  // fld  [0x004d4d90] (the frame-rate estimate)
+};
+const unsigned int kCutsceneSleepBranch = kCutsceneSleepTest + 2;
 
 // ------------------------------------------------------------------- camera aspect ratio
 //
@@ -934,7 +940,7 @@ void Engine::Install() {
 
     if (!Config::LimitCutscenes()) {
         const unsigned char always = 0xEB;                   // jmp 0x0044473a
-        if (Verify(kCutsceneSleepBranch, kCutsceneSleepCode, sizeof(kCutsceneSleepCode)) &&
+        if (Verify(kCutsceneSleepTest, kCutsceneSleepCode, sizeof(kCutsceneSleepCode)) &&
             Overwrite(kCutsceneSleepBranch, &always, 1)) {
             LogLine("    engine: cutscenes run unthrottled (LimitCutscenes=0)");
         } else {
