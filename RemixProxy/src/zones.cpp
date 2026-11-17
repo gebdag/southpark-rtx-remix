@@ -106,12 +106,15 @@ Zones::Zone ReadRecord(unsigned int record) {
     for (int c = 0; c < 3; ++c) {
         z.centre[c] = toWorld[12 + c] / w;
     }
+    float volume = 1.0f;
     for (int row = 0; row < 3; ++row) {
         const float semiAxis = Length(toWorld + row * 4);
         if (semiAxis > z.radius) {
             z.radius = semiAxis;
         }
+        volume *= semiAxis;
     }
+    z.reach = cbrtf(volume);
     if (z.shape == Zones::Box) {
         // Stored in zone space; directions take the zone -> world matrix without translation.
         const float* d = (const float*)(record + 0x1c);

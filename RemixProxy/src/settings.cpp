@@ -14,16 +14,16 @@ struct Setting {
     float value;
     float minimum;
     float maximum;
+    bool dirty;      // changed on the panel, not yet written
 };
 
 // Defaults match the modules that read them.
-Setting g_turn = {"Input", "PadTurnSensitivity", 0.6f, 0.1f, 1.0f};
-Setting g_look = {"Input", "PadLookSensitivity", 1.0f, 0.3f, 1.0f};
-Setting g_fov = {"Display", "FieldOfView", 1.0f, 0.7f, 1.6f};
+Setting g_turn = {"Input", "PadTurnSensitivity", 0.6f, 0.1f, 1.0f, false};
+Setting g_look = {"Input", "PadLookSensitivity", 1.0f, 0.3f, 1.0f, false};
+Setting g_fov = {"Display", "FieldOfView", 1.0f, 0.7f, 1.6f, false};
 Setting* const g_settings[] = {&g_turn, &g_look, &g_fov};
 
 char g_ini[MAX_PATH];
-bool g_dirty = false;
 DWORD g_nextWrite = 0;
 // A drag changes the value every frame; the file is written at most this often.
 const DWORD kWriteIntervalMs = 250;
@@ -66,22 +66,25 @@ void Settings::OnSetTransform(D3DTRANSFORMSTATETYPE state, const D3DMATRIX* m) {
     }
 }
 
+// Only what the panel changed is written: the others may have been edited in the file since.
 void Settings::Update() {
-    if (!g_dirty || (int)(GetTickCount() - g_nextWrite) < 0) {
+    if ((int)(GetTickCount() - g_nextWrite) < 0) {
         return;
     }
-    for (const Setting* s : g_settings) {
-        Write(*s);
+    for (Setting* s : g_settings) {
+        if (s->dirty) {
+            Write(*s);
+            s->dirty = false;
+            g_nextWrite = GetTickCount() + kWriteIntervalMs;
+        }
     }
-    g_dirty = false;
-    g_nextWrite = GetTickCount() + kWriteIntervalMs;
 }
 
 void Settings::DrawPanel() {
     Ui::Heading("Game");
-    g_dirty |= Ui::Slider("Pad turn sensitivity", &g_turn.value, g_turn.minimum, g_turn.maximum, "%.2f");
-    g_dirty |= Ui::Slider("Pad look sensitivity", &g_look.value, g_look.minimum, g_look.maximum, "%.2f");
-    g_dirty |= Ui::Slider("Field of view", &g_fov.value, g_fov.minimum, g_fov.maximum, "x%.2f");
+    g_turn.dirty |= Ui::Slider("Pad turn sensitivity", &g_turn.value, g_turn.minimum, g_turn.maximum, "%.2f");
+    g_look.dirty |= Ui::Slider("Pad look sensitivity", &g_look.value, g_look.minimum, g_look.maximum, "%.2f");
+    g_fov.dirty |= Ui::Slider("Field of view", &g_fov.value, g_fov.minimum, g_fov.maximum, "x%.2f");
     if (g_projection11 != 0.0f) {
         const float degrees = 2.0f * atanf(1.0f / fabsf(g_projection11)) * 57.29578f;
         Ui::LabelDim("Field of view now: %.0f degrees across. Saved to Video_D3D9.ini as you go.", degrees);

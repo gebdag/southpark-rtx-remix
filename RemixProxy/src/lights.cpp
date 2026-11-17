@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace {
@@ -78,9 +79,10 @@ struct Settings {
     bool keepFallbackLight = true;
     bool zoneLights = true;
     float zoneRadianceScale = 1500.0f;
-    // Most zones are not lamps but fills hundreds to thousands of units across, hung over the
-    // town to tint whole streets. As lights they would be suns.
-    float zoneMaxRadius = 512.0f;
+    // A zone's brightness grows with the square of its reach, so a large zone lights its far
+    // side the way the game's does. The level-wide fills, up to 12,000 units across, would be
+    // suns that way, so the reach counted for brightness stops here.
+    float zoneReachCap = 2048.0f;
     // A soft light above the camera, coloured by the light the engine gives an object standing
     // there. It keeps rooms that have only the level's large fills -- no lamp-sized zone to send --
     // from going black, at the cost of a light that travels with the player.
@@ -274,7 +276,12 @@ float Brightness(float intensity, float reach, float scale) {
 // Zones Remix can show: it has no light that takes light away, and a box zone is a directional
 // light confined to a box, which no Remix light is.
 bool ZoneIsLight(const Zones::Zone& z) {
-    return !z.subtractive && z.shape != Zones::Box && z.radius <= g_settings.zoneMaxRadius;
+    return !z.subtractive && z.shape != Zones::Box;
+}
+
+float ZoneBrightness(const Zones::Zone& z) {
+    const float reach = z.reach < g_settings.zoneReachCap ? z.reach : g_settings.zoneReachCap;
+    return Brightness(1.0f, reach, g_settings.zoneRadianceScale);
 }
 
 void ZoneRgb(const Zones::Zone& z, float* out) {
@@ -327,7 +334,7 @@ void Lights::Init(const char* ini) {
     g_settings.keepFallbackLight = ReadBool(ini, "KeepFallbackLight", g_settings.keepFallbackLight);
     g_settings.zoneLights = ReadBool(ini, "ZoneLights", g_settings.zoneLights);
     g_settings.zoneRadianceScale = ReadFloat(ini, "ZoneRadianceScale", g_settings.zoneRadianceScale);
-    g_settings.zoneMaxRadius = ReadFloat(ini, "ZoneMaxRadius", g_settings.zoneMaxRadius);
+    g_settings.zoneReachCap = ReadFloat(ini, "ZoneReachCap", g_settings.zoneReachCap);
     g_settings.playerLight = ReadBool(ini, "PlayerLight", g_settings.playerLight);
     g_settings.playerLightScale = ReadFloat(ini, "PlayerLightScale", g_settings.playerLightScale);
     g_settings.playerLightReach = ReadFloat(ini, "PlayerLightReach", g_settings.playerLightReach);
@@ -399,7 +406,7 @@ void Lights::SubmitFrame() {
                       (int)z.centre[2], (int)z.radius);
             float rgb[3];
             ZoneRgb(z, rgb);
-            SubmitLight(Hash(name), z.centre, rgb, Brightness(1.0f, z.radius, g_settings.zoneRadianceScale),
+            SubmitLight(Hash(name), z.centre, rgb, ZoneBrightness(z),
                         z.shape == Zones::Cone ? z.axis : nullptr);
         }
     }
@@ -505,31 +512,39 @@ void Lights::DrawPanel() {
     Ui::Heading("Level light zones");
     Ui::Checkbox("Send sphere and cone zones to Remix", &g_settings.zoneLights);
     Ui::Slider("Zone radiance scale", &g_settings.zoneRadianceScale, 10.0f, 100000.0f, "%.0f", true);
-    Ui::Slider("Largest zone sent", &g_settings.zoneMaxRadius, 50.0f, 8000.0f, "%.0f units", true);
+    Ui::Slider("Zone reach cap", &g_settings.zoneReachCap, 256.0f, 16384.0f, "%.0f units", true);
     if (g_zones.empty()) {
         Ui::LabelDim("None in this level, or the game has zone lighting off.");
     } else {
-        // Only the zones that become lights: the fills not sent can number dozens.
+        // A level registers up to a hundred zones; the panel lists the nearest lights.
+        const size_t kListed = 24;
+        std::vector<std::pair<float, size_t>> sent;
         int notSent = 0;
-        Ui::LabelDim("      zone shape   colour          ambient  radius   centre                  distance");
         for (size_t i = 0; i < g_zones.size(); ++i) {
             const Zones::Zone& z = g_zones[i];
             if (!ZoneIsLight(z)) {
                 ++notSent;
                 continue;
             }
-            Ui::Swatch(ZoneColour(z));
-            Ui::SameLine();
             float distance = 0.0f;
             if (haveCamera) {
                 const float dx = z.centre[0] - camera[0], dy = z.centre[1] - camera[1], dz = z.centre[2] - camera[2];
                 distance = sqrtf(dx * dx + dy * dy + dz * dz);
             }
-            Ui::Label("%4d %-6s %4.0f %4.0f %4.0f  %8.2f %7.0f   %6.0f %6.0f %6.0f   %8.0f%s", (int)i,
-                      ShapeName(z), z.colour[0], z.colour[1], z.colour[2], z.ambientShare, z.radius, z.centre[0],
-                      z.centre[1], z.centre[2], distance, z.flickers ? "  flicker" : "");
+            sent.push_back({distance, i});
         }
-        Ui::LabelDim("%d more not sent: larger than the limit, boxes, or subtractive.", notSent);
+        std::sort(sent.begin(), sent.end());
+        Ui::LabelDim("      zone shape   colour          ambient   reach   centre                  distance");
+        for (size_t k = 0; k < sent.size() && k < kListed; ++k) {
+            const Zones::Zone& z = g_zones[sent[k].second];
+            Ui::Swatch(ZoneColour(z));
+            Ui::SameLine();
+            Ui::Label("%4d %-6s %4.0f %4.0f %4.0f  %8.2f %7.0f   %6.0f %6.0f %6.0f   %8.0f%s", (int)sent[k].second,
+                      ShapeName(z), z.colour[0], z.colour[1], z.colour[2], z.ambientShare, z.reach, z.centre[0],
+                      z.centre[1], z.centre[2], sent[k].first, z.flickers ? "  flicker" : "");
+        }
+        Ui::LabelDim("%d sent%s; %d not sent: boxes or subtractive.", (int)sent.size(),
+                     sent.size() > kListed ? ", the nearest listed" : "", notSent);
     }
 
     Ui::Heading("Player light");

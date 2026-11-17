@@ -27,6 +27,9 @@ struct Zone {
     float ambientShare = 0.0f;
     float centre[3] = {};      // world space
     float radius = 0.0f;       // largest semi-axis, world units
+    // Radius of the sphere with the zone's volume: zones are often stretched ellipsoids, and
+    // this is the size their light carries over, whatever the stretch.
+    float reach = 0.0f;
     float axis[3] = {};        // world direction: a cone's axis, a box's light direction
 };
 
