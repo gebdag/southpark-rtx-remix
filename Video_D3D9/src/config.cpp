@@ -15,6 +15,10 @@ int g_screenshotFrame = 0;
 int g_screenshotInterval = 0;
 int g_lookdevCaptureKey = 0x78;   // VK_F9
 int g_lookdevCaptureFrames = 1;
+int g_lookdevRemixX = -1;
+int g_lookdevRemixY = -1;
+int g_lookdevRemixWidth = 640;
+int g_lookdevRemixHeight = 480;
 
 bool g_disableBackfaceCulling  = true;
 bool g_disableTriangleSkipMask = false;
@@ -321,6 +325,12 @@ void Config::Load(void* self) {
     g_lookdevCaptureFrames = GetPrivateProfileIntA("Lookdev", "CaptureFrames", 1, g_iniPath);
     if (g_lookdevCaptureFrames < 1) g_lookdevCaptureFrames = 1;
     if (g_lookdevCaptureFrames > 600) g_lookdevCaptureFrames = 600;
+    g_lookdevRemixX = GetPrivateProfileIntA("Lookdev", "RemixWindowX", -1, g_iniPath);
+    g_lookdevRemixY = GetPrivateProfileIntA("Lookdev", "RemixWindowY", -1, g_iniPath);
+    g_lookdevRemixWidth = GetPrivateProfileIntA("Lookdev", "RemixWindowWidth", 640, g_iniPath);
+    g_lookdevRemixHeight = GetPrivateProfileIntA("Lookdev", "RemixWindowHeight", 480, g_iniPath);
+    if (g_lookdevRemixWidth < 64) g_lookdevRemixWidth = 64;
+    if (g_lookdevRemixHeight < 48) g_lookdevRemixHeight = 48;
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
 
@@ -344,8 +354,9 @@ void Config::Load(void* self) {
             g_skyboxBlueShift, g_skyboxBlueTarget);
     LogLine("    ScreenshotFrame=%d ScreenshotInterval=%d",
             g_screenshotFrame, g_screenshotInterval);
-    LogLine("    Lookdev CaptureKey=0x%02X CaptureFrames=%d",
-            g_lookdevCaptureKey, g_lookdevCaptureFrames);
+    LogLine("    Lookdev CaptureKey=0x%02X CaptureFrames=%d RemixWindow=%dx%d at %d,%d",
+            g_lookdevCaptureKey, g_lookdevCaptureFrames, g_lookdevRemixWidth,
+            g_lookdevRemixHeight, g_lookdevRemixX, g_lookdevRemixY);
     LogLine("    LogEveryCall=%d", g_logEveryCall);
     LogSetCallLogging(g_logEveryCall);
 }
@@ -378,4 +389,8 @@ int Config::ScreenshotFrame()             { return g_screenshotFrame; }
 int Config::ScreenshotInterval()           { return g_screenshotInterval; }
 int Config::LookdevCaptureKey()           { return g_lookdevCaptureKey; }
 int Config::LookdevCaptureFrames()        { return g_lookdevCaptureFrames; }
+int Config::LookdevRemixWindowX()         { return g_lookdevRemixX; }
+int Config::LookdevRemixWindowY()         { return g_lookdevRemixY; }
+int Config::LookdevRemixWindowWidth()     { return g_lookdevRemixWidth; }
+int Config::LookdevRemixWindowHeight()    { return g_lookdevRemixHeight; }
 const char* Config::BaseDir()             { return g_baseDir; }

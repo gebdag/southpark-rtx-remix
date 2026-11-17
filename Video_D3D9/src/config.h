@@ -172,6 +172,14 @@ int ScreenshotInterval();
 int LookdevCaptureKey();
 int LookdevCaptureFrames();
 
+// The live Remix window in lookdev mode: client size, and its top-left on the desktop. -1 for
+// either coordinate places it beside the game window. The game window's own size is set by
+// [Lookdev] OriginalResolution, which the lookdev tee hands to dgVoodoo2.
+int LookdevRemixWindowX();
+int LookdevRemixWindowY();
+int LookdevRemixWindowWidth();
+int LookdevRemixWindowHeight();
+
 // Directory the DLL lives in, with a trailing backslash. The engine changes the working
 // directory during startup, so anything written relative to it lands somewhere unhelpful.
 const char* BaseDir();

@@ -32,6 +32,10 @@ enum Opcode {
     OP_TEXTURE_ALT = 0xa6,   // same index, biased by one
     OP_SKIPMASK_CLR = 0xa7,
     OP_SKIPMASK_SET = 0xa8,
+    // The N64's SETOTHERMODE_L. With shift 3 (word0 bits 16..23 == 3) word1 is the render
+    // mode, which the original turns into depth compare, depth write, framebuffer blending and
+    // the decal depth bias (FUN_1000bc90, case 0xb9).
+    OP_OTHERMODE  = 0xb9,
     OP_MATRIX_POP   = 0xbd,
     OP_SEGMENT    = 0xbc,
     // The frame's background colour, packed 0xAABBGGRR in word1. The original unpacks it
@@ -202,6 +206,31 @@ bool ModeBindsTexture() {
 // Batches whose selected set the mode suppressed: binds that would otherwise tint walls with
 // another set's texels and cut them out with its mask.
 unsigned int g_modeSuppressedBinds = 0;
+
+// The render mode, as opcode 0xb9 delivers it. The original reads four things out of it:
+//
+//   0x10    Z_CMP     depth test: LESSEQUAL when set, ALWAYS when clear
+//   0x20    Z_UPD     depth write
+//   0xc00   ZMODE     0xc00 is ZMODE_DEC, a decal: depth bias 1 and a depth nudged towards
+//                     the camera in its own transform, so it wins against the surface it lies on
+//   0x30000           clear means SRCALPHA / INVSRCALPHA blending, set means ONE / ZERO
+//
+// Nothing is known before the first 0xb9, so it starts as the opaque, depth-tested,
+// depth-writing mode the engine uses for ordinary world geometry.
+const unsigned int kRenderModeZCompare = 0x10;
+const unsigned int kRenderModeZUpdate  = 0x20;
+const unsigned int kRenderModeZModeMask = 0xc00;
+const unsigned int kRenderModeZModeDecal = 0xc00;
+const unsigned int kRenderModeOpaque   = 0x30000;
+unsigned int g_renderMode = kRenderModeZCompare | kRenderModeZUpdate | kRenderModeOpaque;
+
+bool RenderModeIsDecal(unsigned int mode) {
+    return (mode & kRenderModeZModeMask) == kRenderModeZModeDecal;
+}
+
+bool RenderModeBlends(unsigned int mode) {
+    return (mode & kRenderModeOpaque) == 0;
+}
 
 // Texture set selected by opcode 0xa9. -1 means untextured.
 int g_currentTexture = -1;
@@ -1415,6 +1444,11 @@ void DumpBatch(int vertexCount, bool textured, bool culled, bool sky) {
 
     const unsigned int constant = ConstantColourForBatch();
     LogLine("      #%-4d %s", g_dumpBatch, texture);
+    LogLine("            rendermode=0x%08x%s%s%s%s", g_renderMode,
+            (g_renderMode & kRenderModeZCompare) ? " zcmp" : " ZALWAYS",
+            (g_renderMode & kRenderModeZUpdate) ? " zupd" : " NOZWRITE",
+            RenderModeBlends(g_renderMode) ? " BLEND" : "",
+            RenderModeIsDecal(g_renderMode) ? " DECAL" : "");
     LogLine("            %3d tris %3d verts  flags=0x%06x%s%s%s%s  mode=0x%02x const=%06x"
             "  %s%s",
             g_indexCount / 3, vertexCount, g_renderFlags,
@@ -1685,6 +1719,15 @@ void Geometry::ProcessDisplayList(const unsigned int* list) {
 
         case OP_BACKGROUND:
             Device::SetClearColour(word1);
+            break;
+
+        case OP_OTHERMODE:
+            // Only shift 3 carries the render mode; the other shifts set state the original
+            // keeps for its rasteriser emulation and never turns into device state.
+            if (((word0 >> 16) & 0xff) == 3 && word1 != g_renderMode) {
+                Flush();
+                g_renderMode = word1;
+            }
             break;
 
         case OP_COMBINER_MODE:

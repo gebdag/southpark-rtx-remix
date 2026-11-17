@@ -174,6 +174,66 @@ struct Range {
 };
 
 bool g_announced = false;
+HWND g_gameWindow = 0;
+HWND g_remixWindow = 0;
+char g_pendingShots[64];
+
+// The window's client area as it is on screen, written as a 24-bit BMP. Copied off the
+// desktop because that works for both windows whatever presents into them.
+bool SaveWindow(HWND hwnd, const char* path) {
+    RECT rc;
+    if (!hwnd || !GetClientRect(hwnd, &rc) || rc.right <= 0 || rc.bottom <= 0) {
+        return false;
+    }
+    POINT origin = {0, 0};
+    ClientToScreen(hwnd, &origin);
+    const int w = rc.right, h = rc.bottom;
+    HDC screen = GetDC(0);
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, w, h);
+    HGDIOBJ old = SelectObject(mem, bitmap);
+    BitBlt(mem, 0, 0, w, h, screen, origin.x, origin.y, SRCCOPY);
+    SelectObject(mem, old);
+    BITMAPINFOHEADER bi = {sizeof(bi)};
+    bi.biWidth = w;
+    bi.biHeight = h;
+    bi.biPlanes = 1;
+    bi.biBitCount = 24;
+    const int stride = (w * 3 + 3) & ~3;
+    std::vector<unsigned char> pixels((size_t)stride * h);
+    GetDIBits(mem, bitmap, 0, h, &pixels[0], (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+    DeleteObject(bitmap);
+    DeleteDC(mem);
+    ReleaseDC(0, screen);
+    BITMAPFILEHEADER bf = {};
+    bf.bfType = 0x4d42;
+    bf.bfOffBits = sizeof(bf) + sizeof(bi);
+    bf.bfSize = bf.bfOffBits + (DWORD)pixels.size();
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        return false;
+    }
+    fwrite(&bf, sizeof(bf), 1, f);
+    fwrite(&bi, sizeof(bi), 1, f);
+    fwrite(&pixels[0], 1, pixels.size(), f);
+    return fclose(f) == 0;
+}
+
+// <name>.bmp is the game window -- the original renderer, the ground truth -- and
+// <name>_remix.bmp the Remix window.
+void SaveWindows(const char* name) {
+    char dir[MAX_PATH];
+    char path[MAX_PATH];
+    CaptureDir(dir, sizeof(dir));
+    _snprintf(path, sizeof(path), "%s%s.bmp", dir, name);
+    path[sizeof(path) - 1] = 0;
+    const bool game = SaveWindow(g_gameWindow, path);
+    _snprintf(path, sizeof(path), "%s%s_remix.bmp", dir, name);
+    path[sizeof(path) - 1] = 0;
+    const bool remix = SaveWindow(g_remixWindow, path);
+    LogLine("    lookdev: pictures of \"%s\": game window %s, Remix window %s", name,
+            game ? "saved" : "FAILED", remix ? "saved" : "FAILED");
+}
 bool g_capturing = false;
 int g_framesLeft = 0;
 int g_framesCaptured = 0;
@@ -359,6 +419,7 @@ void Lookdev::TrackCommand(unsigned int word0, unsigned int word1) {
 }
 
 bool Lookdev::IsHost()       { return g_mode == ModeHost; }
+bool Lookdev::IsTee()        { return g_mode == ModeGame; }
 bool Lookdev::UsePlainD3D9() { return g_plain; }
 
 const char* Lookdev::LogFileName() {
@@ -367,8 +428,70 @@ const char* Lookdev::LogFileName() {
 
 // ======================================================================= start-up exports
 
-void Lookdev::OnInitializeDriver(const unsigned int args[7]) {
+void Lookdev::OnInitializeDriver(HWND window, const unsigned int args[7]) {
+    g_gameWindow = window;
     memcpy(g_initArgs, args, sizeof(g_initArgs));
+}
+
+// ======================================================================= the Remix window
+
+namespace {
+
+LRESULT CALLBACK RemixWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    // Closing it would leave the game drawing into a destroyed window; it goes with the game.
+    if (msg == WM_CLOSE) {
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+} // namespace
+
+HWND Lookdev::CreateRemixWindow() {
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = RemixWindowProc;
+    wc.hInstance = GetModuleHandleA(0);
+    wc.hCursor = LoadCursor(0, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = "SouthParkLookdevRemix";
+    RegisterClassA(&wc);
+
+    const DWORD style = WS_OVERLAPPEDWINDOW;
+    RECT frame = {0, 0, Config::LookdevRemixWindowWidth(), Config::LookdevRemixWindowHeight()};
+    AdjustWindowRect(&frame, style, FALSE);
+    int x = Config::LookdevRemixWindowX();
+    int y = Config::LookdevRemixWindowY();
+    RECT game;
+    if ((x < 0 || y < 0) && g_gameWindow && GetWindowRect(g_gameWindow, &game)) {
+        if (x < 0) x = game.right;
+        if (y < 0) y = game.top;
+    }
+    g_remixWindow = CreateWindowExA(0, wc.lpszClassName, "South Park - RTX Remix (lookdev)", style,
+                                    x < 0 ? CW_USEDEFAULT : x, y < 0 ? CW_USEDEFAULT : y,
+                                    frame.right - frame.left, frame.bottom - frame.top, 0, 0,
+                                    wc.hInstance, 0);
+    if (g_remixWindow) {
+        // Shown without taking focus: the game window keeps the keyboard.
+        ShowWindow(g_remixWindow, SW_SHOWNOACTIVATE);
+    }
+    LogLine("    lookdev: Remix window %p, %dx%d at %d,%d", g_remixWindow,
+            Config::LookdevRemixWindowWidth(), Config::LookdevRemixWindowHeight(), x, y);
+    return g_remixWindow;
+}
+
+void Lookdev::DestroyRemixWindow() {
+    if (g_remixWindow) {
+        DestroyWindow(g_remixWindow);
+        g_remixWindow = 0;
+    }
+}
+
+void Lookdev::PumpRemixWindow() {
+    MSG msg;
+    while (g_remixWindow && PeekMessageA(&msg, g_remixWindow, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
 }
 
 void Lookdev::OnSetTextureFileName(const char* name) {
@@ -390,6 +513,11 @@ void Lookdev::OnEnumerateTexture(unsigned int arg2) {
 void Lookdev::OnBeginScene() {
     if (g_mode != ModeGame) {
         return;
+    }
+    if (g_pendingShots[0]) {
+        // A frame after the capture, so both windows have presented it.
+        SaveWindows(g_pendingShots);
+        g_pendingShots[0] = 0;
     }
     if (!g_announced) {
         g_announced = true;
@@ -417,12 +545,8 @@ void Lookdev::OnEndScene() {
     g_recording = false;
     PutRecord(REC_FRAME_END, 0);
     if (g_framesCaptured++ == 0) {
-        // The game's own picture of the first frame, to judge a replay against.
-        char path[MAX_PATH];
-        CaptureDir(path, sizeof(path));
-        _snprintf(path + strlen(path), sizeof(path) - strlen(path), "%s.bmp", g_captureName);
-        path[sizeof(path) - 1] = 0;
-        Device::RequestScreenshot(path);
+        // Pictures of the first frame from both windows, taken once they have shown it.
+        lstrcpynA(g_pendingShots, g_captureName, sizeof(g_pendingShots));
     }
     if (--g_framesLeft <= 0) {
         g_capturing = false;

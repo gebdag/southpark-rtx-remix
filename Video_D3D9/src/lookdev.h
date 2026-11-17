@@ -1,5 +1,7 @@
 #pragma once
 
+#include <windows.h>
+
 // Lookdev: record frames from the running game at the plugin boundary, so the lookdev host
 // (patches\SouthPark\lookdev) can replay them through any GFXDLL plugin -- this renderer,
 // into RTX Remix or plain D3D9, or one of the game's original renderers as a reference.
@@ -14,10 +16,13 @@
 // The mode comes from the environment, set by whoever starts the process, so a normal game
 // start is untouched:
 //
-//   SP_LOOKDEV=1        the game: capture on a hotkey or a request file
+//   SP_LOOKDEV=1        the game, as a tee: Acclaim's original renderer draws the game window
+//                       (the ground truth, see original.h), this renderer draws the same
+//                       frames through RTX Remix into a second window, and F9 or a request
+//                       file captures
 //   SP_LOOKDEV_HOST=1   the lookdev host: no SouthPark.exe to patch
-//   SP_LOOKDEV_PLAIN=1  either side: use the system d3d9.dll instead of the game folder's
-//                       (RTX Remix), so a vanilla game and a Remix host can run side by side
+//   SP_LOOKDEV_PLAIN=1  the host: use the system d3d9.dll instead of the game folder's
+//                       (RTX Remix)
 namespace Lookdev {
 
 // Reads the environment. Called first thing in DllMain, before the log is opened, because
@@ -25,6 +30,7 @@ namespace Lookdev {
 void DetectMode();
 
 bool IsHost();
+bool IsTee();
 bool UsePlainD3D9();
 
 // Name of the log beside the DLL for this mode.
@@ -34,10 +40,20 @@ const char* LogFileName();
 //
 // Remembered from the moment the engine makes them, since a capture is taken long after.
 
-void OnInitializeDriver(const unsigned int args[7]);    // arguments 2..8
+void OnInitializeDriver(HWND window, const unsigned int args[7]);   // arguments 2..8
 void OnSetTextureFileName(const char* name);
 void OnStartTextureEnumeration(unsigned int count, unsigned int arg3);
 void OnEnumerateTexture(unsigned int arg2);
+
+// ------------------------------------------------------------------- the Remix window
+
+// In tee mode: the window this renderer draws into, beside the game window. Sized and placed
+// by [Lookdev] RemixWindow* in the ini; movable and resizable like any window.
+HWND CreateRemixWindow();
+void DestroyRemixWindow();
+
+// Handles its messages. The game's own loop only pumps the game window's.
+void PumpRemixWindow();
 
 // ------------------------------------------------------------------- frames
 
