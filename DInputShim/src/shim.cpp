@@ -300,6 +300,55 @@ bool IsUnknownIid(const IID& iid) {
     return IsEqualIID(iid, kIidUnknown) != 0;
 }
 
+// The cooperative level each device last took from the game, so it can be put back. The
+// Remix bridge client hooks DirectInput too, and rebinds the game's devices to the window
+// its D3D9 device presents to. That is the game window in the game proper, but lookdev
+// presents Remix in a window of its own -- after which DirectInput only lets the keyboard
+// acquire while that window is in front, never while the player is in the game window.
+struct DeviceLevel {
+    void* device;
+    DWORD flags;
+};
+const int kMaxDeviceLevels = 8;
+DeviceLevel g_deviceLevels[kMaxDeviceLevels];
+int g_deviceLevelCount = 0;
+long g_rebinds = 0;
+long g_unacquirable = 0;
+
+void RememberLevel(void* device, DWORD flags) {
+    for (int i = 0; i < g_deviceLevelCount; ++i) {
+        if (g_deviceLevels[i].device == device) {
+            g_deviceLevels[i].flags = flags;
+            return;
+        }
+    }
+    if (g_deviceLevelCount < kMaxDeviceLevels) {
+        g_deviceLevels[g_deviceLevelCount].device = device;
+        g_deviceLevels[g_deviceLevelCount].flags = flags;
+        ++g_deviceLevelCount;
+    }
+}
+
+bool RecallLevel(void* device, DWORD* flags) {
+    for (int i = 0; i < g_deviceLevelCount; ++i) {
+        if (g_deviceLevels[i].device == device) {
+            *flags = g_deviceLevels[i].flags;
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when the window the game handed to SetCooperativeLevel is the one in front -- the
+// only state in which a foreground device can be acquired for the game at all.
+bool GameWindowInFront() {
+    if (!g_inputWindow) {
+        return false;
+    }
+    const HWND fg = GetForegroundWindow();
+    return fg && GetAncestor(fg, GA_ROOT) == GetAncestor(g_inputWindow, GA_ROOT);
+}
+
 // ------------------------------------------------------------------------ device hooks
 
 HRESULT STDMETHODCALLTYPE HookedSetCooperativeLevel(void* self, HWND window, DWORD flags) {
@@ -323,36 +372,74 @@ HRESULT STDMETHODCALLTYPE HookedSetCooperativeLevel(void* self, HWND window, DWO
             (unsigned long)flags, (unsigned long)effective);
     }
 
+    DWORD applied = effective;
     HRESULT hr = original(self, window, effective);
     if (FAILED(hr) && effective != flags) {
         // Some device classes reject combinations the game never asked for. Better the
         // game's own input than none at all.
         Log("  rewritten level rejected (hr=0x%08lx); falling back to the original",
             (unsigned long)hr);
+        applied = flags;
         hr = original(self, window, flags);
     }
 
     if (window) {
         g_inputWindow = window;
     }
+    if (SUCCEEDED(hr)) {
+        RememberLevel(self, applied);
+    }
     return hr;
+}
+
+bool IsLost(HRESULT hr) {
+    return hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED;
 }
 
 // Foreground cooperativity means DirectInput unacquires the device whenever the window loses
 // focus, and the game is on its own to notice. If it does not, its input never comes back
-// after the first Alt+Tab -- so reacquire here rather than depending on the engine.
-HRESULT ReacquireIfLost(Vtable* v, void* self, HRESULT hr) {
-    if (hr != DIERR_INPUTLOST && hr != DIERR_NOTACQUIRED) {
-        return hr;
-    }
-    if (!GameHasFocus() || !v->original[kSlotAcquire]) {
-        return hr;
-    }
+// after the first Alt+Tab -- so reacquire here rather than depending on the engine. A device
+// that still refuses while the game window is in front has been bound to another window of
+// this process (see DeviceLevel); it is bound back to the game's window and acquired again.
+// Returns true when the device is acquired.
+bool Reacquire(Vtable* v, void* self) {
     AcquireFn acquire = (AcquireFn)v->original[kSlotAcquire];
-    if (FAILED(acquire(self))) {
-        return hr;
+    if (!acquire || !GameHasFocus()) {
+        return false;
     }
-    InterlockedIncrement(&g_reacquires);
+    if (SUCCEEDED(acquire(self))) {
+        InterlockedIncrement(&g_reacquires);
+        return true;
+    }
+    SetCooperativeLevelFn setLevel = (SetCooperativeLevelFn)v->original[kSlotSetCooperativeLevel];
+    DWORD level = 0;
+    if (!setLevel || !GameWindowInFront() || !RecallLevel(self, &level)) {
+        return false;
+    }
+    if (FAILED(setLevel(self, g_inputWindow, level)) || FAILED(acquire(self))) {
+        return false;
+    }
+    if (InterlockedIncrement(&g_rebinds) <= 5) {
+        Log("device %p was bound to another window; rebound to the game window %p", self,
+            (void*)g_inputWindow);
+    }
+    return true;
+}
+
+// A device the game cannot have reads as one with nothing pressed and no movement. The loss
+// itself is never reported: the engine answers it by reacquiring in a loop that pumps no
+// window messages, so it would never see the focus change that lets the acquire succeed.
+HRESULT ReportNoState(void* data, DWORD size) {
+    if (data && size && !IsBadWritePtr(data, size)) {
+        memset(data, 0, size);
+    }
+    return S_OK;
+}
+
+HRESULT ReportNoData(DWORD* inOut) {
+    if (inOut) {
+        *inOut = 0;
+    }
     return S_OK;
 }
 
@@ -362,19 +449,17 @@ HRESULT STDMETHODCALLTYPE HookedGetDeviceState(void* self, DWORD size, void* dat
         return E_FAIL;
     }
     if (InputBlocked()) {
-        // A zeroed buffer is a device with nothing pressed and no movement, which is exactly
-        // what the game should see. Failing the call instead makes engines re-acquire in a
-        // loop, and some read the stale buffer as if it were live.
-        if (data && size && !IsBadWritePtr(data, size)) {
-            memset(data, 0, size);
-        }
         InterlockedIncrement(&g_statesBlocked);
-        return S_OK;
+        return ReportNoState(data, size);
     }
     GetDeviceStateFn original = (GetDeviceStateFn)v->original[kSlotGetDeviceState];
     HRESULT hr = original(self, size, data);
-    if (ReacquireIfLost(v, self, hr) == S_OK && hr != S_OK) {
+    if (IsLost(hr) && Reacquire(v, self)) {
         hr = original(self, size, data);
+    }
+    if (IsLost(hr)) {
+        InterlockedIncrement(&g_unacquirable);
+        return ReportNoState(data, size);
     }
     return hr;
 }
@@ -387,20 +472,25 @@ HRESULT STDMETHODCALLTYPE HookedGetDeviceData(void* self, DWORD objectSize, void
     }
     GetDeviceDataFn original = (GetDeviceDataFn)v->original[kSlotGetDeviceData];
     if (InputBlocked()) {
-        // Report an empty batch. Buffered events keep queueing while the game is not
-        // looking and would replay as a burst on the way back, so flush the queue: passing
-        // a null buffer with an unlimited count is dinput's own way to discard it.
+        // Buffered events keep queueing while the game is not looking and would replay as a
+        // burst on the way back, so flush the queue: passing a null buffer with an unlimited
+        // count is dinput's own way to discard it.
         DWORD discard = 0xffffffffu;
         original(self, objectSize, 0, &discard, 0);
-        if (inOut) {
-            *inOut = 0;
-        }
         InterlockedIncrement(&g_statesBlocked);
-        return S_OK;
+        return ReportNoData(inOut);
     }
+    const DWORD capacity = inOut ? *inOut : 0;
     HRESULT hr = original(self, objectSize, buffer, inOut, flags);
-    if (ReacquireIfLost(v, self, hr) == S_OK && hr != S_OK) {
+    if (IsLost(hr) && Reacquire(v, self)) {
+        if (inOut) {
+            *inOut = capacity;
+        }
         hr = original(self, objectSize, buffer, inOut, flags);
+    }
+    if (IsLost(hr)) {
+        InterlockedIncrement(&g_unacquirable);
+        return ReportNoData(inOut);
     }
     return hr;
 }
@@ -709,8 +799,10 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
         PatchExecutableImports();
     } else if (reason == DLL_PROCESS_DETACH) {
         Log("=== DInputShim unloading: %d device vtables patched, %d cooperative levels "
-            "rewritten, %ld reads blocked, %ld reacquires ===",
-            g_devicesPatched, g_coopCallsRewritten, g_statesBlocked, g_reacquires);
+            "rewritten, %ld reads blocked, %ld reacquires, %ld rebinds, %ld reads of an "
+            "unacquirable device ===",
+            g_devicesPatched, g_coopCallsRewritten, g_statesBlocked, g_reacquires, g_rebinds,
+            g_unacquirable);
         g_logReady = false;
         DeleteCriticalSection(&g_logLock);
     }
