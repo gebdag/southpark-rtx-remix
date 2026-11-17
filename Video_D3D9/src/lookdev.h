@@ -1,5 +1,7 @@
 #pragma once
 
+#include "window.h"
+
 #include <windows.h>
 
 // Lookdev: record frames from the running game at the plugin boundary, so the lookdev host
@@ -33,6 +35,10 @@ bool IsHost();
 bool IsTee();
 bool UsePlainD3D9();
 
+// In the host: true for its first frame only, when SP_LOOKDEV_DUMP is set, so a captured
+// frame can be logged draw by draw, as F10 does in the game.
+bool TakeDumpRequest();
+
 // Name of the log beside the DLL for this mode.
 const char* LogFileName();
 
@@ -45,7 +51,12 @@ void OnSetTextureFileName(const char* name);
 void OnStartTextureEnumeration(unsigned int count, unsigned int arg3);
 void OnEnumerateTexture(unsigned int arg2);
 
-// ------------------------------------------------------------------- the Remix window
+// ------------------------------------------------------------------------ the windows
+
+// In tee mode: where the game window goes, framed so it can be moved, at [Lookdev]
+// GameWindow* in the ini. Left at -1, the game window and the Remix window sit side by side,
+// centred on the primary monitor.
+Window::Placement GameWindowPlacement();
 
 // In tee mode: the window this renderer draws into, beside the game window. Sized and placed
 // by [Lookdev] RemixWindow* in the ini; movable and resizable like any window.

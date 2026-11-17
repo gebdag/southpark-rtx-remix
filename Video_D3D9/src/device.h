@@ -2,9 +2,9 @@
 
 #include <windows.h>
 
-// Owns the D3D9 device for the whole plugin. The engine creates the window and hands
-// it to GFXDLL_InitializeDriver, so the plugin only ever attaches a swapchain to an
-// existing HWND -- it never creates or owns one.
+// Owns the D3D9 device for the whole plugin. The device draws into a window it is handed --
+// the engine's, which window.h shapes, or lookdev's Remix window -- and sizes its back buffer
+// from that window's client area.
 struct IDirect3DDevice9;
 
 namespace Device {
@@ -53,6 +53,10 @@ bool BeginFrame();
 
 // EndScene + Present. Handles a lost device by flagging it for reset next frame.
 void EndFrame();
+
+// The window `window` changed size. If it is the one the device draws into, the back buffer
+// follows it at the start of the next frame. Ignored for any other window.
+void OnWindowResized(HWND window);
 
 void SetVSync(bool enabled);
 

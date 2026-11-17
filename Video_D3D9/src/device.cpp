@@ -30,13 +30,49 @@ bool g_frameHadDraw = false;
 const D3DCOLOR kFallbackClearColour = D3DCOLOR_XRGB(0x20, 0x30, 0x60);
 D3DCOLOR g_clearColour = kFallbackClearColour;
 
-void FillPresentParams(HWND window, int width, int height) {
+// Where in the window the back buffer goes. With [Display] KeepAspect the back buffer is the
+// largest 4:3 rectangle the client area holds -- the engine's picture is always 640x480 --
+// and Present places it centred, leaving bars; otherwise it is the whole client area.
+RECT g_presentRect;
+bool g_presentToRect = false;
+
+void SizeToWindow(HWND window, UINT* width, UINT* height) {
+    RECT client = {0, 0, 640, 480};
+    if (window) {
+        GetClientRect(window, &client);
+    }
+    int w = client.right - client.left;
+    int h = client.bottom - client.top;
+    if (w <= 0 || h <= 0) {
+        w = 640;
+        h = 480;
+    }
+    g_presentRect.left = 0;
+    g_presentRect.top = 0;
+    g_presentRect.right = w;
+    g_presentRect.bottom = h;
+    g_presentToRect = false;
+    if (Config::KeepAspect() && w * 3 != h * 4) {
+        const int fitW = (w * 3 > h * 4) ? h * 4 / 3 : w;
+        const int fitH = (w * 3 > h * 4) ? h : w * 3 / 4;
+        g_presentRect.left = (w - fitW) / 2;
+        g_presentRect.top = (h - fitH) / 2;
+        g_presentRect.right = g_presentRect.left + fitW;
+        g_presentRect.bottom = g_presentRect.top + fitH;
+        g_presentToRect = true;
+        w = fitW;
+        h = fitH;
+    }
+    *width = (UINT)w;
+    *height = (UINT)h;
+}
+
+void FillPresentParams(HWND window) {
     ZeroMemory(&g_params, sizeof(g_params));
     g_params.Windowed = TRUE;
     g_params.SwapEffect = D3DSWAPEFFECT_DISCARD;
     g_params.hDeviceWindow = window;
-    g_params.BackBufferWidth = width;
-    g_params.BackBufferHeight = height;
+    SizeToWindow(window, &g_params.BackBufferWidth, &g_params.BackBufferHeight);
     g_params.BackBufferFormat = D3DFMT_X8R8G8B8;
     g_params.BackBufferCount = 1;
     g_params.EnableAutoDepthStencil = TRUE;
@@ -137,18 +173,11 @@ bool Device::Create(HWND window) {
         return false;
     }
 
-    RECT client;
-    int width = 640;
-    int height = 480;
-    if (window && GetClientRect(window, &client)) {
-        if (client.right > client.left && client.bottom > client.top) {
-            width = client.right - client.left;
-            height = client.bottom - client.top;
-        }
-    }
-    LogLine("    window=%p client=%dx%d", window, width, height);
-
-    FillPresentParams(window, width, height);
+    FillPresentParams(window);
+    const int width = (int)g_params.BackBufferWidth;
+    const int height = (int)g_params.BackBufferHeight;
+    LogLine("    window=%p back buffer %dx%d at %ld,%ld", window, width, height,
+            g_presentRect.left, g_presentRect.top);
 
     // SOFTWARE_VERTEXPROCESSING keeps device creation working on any driver.
     HRESULT hr = g_d3d->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, window,
@@ -351,8 +380,22 @@ void Device::EndFrame() {
         g_screenshotPath[0] = 0;
     }
 
-    HRESULT hr = g_device->Present(0, 0, 0, 0);
+    HRESULT hr = g_device->Present(0, g_presentToRect ? &g_presentRect : 0, 0, 0);
     if (hr == D3DERR_DEVICELOST) {
+        g_needsReset = true;
+    }
+}
+
+void Device::OnWindowResized(HWND window) {
+    if (!g_device || window != g_window) {
+        return;
+    }
+    UINT width = 0;
+    UINT height = 0;
+    SizeToWindow(window, &width, &height);
+    if (width != g_params.BackBufferWidth || height != g_params.BackBufferHeight) {
+        g_params.BackBufferWidth = width;
+        g_params.BackBufferHeight = height;
         g_needsReset = true;
     }
 }

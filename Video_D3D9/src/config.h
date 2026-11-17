@@ -157,6 +157,26 @@ int SkyboxBlueShift();
 // The colour SkyboxBlueShift pulls towards, as 0xRRGGBB.
 int SkyboxBlueTarget();
 
+// --------------------------------------------------------------------------- display
+
+// [Display] Mode: true for a framed window, false for borderless over the whole monitor.
+// Alt+Enter switches between the two while the game runs. See window.h.
+bool DisplayWindowed();
+
+// The framed window's client size, and its top-left on the desktop (-1 centres it).
+int DisplayWindowWidth();
+int DisplayWindowHeight();
+int DisplayWindowX();
+int DisplayWindowY();
+
+// Present the engine's 4:3 picture at 4:3, with black bars where the window is wider or
+// taller, instead of stretching it to fill.
+bool KeepAspect();
+
+// Let the engine pause the game when its window loses focus, as it always has. Off, the game
+// keeps running behind other windows.
+bool PauseWhenUnfocused();
+
 // ----------------------------------------------------------------------------- debug
 
 // Frame number at which to start writing screenshots automatically, or 0 for none, and how
@@ -172,9 +192,15 @@ int ScreenshotInterval();
 int LookdevCaptureKey();
 int LookdevCaptureFrames();
 
+// The game window in lookdev mode, where the original renderer draws: client size, and its
+// top-left on the desktop. -1 for either coordinate centres the pair of windows on the screen.
+int LookdevGameWindowX();
+int LookdevGameWindowY();
+int LookdevGameWindowWidth();
+int LookdevGameWindowHeight();
+
 // The live Remix window in lookdev mode: client size, and its top-left on the desktop. -1 for
-// either coordinate places it beside the game window. The game window's own size is set by
-// [Lookdev] OriginalResolution, which the lookdev tee hands to dgVoodoo2.
+// either coordinate places it beside the game window.
 int LookdevRemixWindowX();
 int LookdevRemixWindowY();
 int LookdevRemixWindowWidth();

@@ -19,6 +19,17 @@ int g_lookdevRemixX = -1;
 int g_lookdevRemixY = -1;
 int g_lookdevRemixWidth = 640;
 int g_lookdevRemixHeight = 480;
+int g_lookdevGameX = -1;
+int g_lookdevGameY = -1;
+int g_lookdevGameWidth = 640;
+int g_lookdevGameHeight = 480;
+bool g_displayWindowed = false;
+int g_displayWidth = 1280;
+int g_displayHeight = 960;
+int g_displayX = -1;
+int g_displayY = -1;
+bool g_keepAspect = true;
+bool g_pauseWhenUnfocused = true;
 
 bool g_disableBackfaceCulling  = true;
 bool g_disableTriangleSkipMask = false;
@@ -51,6 +62,21 @@ const char* kDefaultIni =
     ";\r\n"
     "; The defaults are tuned for RTX Remix. Set the culling options to 0 to get the\r\n"
     "; engine's own rasteriser behaviour back.\r\n"
+    "\r\n"
+    "[Display]\r\n"
+    "; borderless covers the whole monitor; windowed is a framed window you can move and\r\n"
+    "; resize. Alt+Enter switches between them while the game runs.\r\n"
+    "Mode=borderless\r\n"
+    "; The framed window's client size, and its top-left on the desktop (-1 centres it).\r\n"
+    "WindowWidth=1280\r\n"
+    "WindowHeight=960\r\n"
+    "WindowX=-1\r\n"
+    "WindowY=-1\r\n"
+    "; The game draws a 4:3 picture. 1 keeps it 4:3 with black bars at the sides (or top and\r\n"
+    "; bottom); 0 stretches it to fill the window.\r\n"
+    "KeepAspect=1\r\n"
+    "; The game pauses itself while its window is not in front. 0 keeps it running.\r\n"
+    "PauseWhenUnfocused=1\r\n"
     "\r\n"
     "[Culling]\r\n"
     "; Force D3DCULL_NONE. The engine asks for backface culling on essentially every batch\r\n"
@@ -331,10 +357,35 @@ void Config::Load(void* self) {
     g_lookdevRemixHeight = GetPrivateProfileIntA("Lookdev", "RemixWindowHeight", 480, g_iniPath);
     if (g_lookdevRemixWidth < 64) g_lookdevRemixWidth = 64;
     if (g_lookdevRemixHeight < 48) g_lookdevRemixHeight = 48;
+    g_lookdevGameX = GetPrivateProfileIntA("Lookdev", "GameWindowX", -1, g_iniPath);
+    g_lookdevGameY = GetPrivateProfileIntA("Lookdev", "GameWindowY", -1, g_iniPath);
+    g_lookdevGameWidth = GetPrivateProfileIntA("Lookdev", "GameWindowWidth", 640, g_iniPath);
+    g_lookdevGameHeight = GetPrivateProfileIntA("Lookdev", "GameWindowHeight", 480, g_iniPath);
+    if (g_lookdevGameWidth < 64) g_lookdevGameWidth = 64;
+    if (g_lookdevGameHeight < 48) g_lookdevGameHeight = 48;
+    {
+        char mode[32];
+        GetPrivateProfileStringA("Display", "Mode", "borderless", mode, sizeof(mode), g_iniPath);
+        g_displayWindowed = lstrcmpiA(mode, "windowed") == 0;
+        if (!g_displayWindowed && lstrcmpiA(mode, "borderless") != 0) {
+            LogLine("    [Display] Mode=%s is neither borderless nor windowed -- borderless", mode);
+        }
+    }
+    g_displayWidth = GetPrivateProfileIntA("Display", "WindowWidth", 1280, g_iniPath);
+    g_displayHeight = GetPrivateProfileIntA("Display", "WindowHeight", 960, g_iniPath);
+    if (g_displayWidth < 320) g_displayWidth = 320;
+    if (g_displayHeight < 240) g_displayHeight = 240;
+    g_displayX = GetPrivateProfileIntA("Display", "WindowX", -1, g_iniPath);
+    g_displayY = GetPrivateProfileIntA("Display", "WindowY", -1, g_iniPath);
+    g_keepAspect = ReadBool("Display", "KeepAspect", true);
+    g_pauseWhenUnfocused = ReadBool("Display", "PauseWhenUnfocused", true);
     GetPrivateProfileStringA("Sky", "SkyTextureNames", "Dawn,Day,Nite",
                              g_skyNames, sizeof(g_skyNames), g_iniPath);
 
     LogLine("=== config: %s", g_iniPath);
+    LogLine("    Display Mode=%s Window=%dx%d at %d,%d KeepAspect=%d PauseWhenUnfocused=%d",
+            g_displayWindowed ? "windowed" : "borderless", g_displayWidth, g_displayHeight,
+            g_displayX, g_displayY, g_keepAspect, g_pauseWhenUnfocused);
     LogLine("    DisableBackfaceCulling=%d DisableTriangleSkipMask=%d DisableOffscreenQuadReject=%d",
             g_disableBackfaceCulling, g_disableTriangleSkipMask, g_disableOffscreenQuadReject);
     LogLine("    UseEngineBackgroundColour=%d DepthlessSky=%d SkyTextureNames=%s",
@@ -354,8 +405,10 @@ void Config::Load(void* self) {
             g_skyboxBlueShift, g_skyboxBlueTarget);
     LogLine("    ScreenshotFrame=%d ScreenshotInterval=%d",
             g_screenshotFrame, g_screenshotInterval);
-    LogLine("    Lookdev CaptureKey=0x%02X CaptureFrames=%d RemixWindow=%dx%d at %d,%d",
-            g_lookdevCaptureKey, g_lookdevCaptureFrames, g_lookdevRemixWidth,
+    LogLine("    Lookdev CaptureKey=0x%02X CaptureFrames=%d GameWindow=%dx%d at %d,%d "
+            "RemixWindow=%dx%d at %d,%d",
+            g_lookdevCaptureKey, g_lookdevCaptureFrames, g_lookdevGameWidth,
+            g_lookdevGameHeight, g_lookdevGameX, g_lookdevGameY, g_lookdevRemixWidth,
             g_lookdevRemixHeight, g_lookdevRemixX, g_lookdevRemixY);
     LogLine("    LogEveryCall=%d", g_logEveryCall);
     LogSetCallLogging(g_logEveryCall);
@@ -389,6 +442,17 @@ int Config::ScreenshotFrame()             { return g_screenshotFrame; }
 int Config::ScreenshotInterval()           { return g_screenshotInterval; }
 int Config::LookdevCaptureKey()           { return g_lookdevCaptureKey; }
 int Config::LookdevCaptureFrames()        { return g_lookdevCaptureFrames; }
+bool Config::DisplayWindowed()            { return g_displayWindowed; }
+int Config::DisplayWindowWidth()          { return g_displayWidth; }
+int Config::DisplayWindowHeight()         { return g_displayHeight; }
+int Config::DisplayWindowX()              { return g_displayX; }
+int Config::DisplayWindowY()              { return g_displayY; }
+bool Config::KeepAspect()                 { return g_keepAspect; }
+bool Config::PauseWhenUnfocused()         { return g_pauseWhenUnfocused; }
+int Config::LookdevGameWindowX()          { return g_lookdevGameX; }
+int Config::LookdevGameWindowY()          { return g_lookdevGameY; }
+int Config::LookdevGameWindowWidth()      { return g_lookdevGameWidth; }
+int Config::LookdevGameWindowHeight()     { return g_lookdevGameHeight; }
 int Config::LookdevRemixWindowX()         { return g_lookdevRemixX; }
 int Config::LookdevRemixWindowY()         { return g_lookdevRemixY; }
 int Config::LookdevRemixWindowWidth()     { return g_lookdevRemixWidth; }

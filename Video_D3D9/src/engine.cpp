@@ -788,3 +788,21 @@ void Engine::LogState() {
                 a.saturatedFrames ? "   SATURATED -- geometry was dropped" : "");
     }
 }
+
+bool Engine::RedirectApiCall(unsigned int site, const void* replacement) {
+    // call dword ptr [0x0156D218], six bytes, becomes a direct call plus a NOP.
+    static const unsigned char kDispatcherCall[6] = {0xFF, 0x15, 0x18, 0xD2, 0x56, 0x01};
+    unsigned char patch[6];
+    patch[0] = 0xE8;
+    const int rel = (int)((unsigned int)replacement - (site + 5));
+    memcpy(patch + 1, &rel, 4);
+    patch[5] = 0x90;
+    if (Verify(site, patch, sizeof(patch))) {
+        return true;
+    }
+    if (!Verify(site, kDispatcherCall, sizeof(kDispatcherCall))) {
+        LogLine("    engine: 0x%08X is not a dispatcher call -- not patching", site);
+        return false;
+    }
+    return Overwrite(site, patch, sizeof(patch));
+}

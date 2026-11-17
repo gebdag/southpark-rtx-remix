@@ -52,6 +52,7 @@ enum Mode {
 
 Mode g_mode = ModeOff;
 bool g_plain = false;
+bool g_dumpRequest = false;
 
 const unsigned int kMagic = 0x50435053;   // "SPCP"
 const unsigned int kVersion = 2;
@@ -392,6 +393,7 @@ void Lookdev::DetectMode() {
         g_mode = ModeGame;
     }
     g_trackState = g_mode == ModeGame;
+    g_dumpRequest = g_mode == ModeHost && EnvFlag("SP_LOOKDEV_DUMP");
 }
 
 void Lookdev::TrackCommand(unsigned int word0, unsigned int word1) {
@@ -422,6 +424,12 @@ bool Lookdev::IsHost()       { return g_mode == ModeHost; }
 bool Lookdev::IsTee()        { return g_mode == ModeGame; }
 bool Lookdev::UsePlainD3D9() { return g_plain; }
 
+bool Lookdev::TakeDumpRequest() {
+    const bool requested = g_dumpRequest;
+    g_dumpRequest = false;
+    return requested;
+}
+
 const char* Lookdev::LogFileName() {
     return g_mode == ModeHost ? "Video_D3D9.lookdev.log" : "Video_D3D9.log";
 }
@@ -442,10 +450,49 @@ LRESULT CALLBACK RemixWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_CLOSE) {
         return 0;
     }
+    if (msg == WM_SIZE && wp != SIZE_MINIMIZED) {
+        Device::OnWindowResized(hwnd);
+    }
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
+const DWORD kRemixWindowStyle = WS_OVERLAPPEDWINDOW;
+
+// Outer size of a framed window with the given client size.
+SIZE FramedSize(int clientWidth, int clientHeight) {
+    RECT frame = {0, 0, clientWidth, clientHeight};
+    AdjustWindowRect(&frame, kRemixWindowStyle, FALSE);
+    SIZE size = {frame.right - frame.left, frame.bottom - frame.top};
+    return size;
+}
+
 } // namespace
+
+Window::Placement Lookdev::GameWindowPlacement() {
+    Window::Placement p;
+    p.mode = Window::ModeWindowed;
+    p.width = Config::LookdevGameWindowWidth();
+    p.height = Config::LookdevGameWindowHeight();
+    p.x = Config::LookdevGameWindowX();
+    p.y = Config::LookdevGameWindowY();
+    if (p.x < 0 || p.y < 0) {
+        const SIZE game = FramedSize(p.width, p.height);
+        const SIZE remix = FramedSize(Config::LookdevRemixWindowWidth(),
+                                      Config::LookdevRemixWindowHeight());
+        RECT work;
+        SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
+        if (p.x < 0) {
+            p.x = work.left + ((work.right - work.left) - (game.cx + remix.cx)) / 2;
+            if (p.x < work.left) p.x = work.left;
+        }
+        if (p.y < 0) {
+            const int tallest = game.cy > remix.cy ? game.cy : remix.cy;
+            p.y = work.top + ((work.bottom - work.top) - tallest) / 2;
+            if (p.y < work.top) p.y = work.top;
+        }
+    }
+    return p;
+}
 
 HWND Lookdev::CreateRemixWindow() {
     WNDCLASSA wc = {0};
@@ -456,9 +503,9 @@ HWND Lookdev::CreateRemixWindow() {
     wc.lpszClassName = "SouthParkLookdevRemix";
     RegisterClassA(&wc);
 
-    const DWORD style = WS_OVERLAPPEDWINDOW;
-    RECT frame = {0, 0, Config::LookdevRemixWindowWidth(), Config::LookdevRemixWindowHeight()};
-    AdjustWindowRect(&frame, style, FALSE);
+    const DWORD style = kRemixWindowStyle;
+    const SIZE frame = FramedSize(Config::LookdevRemixWindowWidth(),
+                                  Config::LookdevRemixWindowHeight());
     int x = Config::LookdevRemixWindowX();
     int y = Config::LookdevRemixWindowY();
     RECT game;
@@ -468,7 +515,7 @@ HWND Lookdev::CreateRemixWindow() {
     }
     g_remixWindow = CreateWindowExA(0, wc.lpszClassName, "South Park - RTX Remix (lookdev)", style,
                                     x < 0 ? CW_USEDEFAULT : x, y < 0 ? CW_USEDEFAULT : y,
-                                    frame.right - frame.left, frame.bottom - frame.top, 0, 0,
+                                    frame.cx, frame.cy, 0, 0,
                                     wc.hInstance, 0);
     if (g_remixWindow) {
         // Shown without taking focus: the game window keeps the keyboard.

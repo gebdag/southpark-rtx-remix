@@ -23,6 +23,7 @@
 #include "original.h"
 #include "pcx.h"
 #include "texture.h"
+#include "window.h"
 #include "geometry.h"
 #include "config.h"
 
@@ -45,7 +46,7 @@ const signed char kOptionStatus[16] = {
 // off GetAsyncKeyState's low bit, which reports "pressed since the last call" and so works
 // even while the game holds the devices.
 void MaybeDumpFrame() {
-    if (GetAsyncKeyState(VK_F10) & 1) {
+    if ((GetAsyncKeyState(VK_F10) & 1) || Lookdev::TakeDumpRequest()) {
         Geometry::DumpNextFrame();
     }
 }
@@ -462,9 +463,12 @@ GFXAPI unsigned int GFXDLL_InitializeDriver(HWND window, unsigned int a2, unsign
     Lookdev::OnInitializeDriver(window, startup);
 
     // The executable has unpacked itself by the time it drives any export, so this is the
-    // first point at which its code can be patched. The lookdev host has no executable.
+    // first point at which its code can be patched. The lookdev host has no executable, and
+    // no engine window.
     if (!Lookdev::IsHost()) {
         Engine::Install();
+        Window::Attach(window, g_original.initializeDriver ? Lookdev::GameWindowPlacement()
+                                                           : Window::Configured());
     }
 
     if (g_original.initializeDriver) {

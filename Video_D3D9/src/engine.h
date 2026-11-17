@@ -19,4 +19,12 @@ void Install();
 // fit the arrays".
 void LogState();
 
+// Sends one of the engine's API calls to `replacement` instead. The unpacked executable calls
+// every API through the copy protection's dispatcher (`call [0x0156D218]`), which picks the
+// real function from the return address, so its import table cannot be redirected; the call
+// site itself is rewritten. `replacement` must take what the API that site reaches takes, in
+// the same calling convention. Returns false, leaving the code alone, when `site` holds
+// neither that call nor this redirect already.
+bool RedirectApiCall(unsigned int site, const void* replacement);
+
 } // namespace Engine
