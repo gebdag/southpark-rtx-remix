@@ -2,6 +2,8 @@
 
 Path-traced South Park (Acclaim, 1999, PC) with NVIDIA RTX Remix. Requires an retail copy of the game. (US version tested, others may work too)
 
+https://github.com/user-attachments/assets/e34a65f4-a6bd-4294-80d2-a7d854a04542
+
 Replaces the games D3D renderer with an RTX Remix compatible version:
 
 - **`Video_D3D9`** builds `Video_D3D.dll`, a Direct3D 9 renderer for the game's display lists
