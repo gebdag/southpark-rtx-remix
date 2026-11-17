@@ -56,10 +56,24 @@ typedef DWORD (WINAPI* XInputGetStateFn)(DWORD, XInputState*);
 XInputGetStateFn g_xinputGetState = 0;
 bool g_xinputLoaded = false;
 int g_xinputSlot = -1;            // the connected pad in use
-DWORD g_xinputNextScan = 0;       // polling an empty slot is slow, so empty slots are rescanned seldom
 
-// Loaded on the first pad read, not at install: loaded inside the game's DirectInputCreateA,
-// XInput makes the game's mouse fail to set up right after.
+// ---- finding pads, off the game thread
+//
+// Looking for a pad is slow: DirectInput's EnumDevices walks every HID device on the machine,
+// which takes about 50 ms, and an empty XInput slot is slow to answer. On the game thread each
+// search would stall a frame. So the search runs on a thread of its own, once a second while
+// the game thread wants a pad, and the game thread only opens what it found.
+const DWORD kScanIntervalMs = 1000;
+volatile LONG g_wantXInput = 0;        // set by the game thread while it has no XInput pad
+volatile LONG g_xinputFound = -1;      // a slot that answered, for the game thread to take
+volatile LONG g_wantDirectInput = 0;   // likewise for DirectInput
+volatile LONG g_diFoundReady = 0;      // g_diFound* hold a pad for the game thread to open
+GUID g_diFoundInstance;
+WORD g_diFoundVendor = 0;
+char g_diFoundName[MAX_PATH];
+HANDLE g_scanThread = 0;
+void* volatile g_scanFactory = 0;      // the search thread's own DirectInput
+
 void LoadXInput() {
     g_xinputLoaded = true;
     const char* names[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
@@ -80,9 +94,6 @@ float Thumb(SHORT v) {
 }
 
 bool ReadXInput(PadState& s) {
-    if (!g_xinputLoaded) {
-        LoadXInput();
-    }
     if (!g_xinputGetState) {
         return false;
     }
@@ -92,19 +103,14 @@ bool ReadXInput(PadState& s) {
         g_xinputSlot = -1;
     }
     if (g_xinputSlot < 0) {
-        if (GetTickCount() < g_xinputNextScan) {
+        InterlockedExchange(&g_wantXInput, 1);
+        const LONG found = InterlockedExchange(&g_xinputFound, -1);
+        if (found < 0 || g_xinputGetState((DWORD)found, &state) != ERROR_SUCCESS) {
             return false;
         }
-        g_xinputNextScan = GetTickCount() + 1000;
-        for (DWORD i = 0; i < 4 && g_xinputSlot < 0; ++i) {
-            if (g_xinputGetState(i, &state) == ERROR_SUCCESS) {
-                g_xinputSlot = (int)i;
-                LOG("pad: XInput pad %lu connected", (unsigned long)i);
-            }
-        }
-        if (g_xinputSlot < 0) {
-            return false;
-        }
+        g_xinputSlot = (int)found;
+        InterlockedExchange(&g_wantXInput, 0);
+        LOG("pad: XInput pad %d connected", g_xinputSlot);
     }
     const XInputGamepad& p = state.pad;
     s.lx = Thumb(p.thumbLX); s.ly = Thumb(p.thumbLY);
@@ -135,7 +141,6 @@ IDirectInputA* g_di = 0;
 IDirectInputDevice2A* g_diPad = 0;
 WORD g_diVendor = 0;
 HWND g_window = 0;
-DWORD g_diNextScan = 0;
 bool g_diLogged = false;
 
 struct FoundPad {
@@ -158,6 +163,44 @@ BOOL CALLBACK FindPad(LPCDIDEVICEINSTANCEA instance, LPVOID context) {
     return DIENUM_STOP;
 }
 
+DWORD WINAPI ScanForPads(LPVOID) {
+    IDirectInputA* di = 0;   // its own, so the game thread's is never used from two threads
+    for (;;) {
+        if (g_xinputGetState && InterlockedCompareExchange(&g_wantXInput, 0, 0) &&
+            InterlockedCompareExchange(&g_xinputFound, -1, -1) < 0) {
+            XInputState state;
+            for (DWORD i = 0; i < 4; ++i) {
+                if (g_xinputGetState(i, &state) == ERROR_SUCCESS) {
+                    InterlockedExchange(&g_xinputFound, (LONG)i);
+                    break;
+                }
+            }
+        }
+        if (InterlockedCompareExchange(&g_wantDirectInput, 0, 0) &&
+            !InterlockedCompareExchange(&g_diFoundReady, 0, 0)) {
+            if (!di && g_realCreate) {
+                // Published before it enumerates: the shim's enumeration hook offers the
+                // virtual joystick to every factory but ours.
+                if (FAILED(g_realCreate(GetModuleHandleA(0), 0x0500, (void**)&di, 0))) {
+                    di = 0;
+                }
+                g_scanFactory = di;
+            }
+            FoundPad found = {};
+            if (di) {
+                di->EnumDevices(DIDEVTYPE_JOYSTICK, &FindPad, &found, DIEDFL_ATTACHEDONLY);
+            }
+            if (found.found) {
+                g_diFoundInstance = found.instance;
+                g_diFoundVendor = found.vendor;
+                lstrcpynA(g_diFoundName, found.name, sizeof(g_diFoundName));
+                InterlockedExchange(&g_diFoundReady, 1);
+            }
+        }
+        Sleep(kScanIntervalMs);
+    }
+}
+
 void CloseDirectInputPad() {
     if (g_diPad) {
         g_diPad->Unacquire();
@@ -166,17 +209,21 @@ void CloseDirectInputPad() {
     }
 }
 
+// Opens the pad the search thread found.
 bool OpenDirectInputPad() {
+    if (!InterlockedCompareExchange(&g_diFoundReady, 0, 0)) {
+        return false;
+    }
+    FoundPad found = {};
+    found.instance = g_diFoundInstance;
+    found.vendor = g_diFoundVendor;
+    lstrcpynA(found.name, g_diFoundName, sizeof(found.name));
+    InterlockedExchange(&g_diFoundReady, 0);
     if (!g_di) {
         if (!g_realCreate || FAILED(g_realCreate(GetModuleHandleA(0), 0x0500, (void**)&g_di, 0)) || !g_di) {
             g_di = 0;
             return false;
         }
-    }
-    FoundPad found = {};
-    g_di->EnumDevices(DIDEVTYPE_JOYSTICK, &FindPad, &found, DIEDFL_ATTACHEDONLY);
-    if (!found.found) {
-        return false;
     }
     IDirectInputDeviceA* device = 0;
     if (FAILED(g_di->CreateDevice(found.instance, &device, 0)) || !device) {
@@ -208,13 +255,11 @@ float Axis(LONG v) {
 
 bool ReadDirectInput(PadState& s) {
     if (!g_diPad) {
-        if (GetTickCount() < g_diNextScan) {
-            return false;
-        }
-        g_diNextScan = GetTickCount() + 2000;
+        InterlockedExchange(&g_wantDirectInput, 1);
         if (!OpenDirectInputPad()) {
             return false;
         }
+        InterlockedExchange(&g_wantDirectInput, 0);
     }
     DIJOYSTATE j;
     HRESULT hr = g_diPad->Poll();
@@ -329,6 +374,12 @@ void RefreshSettings() {
 void ReadPad() {
     g_lastRead = GetTickCount();
     RefreshSettings();
+    if (!g_xinputLoaded) {
+        // Here rather than at install: loaded inside the game's DirectInputCreateA, XInput
+        // makes the game's mouse fail to set up right after.
+        LoadXInput();
+        g_scanThread = CreateThread(0, 0, &ScanForPads, 0, 0, 0);
+    }
     PadState s;
     g_haveState = ReadXInput(s) || ReadDirectInput(s);
     if (g_haveState) {
@@ -797,7 +848,7 @@ bool Pad::Installed() {
 }
 
 bool Pad::IsOwnFactory(void* factory) {
-    return factory && factory == (void*)g_di;
+    return factory && (factory == (void*)g_di || factory == g_scanFactory);
 }
 
 void Pad::OnMouseMoved() {
