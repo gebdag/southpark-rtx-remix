@@ -1,6 +1,6 @@
 # South Park RTX Remix
 
-Path-traced South Park (Acclaim, 1999, PC) with NVIDIA RTX Remix. Requires an retail copy of the game. (US version tested, others may work too)
+Path-traced South Park (Acclaim, 1999, PC) with NVIDIA RTX Remix. Requires a retail copy of the game. (US version tested, others may work too)
 
 https://github.com/user-attachments/assets/e34a65f4-a6bd-4294-80d2-a7d854a04542
 
